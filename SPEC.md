@@ -7,11 +7,22 @@ A terminal-based music player written in Rust, with a real-time waveform visuali
 
 ### Launching
 ```
-tj <file>
+tj [path]
 ```
-Opens and begins playing the specified audio file.
+- If `path` is an audio file, opens and begins playing it immediately.
+- If `path` is a directory, opens the file browser rooted at that directory.
+- If `path` is omitted, opens the file browser rooted at the current working directory.
 
-### Keyboard Controls
+### File Browser Controls
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` | Move cursor (skips non-audio files) |
+| `Enter` | Navigate into directory / load and play audio file |
+| `←` / `Backspace` | Go to parent directory |
+| `Esc` | Return to player (if one is active) |
+| `q` | Quit |
+
+### Player Controls
 | Key | Action |
 |-----|--------|
 | `Space` | Play / Pause |
@@ -19,11 +30,21 @@ Opens and begins playing the specified audio file.
 | `Left` / `Right` | Seek backward / forward (small increment, e.g. 5s) |
 | `[` / `]` | Beat jump backward / forward by the current beat unit |
 | `1`–`6` | Set beat jump unit (4, 8, 16, 32, 64 beats) |
+| `b` | Open file browser |
 | `q` | Quit |
 
 > Key bindings are indicative; exact bindings are an implementation concern.
 
 ## Behaviour
+
+### File Browser
+- Displays all files and subdirectories in the current directory, sorted alphabetically.
+- Directories are visually distinguished (e.g. trailing `/`, different colour).
+- Compatible audio files (FLAC, MP3, OGG, WAV, AAC, OPUS) are highlighted.
+- Non-audio files are shown but cannot be selected or navigated into.
+- A header shows the current directory path.
+- Selecting an audio file dismisses the browser and begins playback.
+- The browser can be opened from the player at any time with `b`, rooted at the directory of the currently playing file. Audio continues playing while the browser is open. Pressing `Esc` returns to the player view; selecting a new file loads and plays it.
 
 ### Playback
 - Supports audio formats: FLAC, MP3, OGG Vorbis, WAV, AAC, OPUS.
@@ -34,6 +55,9 @@ Opens and begins playing the specified audio file.
 - BPM is auto-detected from the audio on load, assuming a constant tempo throughout the track.
 - The detected BPM is rounded to the nearest integer.
 - A beat phase offset (in milliseconds) can be adjusted at runtime to align the beat indicator with the audio. The offset and BPM are displayed in the UI.
+- Detected BPM and phase offset are cached in `~/.local/share/tj/cache.json`, keyed by a Blake3 hash of the decoded audio samples. This makes the cache invariant of filename, tags, and container format.
+- Each cache entry includes the filename at time of first detection as a human-readable hint to aid manual cache management.
+- On quit, the current phase offset is persisted to the cache.
 
 ### Beat Indicator
 - A visual indicator flashes on each beat in real time, derived from the detected BPM, playback position, and phase offset.
@@ -45,9 +69,16 @@ Opens and begins playing the specified audio file.
 - Both views update in real time during playback.
 - The detail view tracks the playhead as the track progresses.
 - Zoom level for the detail view is adjustable by the user.
+- The overview displays a bar marker (every 4 bars) as a full-height line drawn beneath the waveform, visible only in the gaps.
+- The detail view displays a beat marker at each beat position as a full-height line drawn beneath the waveform, visible only in the gaps.
+- Both sets of markers shift immediately when the phase offset is adjusted.
 
 ### Beat Jump
-- Beat jump moves the playhead backward or forward by a user-selected number of beats: 4, 8, 16, 32, or 64.
+- Beat jump moves the playhead backward or forward by a user-selected number of beats: 4, 8, 16, 32, 64, or 128.
+- The jump is by exactly N × beat_period seconds from the current position, preserving rhythmic continuity.
+- Jumping backward past the start clamps to position 0. Jumping forward past the end is a no-op.
+- Seeking is implemented via an atomic position counter shared with the audio thread; the audio thread never pauses.
+- A ~6ms fade-out before the cut and ~6ms fade-in after eliminate click artefacts without any perceptible gap.
 - The detected BPM and current beat jump unit are displayed in the UI.
 
 ### Threading
@@ -64,12 +95,13 @@ Opens and begins playing the specified audio file.
 - Target platform: Linux (primary); other Unix-like systems are a stretch goal.
 
 ## Out of Scope (deferred)
-- Directory browser and playlist support.
 - Cover art display.
 - Volume control, shuffle, repeat.
 - Multiple file / queue management.
 
 ## Verification
+- Launching with no argument opens the file browser in the current working directory.
+- Launching with a directory path opens the file browser rooted there.
 - Launching with a valid file path plays the track and renders the TUI.
 - Beat indicator flashes at the correct tempo, aligned with the audio.
 - Phase offset adjustment shifts the flash timing immediately.
