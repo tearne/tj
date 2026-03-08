@@ -39,7 +39,6 @@ const BEAT_UNITS: &[u32] = &[4, 8, 16, 32, 64, 128];
 const DEFAULT_BEAT_UNIT_IDX: usize = 2; // 16 beats
 const FADE_SAMPLES: i64 = 256; // ~5.8ms at 44100 Hz — fade-out then fade-in around each seek
 const DETECT_MODES: &[&str] = &["auto", "fusion", "legacy"];
-const FPS_LEVELS: &[u64] = &[10, 15, 20, 30, 60, 120];
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -257,7 +256,6 @@ fn tui_loop(
     let mut beat_unit_idx: usize = DEFAULT_BEAT_UNIT_IDX;
     let mut detect_mode: usize = 0;
     let mut detail_height: usize = 8;
-    let mut fps_idx: usize = 3; // default 30 fps
 
     // Shared state for the background detail-braille thread.
     let detail_cols = Arc::new(AtomicUsize::new(0));
@@ -378,7 +376,11 @@ fn tui_loop(
         }
 
         let now = Instant::now();
-        let elapsed = now.duration_since(last_render).as_secs_f64();
+        let dc = detail_cols.load(Ordering::Relaxed);
+        let zoom_secs = ZOOM_LEVELS[zoom_idx];
+        let col_secs = if dc > 0 { zoom_secs as f64 / dc as f64 } else { 0.033 };
+        let elapsed = now.duration_since(last_render).as_secs_f64()
+            .min(col_secs * 0.75); // cap at 1.5× a dot-column (= 0.75× a full column)
         last_render = now;
 
         // Real audio position — used for beat flash, time display, overview playhead.
@@ -387,7 +389,8 @@ fn tui_loop(
         let pos      = Duration::from_secs_f64(pos_samp as f64 / sample_rate as f64);
 
         // Smooth display position — advances via wall clock to avoid audio-buffer-burst jitter.
-        // Hard-snap to real position on large drift (seek, startup); gentle pull for small drift.
+        // Large drift (seek / startup) snaps immediately. Small drift correction rate is 1.0
+        // (also snaps) so any firing is visually obvious — for empirical observation only.
         if !player.is_paused() {
             smooth_display_samp += elapsed * sample_rate as f64;
         }
@@ -395,9 +398,6 @@ fn tui_loop(
         if drift.abs() > sample_rate as f64 * 0.5 {
             // Large drift (seek / startup) — snap immediately.
             smooth_display_samp = pos_samp as f64;
-        } else if drift.abs() > sample_rate as f64 * 0.02 {
-            // Small drift (>20 ms) — pull gently at 10% per frame to avoid accumulation.
-            smooth_display_samp -= drift * 0.10;
         }
         let display_pos_samp = smooth_display_samp as usize;
         display_pos_shared.store(display_pos_samp * seek_handle.channels as usize, Ordering::Relaxed);
@@ -420,7 +420,6 @@ fn tui_loop(
         };
         let time_str = format!("{} / {}", fmt_dur(pos), fmt_dur(total_duration));
         let status = if player.is_paused() { "Paused" } else { "Playing" };
-        let zoom_secs = ZOOM_LEVELS[zoom_idx];
         detail_zoom_at.store(zoom_idx, Ordering::Relaxed);
 
         terminal.draw(|frame| {
@@ -535,21 +534,29 @@ fn tui_loop(
             // Also derive the quantised viewport centre in seconds for beat_line_cols, so that
             // ticks are anchored to the same column grid as the waveform (avoids ±1-col jitter).
             let mut viewport_centre_secs = display_pos_samp as f64 / sample_rate as f64;
+            let mut sub_col = false;
             let viewport_start: Option<usize> = if buf.buf_cols >= dw && buf.samples_per_col > 0 {
                 let delta = display_pos_samp as i64 - buf.anchor_sample as i64;
-                // Round to nearest column to avoid systematic +1/+2 jitter from truncation.
-                let delta_cols = (delta as f64 / buf.samples_per_col as f64).round() as i64;
+                // Track at half-column (dot-column) resolution for sub-column scrolling.
+                let half_col_samp = buf.samples_per_col as f64 / 2.0;
+                let delta_half = (delta as f64 / half_col_samp).round() as i64;
+                sub_col = delta_half % 2 != 0;
+                let delta_cols = delta_half / 2;
                 let vs = buf.buf_cols as i64 / 2 + delta_cols - dw as i64 / 2;
-                // Snap beat_line_cols centre to the same quantised position as the viewport.
-                viewport_centre_secs = (buf.anchor_sample as i64 + delta_cols * buf.samples_per_col as i64)
-                    .max(0) as f64 / sample_rate as f64;
-                if vs >= 0 && (vs as usize) + dw <= buf.buf_cols {
+                // Snap beat_line_cols centre to the same quantised position as the viewport,
+                // offset by half a column when sub_col so ticks stay aligned with the waveform.
+                let sub_col_offset = if sub_col { buf.samples_per_col as f64 / 2.0 } else { 0.0 };
+                viewport_centre_secs = ((buf.anchor_sample as i64 + delta_cols * buf.samples_per_col as i64)
+                    .max(0) as f64 + sub_col_offset) / sample_rate as f64;
+                // Need dw+1 columns when sub_col to supply the extra byte for the shift.
+                let need = if sub_col { dw + 1 } else { dw };
+                if vs >= 0 && (vs as usize) + need <= buf.buf_cols {
                     let v = vs as usize;
                     last_viewport_start = v;
                     Some(v)
                 } else {
                     // Buffer not yet ready (new buffer being computed) — reuse last valid frame.
-                    if buf.buf_cols >= dw && last_viewport_start + dw <= buf.buf_cols {
+                    if buf.buf_cols >= dw && last_viewport_start + need <= buf.buf_cols {
                         Some(last_viewport_start)
                     } else {
                         None // first frame or seek — show blank
@@ -567,9 +574,21 @@ fn tui_loop(
 
             let detail_lines: Vec<Line<'static>> = (0..dh)
                 .map(|r| {
-                    let row_slice: Option<&[u8]> = viewport_start.and_then(|vs| {
-                        buf.grid.get(r).map(|row| &row[vs..vs + dw])
-                    });
+                    // When sub_col, shift each character by one dot-column using the next byte.
+                    let shifted: Option<Vec<u8>> = if sub_col {
+                        viewport_start.and_then(|vs| {
+                            buf.grid.get(r).map(|row| {
+                                (0..dw).map(|c| shift_braille_half(row[vs + c], row[vs + c + 1])).collect()
+                            })
+                        })
+                    } else {
+                        None
+                    };
+                    let row_slice: Option<&[u8]> = if sub_col {
+                        shifted.as_deref()
+                    } else {
+                        viewport_start.and_then(|vs| buf.grid.get(r).map(|row| &row[vs..vs + dw]))
+                    };
                     let row = match row_slice {
                         None => return Line::from(Span::raw("\u{2800}".repeat(dw))),
                         Some(s) => s,
@@ -639,17 +658,24 @@ fn tui_loop(
 
             // Key hints
             frame.render_widget(
-                Paragraph::new(format!("Space: play/pause   [/]: beat jump   1-6: unit   +/-: offset   z/Z: zoom   {{/}}: height({})   f/F: fps({})   m: mode({})   h/H: bpm½/×2   r: re-detect   b: browser   q: quit",
-                    detail_height, FPS_LEVELS[fps_idx], if live_mode { "live" } else { "buf" })
+                Paragraph::new(format!("Space: play/pause   [/]: beat jump   1-6: unit   +/-: offset   z/Z: zoom   {{/}}: height({})   m: mode({})   h/H: bpm½/×2   r: re-detect   b: browser   q: quit",
+                    detail_height, if live_mode { "live" } else { "buf" })
                 )
                     .style(Style::default().fg(Color::DarkGray)),
                 chunks[5],
             );
         })?;
 
-        let poll_ms = 1000 / FPS_LEVELS[fps_idx];
+        // Adaptive frame rate: target one dot-column (half a character) per frame.
+        let poll_dur = if dc > 0 {
+            Duration::from_secs_f32(zoom_secs / dc as f32 / 2.0)
+                .max(Duration::from_millis(8))
+                .min(Duration::from_millis(200))
+        } else {
+            Duration::from_millis(30)
+        };
 
-        if event::poll(Duration::from_millis(poll_ms))? {
+        if event::poll(poll_dur)? {
             if let Event::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => {
@@ -697,12 +723,6 @@ fn tui_loop(
                     }
                     KeyCode::Char('Z') => {
                         if zoom_idx + 1 < ZOOM_LEVELS.len() { zoom_idx += 1; }
-                    }
-                    KeyCode::Char('f') => {
-                        if fps_idx > 0 { fps_idx -= 1; }
-                    }
-                    KeyCode::Char('F') => {
-                        if fps_idx + 1 < FPS_LEVELS.len() { fps_idx += 1; }
                     }
                     KeyCode::Char('m') => {
                         live_mode = !live_mode;
@@ -814,6 +834,15 @@ impl BrailleBuffer {
 ///
 /// `peaks` — one (min, max) pair per column, values in [-1, 1].
 /// Mapping: y = +1 → top dot row 0; y = −1 → bottom dot row (rows×4 − 1).
+/// Combine two adjacent braille bytes into a half-column-shifted result.
+/// Takes the right dot-column of `a` (bits 3,4,5,7) as the new left column (bits 0,1,2,6)
+/// and the left dot-column of `b` (bits 0,1,2,6) as the new right column (bits 3,4,5,7).
+fn shift_braille_half(a: u8, b: u8) -> u8 {
+    let left  = ((a >> 3) & 0x07) | ((a >> 1) & 0x40);
+    let right = ((b & 0x07) << 3) | ((b & 0x40) << 1);
+    left | right
+}
+
 fn render_braille(peaks: &[(f32, f32)], rows: usize, cols: usize) -> Vec<Vec<u8>> {
     // Bit mask for left+right dots at each of the 4 dot-rows within a Braille cell.
     // Layout: dot1(bit0)/dot4(bit3), dot2(bit1)/dot5(bit4), dot3(bit2)/dot6(bit5), dot7(bit6)/dot8(bit7)

@@ -99,6 +99,10 @@ The detail waveform supports two render modes, toggled at runtime with `m` (show
 
 The detail waveform height is user-adjustable at runtime with `{` (decrease) and `}` (increase), defaulting to 8 rows. Any unused space below the panel is left blank. The current height is shown in the key hints line.
 
+The detail waveform scrolls at dot-column resolution (half a braille character width). Each braille character encodes a 2×4 dot grid; by combining the right dot-column of one buffer cell with the left dot-column of the next, the viewport can be positioned at half-character offsets without modifying the pre-rendered buffer.
+
+The render frame period adapts to the current zoom level and detail panel width, targeting one dot-column advance per frame. At very tight zoom it is capped at ~120 fps; at very wide zoom it is capped at ~5 fps to keep input responsive.
+
 ### Beat Jump
 - Beat jump moves the playhead backward or forward by a user-selected number of beats: 4, 8, 16, 32, 64, or 128.
 - The jump is by exactly N × beat_period seconds from the current position, preserving rhythmic continuity.
