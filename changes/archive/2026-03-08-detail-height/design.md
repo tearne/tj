@@ -14,5 +14,5 @@ No new atomics needed — `detail_rows` is already written from `chunks[2].heigh
 ## Tasks
 
 1. ✓ Impl: Add `detail_height` variable; split detail area into `Length(detail_height)` + `Min(0)`; add `{`/`}` key handlers with clamping; update key hints.
-2. Verify: `cargo build`; manual test — height adjusts correctly, waveform renders at new size, no stutter at small heights.
-3. Process: Archive `detail-height`; archive `smooth-scrolling` and `braille-rendering`; update SPEC.md for all three.
+2. ✓ Verify: `cargo build`; manual test — height adjusts correctly, waveform renders at new size, no stutter at small heights.
+3. ✓ Process: Archive `detail-height`; update SPEC.md.

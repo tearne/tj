@@ -39,6 +39,7 @@ const BEAT_UNITS: &[u32] = &[4, 8, 16, 32, 64, 128];
 const DEFAULT_BEAT_UNIT_IDX: usize = 2; // 16 beats
 const FADE_SAMPLES: i64 = 256; // ~5.8ms at 44100 Hz — fade-out then fade-in around each seek
 const DETECT_MODES: &[&str] = &["auto", "fusion", "legacy"];
+const FPS_LEVELS: &[u64] = &[10, 15, 20, 30, 60, 120];
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -250,10 +251,13 @@ fn tui_loop(
     // Smooth display position: advances via wall clock to avoid audio-buffer-burst jitter.
     let mut smooth_display_samp: f64 = 0.0;
     let mut last_render = Instant::now();
+    let mut last_viewport_start: usize = 0;
     const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let mut zoom_idx: usize = DEFAULT_ZOOM_IDX;
     let mut beat_unit_idx: usize = DEFAULT_BEAT_UNIT_IDX;
     let mut detect_mode: usize = 0;
+    let mut detail_height: usize = 8;
+    let mut fps_idx: usize = 3; // default 30 fps
 
     // Shared state for the background detail-braille thread.
     let detail_cols = Arc::new(AtomicUsize::new(0));
@@ -261,6 +265,9 @@ fn tui_loop(
     let detail_zoom_at = Arc::new(AtomicUsize::new(zoom_idx));
     let detail_braille_shared: Arc<Mutex<Arc<BrailleBuffer>>> =
         Arc::new(Mutex::new(Arc::new(BrailleBuffer::empty())));
+    let live_mode_shared   = Arc::new(AtomicBool::new(false));
+    let display_pos_shared = Arc::new(AtomicUsize::new(0));
+    let mut live_mode = false;
 
     // StopOnDrop sets the stop flag when tui_loop exits for any reason.
     struct StopOnDrop(Arc<AtomicBool>);
@@ -271,15 +278,17 @@ fn tui_loop(
     let _stop_guard = StopOnDrop(Arc::clone(&stop_detail));
 
     {
-        let cols_bg    = Arc::clone(&detail_cols);
-        let rows_bg    = Arc::clone(&detail_rows);
-        let zoom_bg    = Arc::clone(&detail_zoom_at);
-        let braille_bg = Arc::clone(&detail_braille_shared);
-        let stop_bg    = Arc::clone(&stop_detail);
-        let wf_bg      = Arc::clone(&waveform);
-        let pos_bg     = Arc::clone(&seek_handle.position);
-        let sr_bg      = sample_rate;
-        let ch_bg      = seek_handle.channels;
+        let cols_bg        = Arc::clone(&detail_cols);
+        let rows_bg        = Arc::clone(&detail_rows);
+        let zoom_bg        = Arc::clone(&detail_zoom_at);
+        let braille_bg     = Arc::clone(&detail_braille_shared);
+        let stop_bg        = Arc::clone(&stop_detail);
+        let wf_bg          = Arc::clone(&waveform);
+
+        let live_mode_bg   = Arc::clone(&live_mode_shared);
+        let display_pos_bg = Arc::clone(&display_pos_shared);
+        let sr_bg          = sample_rate;
+        let ch_bg          = seek_handle.channels;
 
         thread::spawn(move || {
             let mut last_cols            = 0usize;
@@ -300,10 +309,15 @@ fn tui_loop(
 
                 let zoom         = zoom_bg.load(Ordering::Relaxed).min(ZOOM_LEVELS.len() - 1);
                 let zoom_secs    = ZOOM_LEVELS[zoom];
-                let pos_samp     = pos_bg.load(Ordering::Relaxed) / ch_bg as usize;
+                let live         = live_mode_bg.load(Ordering::Relaxed);
+                // Always use the smooth display position as the buffer centre — even in buffer mode.
+                // Using the raw audio position (pos_bg) causes premature recomputes and off-centre
+                // buffers whenever rodio bursts the audio position forward.
+                let pos_samp     = display_pos_bg.load(Ordering::Relaxed) / ch_bg as usize;
                 let col_samp     = ((zoom_secs * sr_bg as f32) as usize / cols).max(1);
 
                 // Recompute when dimensions/zoom change or the viewport approaches the buffer edge.
+                // In live mode, always recompute.
                 let drift_cols = if last_samples_per_col > 0 {
                     let drift = pos_samp as i64 - last_anchor_sample as i64;
                     drift.unsigned_abs() as usize / last_samples_per_col
@@ -311,49 +325,44 @@ fn tui_loop(
                     usize::MAX // force initial compute
                 };
 
-                if cols != last_cols || rows != last_rows || zoom != last_zoom || drift_cols >= cols {
-                    // Pre-render a 3× wide buffer centred on the current position.
-                    // Derive half_buf from col_samp to avoid float-rounding mismatch.
-                    let buf_cols = cols * 3;
-                    let half_buf = col_samp * (buf_cols / 2);
-                    let start    = pos_samp.saturating_sub(half_buf);
-                    let end      = (pos_samp + half_buf).min(wf_bg.mono.len());
-                    let window   = &wf_bg.mono[start..end];
+                let must_recompute = live
+                    || cols != last_cols || rows != last_rows || zoom != last_zoom || drift_cols >= cols * 3 / 4;
 
-                    // Use the actual chunk_size (may differ from col_samp near track boundaries).
-                    let chunk_size = if window.is_empty() { col_samp } else { (window.len() / buf_cols).max(1) };
-                    // Anchor is the audio sample at the centre column of the buffer.
-                    let actual_anchor = start + (buf_cols / 2) * chunk_size;
+                if must_recompute {
+                    let buf_cols = if live { cols * 2 } else { cols * 3 };
+                    // Align anchor to the column grid so every buffer at this zoom level shares
+                    // the same column boundaries — overlapping columns are byte-for-byte identical,
+                    // making the buffer handoff visually seamless.
+                    let anchor = (pos_samp / col_samp) * col_samp;
+                    let mono   = &wf_bg.mono;
 
-                    let peaks: Vec<(f32, f32)> = if window.is_empty() {
-                        vec![(0.0, 0.0); buf_cols]
-                    } else {
-                        let mut v: Vec<(f32, f32)> = window
-                            .chunks(chunk_size)
-                            .map(|chunk| {
-                                let mn = chunk.iter().cloned().fold(f32::INFINITY, f32::min);
-                                let mx = chunk.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                                (mn.max(-1.0), mx.min(1.0))
-                            })
-                            .collect();
-                        v.resize(buf_cols, (0.0, 0.0));
-                        v
-                    };
+                    let peaks: Vec<(f32, f32)> = (0..buf_cols).map(|c| {
+                        let offset     = c as i64 - (buf_cols / 2) as i64;
+                        let samp_start = (anchor as i64 + offset * col_samp as i64).max(0) as usize;
+                        let samp_end   = (samp_start + col_samp).min(mono.len());
+                        if samp_start >= mono.len() {
+                            return (0.0, 0.0);
+                        }
+                        let chunk = &mono[samp_start..samp_end];
+                        let mn = chunk.iter().cloned().fold(f32::INFINITY,     f32::min);
+                        let mx = chunk.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                        (mn.max(-1.0), mx.min(1.0))
+                    }).collect();
 
                     *braille_bg.lock().unwrap() = Arc::new(BrailleBuffer {
                         grid: render_braille(&peaks, rows, buf_cols),
                         buf_cols,
-                        anchor_sample:   actual_anchor,
-                        samples_per_col: chunk_size,
+                        anchor_sample:   anchor,
+                        samples_per_col: col_samp,
                     });
                     last_cols            = cols;
                     last_rows            = rows;
                     last_zoom            = zoom;
-                    last_anchor_sample   = actual_anchor;
-                    last_samples_per_col = chunk_size;
+                    last_anchor_sample   = anchor;
+                    last_samples_per_col = col_samp;
                 }
 
-                thread::sleep(Duration::from_millis(8));
+                thread::sleep(Duration::from_millis(if live { 4 } else { 8 }));
             }
         });
     }
@@ -378,14 +387,21 @@ fn tui_loop(
         let pos      = Duration::from_secs_f64(pos_samp as f64 / sample_rate as f64);
 
         // Smooth display position — advances via wall clock to avoid audio-buffer-burst jitter.
-        // Resyncs to the real position if drift exceeds 0.5 s (seek, pause/resume, startup).
+        // Hard-snap to real position on large drift (seek, startup); gentle pull for small drift.
         if !player.is_paused() {
             smooth_display_samp += elapsed * sample_rate as f64;
         }
-        if (smooth_display_samp - pos_samp as f64).abs() > sample_rate as f64 * 0.5 {
+        let drift = smooth_display_samp - pos_samp as f64;
+        if drift.abs() > sample_rate as f64 * 0.5 {
+            // Large drift (seek / startup) — snap immediately.
             smooth_display_samp = pos_samp as f64;
+        } else if drift.abs() > sample_rate as f64 * 0.02 {
+            // Small drift (>20 ms) — pull gently at 10% per frame to avoid accumulation.
+            smooth_display_samp -= drift * 0.10;
         }
         let display_pos_samp = smooth_display_samp as usize;
+        display_pos_shared.store(display_pos_samp * seek_handle.channels as usize, Ordering::Relaxed);
+        live_mode_shared.store(live_mode, Ordering::Relaxed);
 
         // Beat-derived values — recomputed each frame so they react to bpm changes instantly.
         let beat_period = Duration::from_secs_f64(60.0 / bpm as f64);
@@ -421,12 +437,20 @@ fn tui_loop(
                 .constraints([
                     Constraint::Length(1), // BPM + offset
                     Constraint::Length(5), // overview waveform
-                    Constraint::Min(6),    // detail waveform
+                    Constraint::Min(0),    // detail waveform + blank space
                     Constraint::Length(1), // beat indicator
                     Constraint::Length(1), // status + time
                     Constraint::Length(1), // key hints
                 ])
                 .split(inner);
+            // Sub-split the detail area: fixed height + blank space below.
+            let detail_area = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(detail_height as u16),
+                    Constraint::Min(0),
+                ])
+                .split(chunks[2])[0];
 
             // BPM + offset
             let bpm_line = if analysing {
@@ -499,8 +523,8 @@ fn tui_loop(
             frame.render_widget(Paragraph::new(ov_lines), chunks[1]);
 
             // Detail waveform — pan a viewport through the stable background-thread buffer.
-            let dw = chunks[2].width as usize;
-            let dh = chunks[2].height as usize;
+            let dw = detail_area.width as usize;
+            let dh = detail_area.height as usize;
             detail_cols.store(dw, Ordering::Relaxed);
             detail_rows.store(dh, Ordering::Relaxed);
             let buf = Arc::clone(&*detail_braille_shared.lock().unwrap());
@@ -508,22 +532,35 @@ fn tui_loop(
 
             // Compute the column offset into the buffer that places the playhead at centre.
             // Uses smooth_display_samp (wall-clock based) to avoid audio-buffer-burst jitter.
+            // Also derive the quantised viewport centre in seconds for beat_line_cols, so that
+            // ticks are anchored to the same column grid as the waveform (avoids ±1-col jitter).
+            let mut viewport_centre_secs = display_pos_samp as f64 / sample_rate as f64;
             let viewport_start: Option<usize> = if buf.buf_cols >= dw && buf.samples_per_col > 0 {
                 let delta = display_pos_samp as i64 - buf.anchor_sample as i64;
                 // Round to nearest column to avoid systematic +1/+2 jitter from truncation.
                 let delta_cols = (delta as f64 / buf.samples_per_col as f64).round() as i64;
                 let vs = buf.buf_cols as i64 / 2 + delta_cols - dw as i64 / 2;
+                // Snap beat_line_cols centre to the same quantised position as the viewport.
+                viewport_centre_secs = (buf.anchor_sample as i64 + delta_cols * buf.samples_per_col as i64)
+                    .max(0) as f64 / sample_rate as f64;
                 if vs >= 0 && (vs as usize) + dw <= buf.buf_cols {
-                    Some(vs as usize)
+                    let v = vs as usize;
+                    last_viewport_start = v;
+                    Some(v)
                 } else {
-                    None // buffer exhausted (seek / first frame) — show blank
+                    // Buffer not yet ready (new buffer being computed) — reuse last valid frame.
+                    if buf.buf_cols >= dw && last_viewport_start + dw <= buf.buf_cols {
+                        Some(last_viewport_start)
+                    } else {
+                        None // first frame or seek — show blank
+                    }
                 }
             } else {
                 None
             };
 
             let beat_cols: Vec<usize> = if !analysing {
-                beat_line_cols(bpm as f64, offset_ms, display_pos_samp as f64 / sample_rate as f64, zoom_secs as f64, dw)
+                beat_line_cols(bpm as f64, offset_ms, viewport_centre_secs, zoom_secs as f64, dw)
             } else {
                 Vec::new()
             };
@@ -568,7 +605,7 @@ fn tui_loop(
                 })
                 .collect();
 
-            frame.render_widget(Paragraph::new(detail_lines), chunks[2]);
+            frame.render_widget(Paragraph::new(detail_lines), detail_area);
 
             // Beat indicator (single line)
             let (label, style) = if beat_on && !analysing {
@@ -602,19 +639,15 @@ fn tui_loop(
 
             // Key hints
             frame.render_widget(
-                Paragraph::new("Space: play/pause   [/]: beat jump   1-6: unit   +/-: offset   z/Z: zoom   h/H: bpm½/×2   r: re-detect   b: browser   q: quit")
+                Paragraph::new(format!("Space: play/pause   [/]: beat jump   1-6: unit   +/-: offset   z/Z: zoom   {{/}}: height({})   f/F: fps({})   m: mode({})   h/H: bpm½/×2   r: re-detect   b: browser   q: quit",
+                    detail_height, FPS_LEVELS[fps_idx], if live_mode { "live" } else { "buf" })
+                )
                     .style(Style::default().fg(Color::DarkGray)),
                 chunks[5],
             );
         })?;
 
-        // Target one column per frame; clamped to 8–50ms.
-        let dc = detail_cols.load(Ordering::Relaxed);
-        let poll_ms = if dc > 0 {
-            ((zoom_secs * 1000.0 / dc as f32) as u64).max(8).min(50)
-        } else {
-            30
-        };
+        let poll_ms = 1000 / FPS_LEVELS[fps_idx];
 
         if event::poll(Duration::from_millis(poll_ms))? {
             if let Event::Key(key) = event::read()? {
@@ -664,6 +697,21 @@ fn tui_loop(
                     }
                     KeyCode::Char('Z') => {
                         if zoom_idx + 1 < ZOOM_LEVELS.len() { zoom_idx += 1; }
+                    }
+                    KeyCode::Char('f') => {
+                        if fps_idx > 0 { fps_idx -= 1; }
+                    }
+                    KeyCode::Char('F') => {
+                        if fps_idx + 1 < FPS_LEVELS.len() { fps_idx += 1; }
+                    }
+                    KeyCode::Char('m') => {
+                        live_mode = !live_mode;
+                    }
+                    KeyCode::Char('{') => {
+                        if detail_height > 1 { detail_height -= 1; }
+                    }
+                    KeyCode::Char('}') => {
+                        detail_height += 1; // clamped below at render time by ratatui
                     }
                     KeyCode::Char('h') => {
                         bpm = (bpm * 0.5).max(40.0);

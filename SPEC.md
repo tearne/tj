@@ -83,10 +83,21 @@ tj [path]
 ### Rendering
 The following principles are required to achieve smooth, stable rendering:
 
-- **Smooth display position**: The position used for all visual rendering (detail viewport, beat markers) advances by wall-clock elapsed time rather than reading the audio output position directly. The audio output position advances in bursts as the output device requests audio buffers; using it directly causes visible periodic jumps in the display. The smooth position resyncs to the real position if it drifts by more than a small threshold (e.g. 0.5 s), covering seek and pause.
+- **Smooth display position**: The position used for all visual rendering (detail viewport, beat markers) advances by wall-clock elapsed time rather than reading the audio output position directly. The audio output position advances in bursts as the output device requests audio buffers; using it directly causes visible periodic jumps in the display. Small accumulated drift (>20 ms) is corrected gradually rather than snapped, to avoid introducing a jump of its own. Large drift (e.g. after seek or startup) is snapped immediately.
 - **Consistent position**: Beat marker columns must be computed from the same smooth display position as the waveform viewport. Using different position sources causes markers to oscillate relative to the waveform.
 - **Waveform computation off the UI thread**: Braille dot rasterisation runs on a background thread. The UI thread performs only lightweight per-frame work (colour assignment, span construction) to stay within the frame budget.
 - **Stable buffer between recomputes**: The background thread pre-renders a buffer wider than the visible area. The UI thread slides a viewport through this buffer each frame. This avoids recomputing the waveform on every frame tick and prevents ratatui from receiving a changed grid every frame (which would cause a full widget repaint and visible flicker).
+- **Background thread uses smooth position**: The background thread must use the smooth display position (not the raw audio position) as both the drift trigger and the buffer centre. Using the raw audio position causes the buffer to recompute prematurely on audio bursts and to be centred at a different position than the viewport expects, producing a visible jump on each recompute.
+- **Fixed column grid**: The buffer anchor is aligned to a multiple of `col_samp` and peaks are computed by direct per-column indexing (not by slicing a window and dividing). This ensures any two buffers at the same zoom level share identical column boundaries, so overlapping columns are byte-for-byte equal and the buffer handoff is visually seamless.
+- **Early recompute trigger**: The background thread begins computing a new buffer when drift reaches 3/4 of the screen width (not at the edge), ensuring the new buffer is ready before the old one runs out. A last-valid-viewport fallback prevents black frames in the rare case the OS delays the background thread.
+- **Consistent tick and viewport centre**: Beat marker columns must be computed from the same quantised position as the waveform viewport centre (i.e. `anchor + delta_cols × samples_per_col`), not from the raw smooth display position. The two differ by up to half a column due to rounding, causing ticks to oscillate by one column relative to the waveform if inconsistent sources are used.
+
+### Detail Waveform Render Modes
+The detail waveform supports two render modes, toggled at runtime with `m` (shown in the key hints):
+- **Buffer mode** (default): the background thread pre-renders a 3× wide braille buffer; the UI thread slides a viewport through it. Recomputes only on zoom change, resize, or when the playhead drifts within one screen-width of the buffer edge.
+- **Live mode**: the background thread recomputes a 2× wide buffer every 4 ms, always centred on the current smooth display position. Each frame reflects the exact playback position with minimal lag.
+
+The detail waveform height is user-adjustable at runtime with `{` (decrease) and `}` (increase), defaulting to 8 rows. Any unused space below the panel is left blank. The current height is shown in the key hints line.
 
 ### Beat Jump
 - Beat jump moves the playhead backward or forward by a user-selected number of beats: 4, 8, 16, 32, 64, or 128.
