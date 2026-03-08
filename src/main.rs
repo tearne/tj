@@ -1,9 +1,10 @@
 use std::io;
 use std::num::NonZero;
 use std::path::Path;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode};
 use crossterm::terminal::{
@@ -13,10 +14,8 @@ use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::canvas::{Canvas, Context, Line as CanvasLine};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph};
 use ratatui::Terminal;
 
 use rodio::stream::DeviceSinkBuilder;
@@ -39,6 +38,7 @@ const DEFAULT_ZOOM_IDX: usize = 2; // 4 seconds
 const BEAT_UNITS: &[u32] = &[4, 8, 16, 32, 64, 128];
 const DEFAULT_BEAT_UNIT_IDX: usize = 2; // 16 beats
 const FADE_SAMPLES: i64 = 256; // ~5.8ms at 44100 Hz — fade-out then fade-in around each seek
+const DETECT_MODES: &[&str] = &["auto", "fusion", "legacy"];
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -101,16 +101,54 @@ fn main() {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-        let _ = terminal.draw(|frame| {
-            let area = frame.area();
-            frame.render_widget(
-                Paragraph::new(format!("Loading {}…", path_str))
-                    .style(Style::default().fg(Color::DarkGray)),
-                area,
-            );
-        });
+        let decoded_samples = Arc::new(AtomicUsize::new(0));
+        let estimated_total = Arc::new(AtomicUsize::new(0));
+        let (decode_tx, decode_rx) = mpsc::channel::<Result<(Vec<f32>, Vec<f32>, u32, u16), String>>();
+        {
+            let path_clone = path_str.clone();
+            let ds = Arc::clone(&decoded_samples);
+            let et = Arc::clone(&estimated_total);
+            thread::spawn(move || {
+                let _ = decode_tx.send(decode_audio(&path_clone, ds, et).map_err(|e| e.to_string()));
+            });
+        }
 
-        let (mono, stereo, sample_rate, channels) = match decode_audio(&path_str) {
+        let decode_result = loop {
+            let done = decoded_samples.load(Ordering::Relaxed);
+            let total = estimated_total.load(Ordering::Relaxed);
+            let ratio = if total > 0 { (done as f64 / total as f64).min(1.0) } else { 0.0 };
+
+            let _ = terminal.draw(|frame| {
+                let area = frame.area();
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)])
+                    .split(area);
+                frame.render_widget(
+                    Paragraph::new(format!("Loading {}…", path_str))
+                        .style(Style::default().fg(Color::DarkGray)),
+                    chunks[0],
+                );
+                let label = if total > 0 { format!("{:.0}%", ratio * 100.0) } else { String::new() };
+                frame.render_widget(Gauge::default().ratio(ratio).label(label), chunks[1]);
+            });
+
+            if let Ok(result) = decode_rx.try_recv() {
+                break result;
+            }
+
+            if event::poll(Duration::from_millis(30)).unwrap_or(false) {
+                if let Ok(Event::Key(key)) = event::read() {
+                    if key.code == KeyCode::Char('q') {
+                        let _ = disable_raw_mode();
+                        let _ = io::stdout().execute(LeaveAlternateScreen);
+                        return;
+                    }
+                }
+            }
+        };
+
+        let (mono, stereo, sample_rate, channels) = match decode_result {
             Ok(v) => v,
             Err(e) => {
                 let _ = disable_raw_mode();
@@ -126,27 +164,9 @@ fn main() {
             .unwrap_or(&path_str)
             .to_string();
 
-        let hash = hash_mono(&mono);
-
-        let (bpm, initial_offset_ms) = if let Some(entry) = cache.get(&hash) {
-            (entry.bpm, entry.offset_ms)
-        } else {
-            let bpm = match detect_bpm(&mono, sample_rate) {
-                Ok(b) => b.round(),
-                Err(e) => {
-                    let _ = disable_raw_mode();
-                    let _ = io::stdout().execute(LeaveAlternateScreen);
-                    eprintln!("BPM error: {e}");
-                    std::process::exit(1);
-                }
-            };
-            cache.set(hash.clone(), CacheEntry { bpm, offset_ms: 0, name: filename.clone() });
-            cache.save();
-            (bpm, 0)
-        };
-
         let total_duration = Duration::from_secs(mono.len() as u64 / sample_rate as u64);
-        let waveform = WaveformData::compute(mono, sample_rate);
+        let mono = Arc::new(mono);
+        let waveform = Arc::new(WaveformData::compute(Arc::clone(&mono), sample_rate));
 
         let samples = Arc::new(stereo);
         let position = Arc::new(AtomicUsize::new(0));
@@ -166,17 +186,33 @@ fn main() {
             samples, position, fade_remaining, pending_target, sample_rate, channels,
         ));
 
+        let (bpm_tx, bpm_rx) = mpsc::channel::<(String, f32, i64)>();
+        {
+            let mono_bg = Arc::clone(&mono);
+            let entries = cache.entries_snapshot();
+            thread::spawn(move || {
+                let hash = hash_mono(&mono_bg);
+                let (bpm, offset_ms) = if let Some(entry) = entries.get(&hash) {
+                    (entry.bpm, entry.offset_ms)
+                } else {
+                    let bpm = detect_bpm(&mono_bg, sample_rate).map(|b| b.round()).unwrap_or(120.0);
+                    (bpm, 0i64)
+                };
+                let _ = bpm_tx.send((hash, bpm, offset_ms));
+            });
+        }
+
         match tui_loop(
             &mut terminal,
             &filename,
             &file_dir,
-            bpm,
-            initial_offset_ms,
+            bpm_rx,
             total_duration,
-            &waveform,
+            Arc::clone(&waveform),
             &player,
             &seek_handle,
-            &hash,
+            &mono,
+            sample_rate,
             &mut cache,
         ) {
             Ok(Some(path)) => { next_path = path; }
@@ -198,28 +234,169 @@ fn tui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     filename: &str,
     file_dir: &std::path::Path,
-    bpm: f32,
-    initial_offset_ms: i64,
+    mut bpm_rx: mpsc::Receiver<(String, f32, i64)>,
     total_duration: Duration,
-    waveform: &WaveformData,
+    waveform: Arc<WaveformData>,
     player: &Player,
     seek_handle: &SeekHandle,
-    hash: &str,
+    mono: &Arc<Vec<f32>>,
+    sample_rate: u32,
     cache: &mut Cache,
 ) -> io::Result<Option<std::path::PathBuf>> {
-    let beat_period = Duration::from_secs_f64(60.0 / bpm as f64);
-    let flash_window = beat_period.mul_f64(0.15);
-    let mut offset_ms: i64 = initial_offset_ms;
+    let mut bpm: f32 = 120.0;
+    let mut offset_ms: i64 = 0;
+    let mut analysis_hash: Option<String> = None;
+    let mut frame_count: usize = 0;
+    // Smooth display position: advances via wall clock to avoid audio-buffer-burst jitter.
+    let mut smooth_display_samp: f64 = 0.0;
+    let mut last_render = Instant::now();
+    const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let mut zoom_idx: usize = DEFAULT_ZOOM_IDX;
     let mut beat_unit_idx: usize = DEFAULT_BEAT_UNIT_IDX;
+    let mut detect_mode: usize = 0;
+
+    // Shared state for the background detail-braille thread.
+    let detail_cols = Arc::new(AtomicUsize::new(0));
+    let detail_rows = Arc::new(AtomicUsize::new(0));
+    let detail_zoom_at = Arc::new(AtomicUsize::new(zoom_idx));
+    let detail_braille_shared: Arc<Mutex<Arc<BrailleBuffer>>> =
+        Arc::new(Mutex::new(Arc::new(BrailleBuffer::empty())));
+
+    // StopOnDrop sets the stop flag when tui_loop exits for any reason.
+    struct StopOnDrop(Arc<AtomicBool>);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) { self.0.store(true, Ordering::Relaxed); }
+    }
+    let stop_detail = Arc::new(AtomicBool::new(false));
+    let _stop_guard = StopOnDrop(Arc::clone(&stop_detail));
+
+    {
+        let cols_bg    = Arc::clone(&detail_cols);
+        let rows_bg    = Arc::clone(&detail_rows);
+        let zoom_bg    = Arc::clone(&detail_zoom_at);
+        let braille_bg = Arc::clone(&detail_braille_shared);
+        let stop_bg    = Arc::clone(&stop_detail);
+        let wf_bg      = Arc::clone(&waveform);
+        let pos_bg     = Arc::clone(&seek_handle.position);
+        let sr_bg      = sample_rate;
+        let ch_bg      = seek_handle.channels;
+
+        thread::spawn(move || {
+            let mut last_cols            = 0usize;
+            let mut last_rows            = 0usize;
+            let mut last_zoom            = usize::MAX;
+            let mut last_anchor_sample   = 0usize;
+            let mut last_samples_per_col = 0usize;
+
+            loop {
+                if stop_bg.load(Ordering::Relaxed) { break; }
+
+                let cols = cols_bg.load(Ordering::Relaxed);
+                let rows = rows_bg.load(Ordering::Relaxed);
+                if cols == 0 || rows == 0 {
+                    thread::sleep(Duration::from_millis(8));
+                    continue;
+                }
+
+                let zoom         = zoom_bg.load(Ordering::Relaxed).min(ZOOM_LEVELS.len() - 1);
+                let zoom_secs    = ZOOM_LEVELS[zoom];
+                let pos_samp     = pos_bg.load(Ordering::Relaxed) / ch_bg as usize;
+                let col_samp     = ((zoom_secs * sr_bg as f32) as usize / cols).max(1);
+
+                // Recompute when dimensions/zoom change or the viewport approaches the buffer edge.
+                let drift_cols = if last_samples_per_col > 0 {
+                    let drift = pos_samp as i64 - last_anchor_sample as i64;
+                    drift.unsigned_abs() as usize / last_samples_per_col
+                } else {
+                    usize::MAX // force initial compute
+                };
+
+                if cols != last_cols || rows != last_rows || zoom != last_zoom || drift_cols >= cols {
+                    // Pre-render a 3× wide buffer centred on the current position.
+                    // Derive half_buf from col_samp to avoid float-rounding mismatch.
+                    let buf_cols = cols * 3;
+                    let half_buf = col_samp * (buf_cols / 2);
+                    let start    = pos_samp.saturating_sub(half_buf);
+                    let end      = (pos_samp + half_buf).min(wf_bg.mono.len());
+                    let window   = &wf_bg.mono[start..end];
+
+                    // Use the actual chunk_size (may differ from col_samp near track boundaries).
+                    let chunk_size = if window.is_empty() { col_samp } else { (window.len() / buf_cols).max(1) };
+                    // Anchor is the audio sample at the centre column of the buffer.
+                    let actual_anchor = start + (buf_cols / 2) * chunk_size;
+
+                    let peaks: Vec<(f32, f32)> = if window.is_empty() {
+                        vec![(0.0, 0.0); buf_cols]
+                    } else {
+                        let mut v: Vec<(f32, f32)> = window
+                            .chunks(chunk_size)
+                            .map(|chunk| {
+                                let mn = chunk.iter().cloned().fold(f32::INFINITY, f32::min);
+                                let mx = chunk.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                                (mn.max(-1.0), mx.min(1.0))
+                            })
+                            .collect();
+                        v.resize(buf_cols, (0.0, 0.0));
+                        v
+                    };
+
+                    *braille_bg.lock().unwrap() = Arc::new(BrailleBuffer {
+                        grid: render_braille(&peaks, rows, buf_cols),
+                        buf_cols,
+                        anchor_sample:   actual_anchor,
+                        samples_per_col: chunk_size,
+                    });
+                    last_cols            = cols;
+                    last_rows            = rows;
+                    last_zoom            = zoom;
+                    last_anchor_sample   = actual_anchor;
+                    last_samples_per_col = chunk_size;
+                }
+
+                thread::sleep(Duration::from_millis(8));
+            }
+        });
+    }
 
     loop {
-        let pos = seek_handle.current_pos();
+        frame_count += 1;
+        if let Ok((hash, new_bpm, new_offset)) = bpm_rx.try_recv() {
+            bpm = new_bpm;
+            offset_ms = new_offset;
+            cache.set(hash.clone(), CacheEntry { bpm, offset_ms, name: filename.to_string() });
+            cache.save();
+            analysis_hash = Some(hash);
+        }
+
+        let now = Instant::now();
+        let elapsed = now.duration_since(last_render).as_secs_f64();
+        last_render = now;
+
+        // Real audio position — used for beat flash, time display, overview playhead.
+        let pos_raw  = seek_handle.position.load(Ordering::Relaxed);
+        let pos_samp = pos_raw / seek_handle.channels as usize;
+        let pos      = Duration::from_secs_f64(pos_samp as f64 / sample_rate as f64);
+
+        // Smooth display position — advances via wall clock to avoid audio-buffer-burst jitter.
+        // Resyncs to the real position if drift exceeds 0.5 s (seek, pause/resume, startup).
+        if !player.is_paused() {
+            smooth_display_samp += elapsed * sample_rate as f64;
+        }
+        if (smooth_display_samp - pos_samp as f64).abs() > sample_rate as f64 * 0.5 {
+            smooth_display_samp = pos_samp as f64;
+        }
+        let display_pos_samp = smooth_display_samp as usize;
+
+        // Beat-derived values — recomputed each frame so they react to bpm changes instantly.
+        let beat_period = Duration::from_secs_f64(60.0 / bpm as f64);
+        let flash_window = beat_period.mul_f64(0.15);
 
         // Beat flash
         let pos_ns = pos.as_nanos() as i128 + offset_ms as i128 * 1_000_000;
         let phase = pos_ns.rem_euclid(beat_period.as_nanos() as i128);
         let beat_on = phase < flash_window.as_nanos() as i128;
+
+        let analysing = analysis_hash.is_none();
 
         let fmt_dur = |d: Duration| {
             let s = d.as_secs();
@@ -228,12 +405,13 @@ fn tui_loop(
         let time_str = format!("{} / {}", fmt_dur(pos), fmt_dur(total_duration));
         let status = if player.is_paused() { "Paused" } else { "Playing" };
         let zoom_secs = ZOOM_LEVELS[zoom_idx];
+        detail_zoom_at.store(zoom_idx, Ordering::Relaxed);
 
         terminal.draw(|frame| {
             let area = frame.area();
 
             let outer = Block::default()
-                .title(format!(" tj — {filename} "))
+                .title(format!(" tj {} — {filename} ", env!("CARGO_PKG_VERSION")))
                 .borders(Borders::ALL);
             let inner = outer.inner(area);
             frame.render_widget(outer, area);
@@ -251,79 +429,149 @@ fn tui_loop(
                 .split(inner);
 
             // BPM + offset
-            frame.render_widget(
-                Paragraph::new(format!(
-                    "BPM: {bpm:.0}   offset: {:+}ms   unit: {} beats",
-                    offset_ms, BEAT_UNITS[beat_unit_idx]
-                )),
-                chunks[0],
-            );
+            let bpm_line = if analysing {
+                format!("BPM: --- [analysing {}]   unit: {} beats",
+                    SPINNER[frame_count % SPINNER.len()], BEAT_UNITS[beat_unit_idx])
+            } else {
+                format!("BPM: {bpm:.0} [{}]   offset: {:+}ms   unit: {} beats",
+                    DETECT_MODES[detect_mode], offset_ms, BEAT_UNITS[beat_unit_idx])
+            };
+            frame.render_widget(Paragraph::new(bpm_line), chunks[0]);
 
-            // Overview waveform
+            // Overview waveform — Braille rendered fresh each frame (O(cols×rows), negligible).
             let ow = chunks[1].width as usize;
+            let oh = chunks[1].height as usize;
             let total_peaks = waveform.peaks.len();
             let playhead_frac = if total_duration.is_zero() {
                 0.0
             } else {
                 pos.as_secs_f64() / total_duration.as_secs_f64()
             };
-            let playhead_col = (playhead_frac * ow as f64).min(ow as f64 - 1.0);
+            let playhead_col = ((playhead_frac * ow as f64) as usize).min(ow.saturating_sub(1));
 
-            frame.render_widget(
-                Canvas::default()
-                    .marker(Marker::Braille)
-                    .x_bounds([0.0, ow as f64])
-                    .y_bounds([-1.0, 1.0])
-                    .paint(move |ctx| {
-                        draw_bar_ticks(ctx, bpm as f64, offset_ms, total_duration.as_secs_f64(), ow as f64);
-                        for col in 0..ow {
-                            let idx = (col * total_peaks / ow.max(1)).min(total_peaks - 1);
-                            let (min, max) = waveform.peaks[idx];
-                            ctx.draw(&CanvasLine {
-                                x1: col as f64, y1: min as f64,
-                                x2: col as f64, y2: max as f64,
-                                color: Color::Green,
-                            });
+            let ov_peaks: Vec<(f32, f32)> = (0..ow)
+                .map(|col| {
+                    let idx = (col * total_peaks / ow.max(1)).min(total_peaks.saturating_sub(1));
+                    waveform.peaks[idx]
+                })
+                .collect();
+            let ov_braille = render_braille(&ov_peaks, oh, ow);
+            let bar_cols: Vec<usize> = if !analysing {
+                bar_tick_cols(bpm as f64, offset_ms, total_duration.as_secs_f64(), ow)
+            } else {
+                Vec::new()
+            };
+
+            let ov_lines: Vec<Line<'static>> = ov_braille
+                .into_iter()
+                .map(|row| {
+                    let mut spans: Vec<Span<'static>> = Vec::new();
+                    let mut run = String::new();
+                    let mut run_color = Color::Reset;
+                    for (c, byte) in row.into_iter().enumerate() {
+                        // Replicate Canvas z-order: tick drawn first, waveform on top.
+                        // Tick is visible only where the waveform cell is empty (byte == 0).
+                        let (color, ch) = if c == playhead_col {
+                            (Color::White, '\u{28FF}') // ⣿ solid playhead
+                        } else if bar_cols.contains(&c) && byte == 0 {
+                            (Color::DarkGray, '\u{28FF}') // ⣿ tick visible in gap
+                        } else {
+                            (Color::Green, char::from_u32(0x2800 | byte as u32).unwrap_or(' '))
+                        };
+                        if color != run_color {
+                            if !run.is_empty() {
+                                spans.push(Span::styled(
+                                    std::mem::take(&mut run),
+                                    Style::default().fg(run_color),
+                                ));
+                            }
+                            run_color = color;
                         }
-                        ctx.draw(&CanvasLine {
-                            x1: playhead_col, y1: -1.0,
-                            x2: playhead_col, y2: 1.0,
-                            color: Color::White,
-                        });
-                    }),
-                chunks[1],
-            );
+                        run.push(ch);
+                    }
+                    if !run.is_empty() {
+                        spans.push(Span::styled(run, Style::default().fg(run_color)));
+                    }
+                    Line::from(spans)
+                })
+                .collect();
 
-            // Detail waveform
+            frame.render_widget(Paragraph::new(ov_lines), chunks[1]);
+
+            // Detail waveform — pan a viewport through the stable background-thread buffer.
             let dw = chunks[2].width as usize;
-            let detail_peaks = waveform.detail_peaks(pos, zoom_secs, dw);
-            let center_col = dw as f64 / 2.0;
+            let dh = chunks[2].height as usize;
+            detail_cols.store(dw, Ordering::Relaxed);
+            detail_rows.store(dh, Ordering::Relaxed);
+            let buf = Arc::clone(&*detail_braille_shared.lock().unwrap());
+            let centre_col = dw / 2;
 
-            frame.render_widget(
-                Canvas::default()
-                    .marker(Marker::Braille)
-                    .x_bounds([0.0, dw as f64])
-                    .y_bounds([-1.0, 1.0])
-                    .paint(move |ctx| {
-                        draw_beat_lines(ctx, bpm as f64, offset_ms, pos.as_secs_f64(), zoom_secs as f64, dw as f64);
-                        for (col, (min, max)) in detail_peaks.iter().enumerate() {
-                            ctx.draw(&CanvasLine {
-                                x1: col as f64, y1: *min as f64,
-                                x2: col as f64, y2: *max as f64,
-                                color: Color::Cyan,
-                            });
+            // Compute the column offset into the buffer that places the playhead at centre.
+            // Uses smooth_display_samp (wall-clock based) to avoid audio-buffer-burst jitter.
+            let viewport_start: Option<usize> = if buf.buf_cols >= dw && buf.samples_per_col > 0 {
+                let delta = display_pos_samp as i64 - buf.anchor_sample as i64;
+                // Round to nearest column to avoid systematic +1/+2 jitter from truncation.
+                let delta_cols = (delta as f64 / buf.samples_per_col as f64).round() as i64;
+                let vs = buf.buf_cols as i64 / 2 + delta_cols - dw as i64 / 2;
+                if vs >= 0 && (vs as usize) + dw <= buf.buf_cols {
+                    Some(vs as usize)
+                } else {
+                    None // buffer exhausted (seek / first frame) — show blank
+                }
+            } else {
+                None
+            };
+
+            let beat_cols: Vec<usize> = if !analysing {
+                beat_line_cols(bpm as f64, offset_ms, display_pos_samp as f64 / sample_rate as f64, zoom_secs as f64, dw)
+            } else {
+                Vec::new()
+            };
+
+            let detail_lines: Vec<Line<'static>> = (0..dh)
+                .map(|r| {
+                    let row_slice: Option<&[u8]> = viewport_start.and_then(|vs| {
+                        buf.grid.get(r).map(|row| &row[vs..vs + dw])
+                    });
+                    let row = match row_slice {
+                        None => return Line::from(Span::raw("\u{2800}".repeat(dw))),
+                        Some(s) => s,
+                    };
+                    let mut spans: Vec<Span<'static>> = Vec::new();
+                    let mut run = String::new();
+                    let mut run_color = Color::Reset;
+                    for (c, &byte) in row.iter().enumerate() {
+                        // Replicate Canvas z-order: tick drawn first, waveform on top.
+                        // Tick is visible only where the waveform cell is empty (byte == 0).
+                        let (color, ch) = if c == centre_col {
+                            (Color::White, '\u{28FF}') // ⣿ solid centre line
+                        } else if beat_cols.contains(&c) && byte == 0 {
+                            (Color::DarkGray, '\u{28FF}') // ⣿ beat tick visible in gap
+                        } else {
+                            (Color::Cyan, char::from_u32(0x2800 | byte as u32).unwrap_or(' '))
+                        };
+                        if color != run_color {
+                            if !run.is_empty() {
+                                spans.push(Span::styled(
+                                    std::mem::take(&mut run),
+                                    Style::default().fg(run_color),
+                                ));
+                            }
+                            run_color = color;
                         }
-                        ctx.draw(&CanvasLine {
-                            x1: center_col, y1: -1.0,
-                            x2: center_col, y2: 1.0,
-                            color: Color::White,
-                        });
-                    }),
-                chunks[2],
-            );
+                        run.push(ch);
+                    }
+                    if !run.is_empty() {
+                        spans.push(Span::styled(run, Style::default().fg(run_color)));
+                    }
+                    Line::from(spans)
+                })
+                .collect();
+
+            frame.render_widget(Paragraph::new(detail_lines), chunks[2]);
 
             // Beat indicator (single line)
-            let (label, style) = if beat_on {
+            let (label, style) = if beat_on && !analysing {
                 (
                     "  ██  BEAT  ██  ",
                     Style::default()
@@ -354,20 +602,30 @@ fn tui_loop(
 
             // Key hints
             frame.render_widget(
-                Paragraph::new("Space: play/pause   [/]: beat jump   1-6: unit   +/-: offset   z/Z: zoom   b: browser   q: quit")
+                Paragraph::new("Space: play/pause   [/]: beat jump   1-6: unit   +/-: offset   z/Z: zoom   h/H: bpm½/×2   r: re-detect   b: browser   q: quit")
                     .style(Style::default().fg(Color::DarkGray)),
                 chunks[5],
             );
         })?;
 
-        if event::poll(Duration::from_millis(30))? {
+        // Target one column per frame; clamped to 8–50ms.
+        let dc = detail_cols.load(Ordering::Relaxed);
+        let poll_ms = if dc > 0 {
+            ((zoom_secs * 1000.0 / dc as f32) as u64).max(8).min(50)
+        } else {
+            30
+        };
+
+        if event::poll(Duration::from_millis(poll_ms))? {
             if let Event::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => {
                         player.stop();
-                        if let Some(entry) = cache.get(hash).cloned() {
-                            cache.set(hash.to_string(), CacheEntry { offset_ms, ..entry });
-                            cache.save();
+                        if let Some(ref hash) = analysis_hash {
+                            if let Some(entry) = cache.get(hash.as_str()).cloned() {
+                                cache.set(hash.clone(), CacheEntry { offset_ms, ..entry });
+                                cache.save();
+                            }
                         }
                         return Ok(None);
                     }
@@ -376,17 +634,21 @@ fn tui_loop(
                             BrowserResult::ReturnToPlayer => {}
                             BrowserResult::Selected(path) => {
                                 player.stop();
-                                if let Some(entry) = cache.get(hash).cloned() {
-                                    cache.set(hash.to_string(), CacheEntry { offset_ms, ..entry });
-                                    cache.save();
+                                if let Some(ref hash) = analysis_hash {
+                                    if let Some(entry) = cache.get(hash.as_str()).cloned() {
+                                        cache.set(hash.clone(), CacheEntry { offset_ms, ..entry });
+                                        cache.save();
+                                    }
                                 }
                                 return Ok(Some(path));
                             }
                             BrowserResult::Quit => {
                                 player.stop();
-                                if let Some(entry) = cache.get(hash).cloned() {
-                                    cache.set(hash.to_string(), CacheEntry { offset_ms, ..entry });
-                                    cache.save();
+                                if let Some(ref hash) = analysis_hash {
+                                    if let Some(entry) = cache.get(hash.as_str()).cloned() {
+                                        cache.set(hash.clone(), CacheEntry { offset_ms, ..entry });
+                                        cache.save();
+                                    }
                                 }
                                 return Ok(None);
                             }
@@ -402,6 +664,45 @@ fn tui_loop(
                     }
                     KeyCode::Char('Z') => {
                         if zoom_idx + 1 < ZOOM_LEVELS.len() { zoom_idx += 1; }
+                    }
+                    KeyCode::Char('h') => {
+                        bpm = (bpm * 0.5).max(40.0);
+                        if let Some(ref hash) = analysis_hash {
+                            if let Some(entry) = cache.get(hash.as_str()).cloned() {
+                                cache.set(hash.clone(), CacheEntry { bpm, offset_ms, ..entry });
+                                cache.save();
+                            }
+                        }
+                    }
+                    KeyCode::Char('H') => {
+                        bpm = (bpm * 2.0).min(240.0);
+                        if let Some(ref hash) = analysis_hash {
+                            if let Some(entry) = cache.get(hash.as_str()).cloned() {
+                                cache.set(hash.clone(), CacheEntry { bpm, offset_ms, ..entry });
+                                cache.save();
+                            }
+                        }
+                    }
+                    KeyCode::Char('r') => {
+                        if let Some(ref hash) = analysis_hash {
+                            let hash = hash.clone();
+                            detect_mode = (detect_mode + 1) % DETECT_MODES.len();
+                            let config = match detect_mode {
+                                1 => AnalysisConfig { enable_bpm_fusion: true, ..AnalysisConfig::default() },
+                                2 => AnalysisConfig { force_legacy_bpm: true, ..AnalysisConfig::default() },
+                                _ => AnalysisConfig::default(),
+                            };
+                            let mono_bg = Arc::clone(mono);
+                            let offset_snap = offset_ms;
+                            let (tx, rx) = mpsc::channel::<(String, f32, i64)>();
+                            thread::spawn(move || {
+                                if let Ok(result) = analyze_audio(&mono_bg, sample_rate, config) {
+                                    let _ = tx.send((hash, result.bpm.round(), offset_snap));
+                                }
+                            });
+                            bpm_rx = rx;
+                            analysis_hash = None;
+                        }
                     }
                     KeyCode::Char(c @ '1'..='6') => {
                         beat_unit_idx = (c as usize - '1' as usize).min(BEAT_UNITS.len() - 1);
@@ -434,27 +735,82 @@ fn tui_loop(
 // Beat marker helpers
 // ---------------------------------------------------------------------------
 
-/// Draw bar ticks (every 4 beats) along the bottom of the overview canvas.
-fn draw_bar_ticks(ctx: &mut Context<'_>, bpm: f64, offset_ms: i64, total_secs: f64, width: f64) {
-    if bpm <= 0.0 || total_secs <= 0.0 {
-        return;
-    }
-    let bar_period = 16.0 * 60.0 / bpm;
-    let offset_secs = offset_ms as f64 / 1000.0;
-    let n_start = (-offset_secs / bar_period).ceil() as i64;
-    let mut t = offset_secs + n_start as f64 * bar_period;
-    while t <= total_secs {
-        let x = ((t / total_secs) * width).round();
-        ctx.draw(&CanvasLine { x1: x, y1: -1.0, x2: x, y2: 1.0, color: Color::DarkGray });
-        t += bar_period;
+
+
+// ---------------------------------------------------------------------------
+// Braille rendering helpers
+// ---------------------------------------------------------------------------
+
+/// Pre-rendered braille buffer wider than the visible area, enabling smooth scrolling.
+/// The UI thread pans a viewport through this stable buffer rather than requesting
+/// a full recompute every time the playhead advances by one column.
+struct BrailleBuffer {
+    grid:            Vec<Vec<u8>>, // rows × buf_cols braille bytes
+    buf_cols:        usize,        // total buffer width (= 3 × screen_cols)
+    anchor_sample:   usize,        // mono-sample index at the buffer centre
+    samples_per_col: usize,        // mono samples represented by each buffer column
+}
+
+impl BrailleBuffer {
+    fn empty() -> Self {
+        Self { grid: Vec::new(), buf_cols: 0, anchor_sample: 0, samples_per_col: 1 }
     }
 }
 
-/// Draw full-height beat lines on the detail canvas, drawn before the waveform so the
-/// waveform paints over them — markers are only visible in the gaps between waveform peaks.
-fn draw_beat_lines(ctx: &mut Context<'_>, bpm: f64, offset_ms: i64, pos_secs: f64, zoom_secs: f64, width: f64) {
-    if bpm <= 0.0 || zoom_secs <= 0.0 {
-        return;
+
+/// Pre-render a waveform peak grid into a rows×cols array of Braille dot-pattern bytes.
+///
+/// Each byte encodes which dots are lit in the corresponding Braille cell (U+2800 + byte).
+/// Both the left and right dot columns are set for every lit dot row, so each column of the
+/// waveform appears as a solid-width vertical bar.
+///
+/// `peaks` — one (min, max) pair per column, values in [-1, 1].
+/// Mapping: y = +1 → top dot row 0; y = −1 → bottom dot row (rows×4 − 1).
+fn render_braille(peaks: &[(f32, f32)], rows: usize, cols: usize) -> Vec<Vec<u8>> {
+    // Bit mask for left+right dots at each of the 4 dot-rows within a Braille cell.
+    // Layout: dot1(bit0)/dot4(bit3), dot2(bit1)/dot5(bit4), dot3(bit2)/dot6(bit5), dot7(bit6)/dot8(bit7)
+    const DOT_BITS: [u8; 4] = [0x09, 0x12, 0x24, 0xC0];
+
+    let mut grid = vec![vec![0u8; cols]; rows];
+    if rows == 0 || cols == 0 {
+        return grid;
+    }
+    let total_dots = rows * 4;
+
+    for (c, &(min_val, max_val)) in peaks.iter().take(cols).enumerate() {
+        let clamped_max = max_val.min(1.0);
+        let clamped_min = min_val.max(-1.0);
+        if clamped_min > clamped_max {
+            continue;
+        }
+        // Map y ∈ [-1, 1] → dot row ∈ [0, total_dots); y=1 is top (row 0).
+        let top_dot = ((1.0 - clamped_max) / 2.0 * total_dots as f32) as usize;
+        let bot_dot = (((1.0 - clamped_min) / 2.0 * total_dots as f32) as usize)
+            .min(total_dots - 1);
+        for d in top_dot..=bot_dot {
+            let br = d / 4;
+            let dr = d % 4;
+            if br < rows {
+                grid[br][c] |= DOT_BITS[dr];
+            }
+        }
+    }
+    grid
+}
+
+/// Return the column indices of beat lines within the detail view window.
+///
+/// Replaces `draw_beat_lines` — callers colour these columns instead of drawing Canvas lines.
+fn beat_line_cols(
+    bpm: f64,
+    offset_ms: i64,
+    pos_secs: f64,
+    zoom_secs: f64,
+    cols: usize,
+) -> Vec<usize> {
+    let mut result = Vec::new();
+    if bpm <= 0.0 || zoom_secs <= 0.0 || cols == 0 {
+        return result;
     }
     let beat_period = 60.0 / bpm;
     let offset_secs = offset_ms as f64 / 1000.0;
@@ -464,11 +820,36 @@ fn draw_beat_lines(ctx: &mut Context<'_>, bpm: f64, offset_ms: i64, pos_secs: f6
     let mut t = offset_secs + n_start as f64 * beat_period;
     while t <= window_end {
         if t >= window_start {
-            let x = ((t - window_start) / zoom_secs * width).round();
-            ctx.draw(&CanvasLine { x1: x, y1: -1.0, x2: x, y2: 1.0, color: Color::DarkGray });
+            let col = ((t - window_start) / zoom_secs * cols as f64).round() as usize;
+            if col < cols {
+                result.push(col);
+            }
         }
         t += beat_period;
     }
+    result
+}
+
+/// Return the column indices of bar-tick lines within the overview.
+///
+/// Replaces `draw_bar_ticks` — callers colour these columns instead of drawing Canvas lines.
+fn bar_tick_cols(bpm: f64, offset_ms: i64, total_secs: f64, cols: usize) -> Vec<usize> {
+    let mut result = Vec::new();
+    if bpm <= 0.0 || total_secs <= 0.0 || cols == 0 {
+        return result;
+    }
+    let bar_period = 16.0 * 60.0 / bpm;
+    let offset_secs = offset_ms as f64 / 1000.0;
+    let n_start = (-offset_secs / bar_period).ceil() as i64;
+    let mut t = offset_secs + n_start as f64 * bar_period;
+    while t <= total_secs {
+        let col = ((t / total_secs) * cols as f64).round() as usize;
+        if col < cols {
+            result.push(col);
+        }
+        t += bar_period;
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -479,12 +860,11 @@ struct WaveformData {
     /// Full-track peak envelope at OVERVIEW_RESOLUTION buckets.
     peaks: Vec<(f32, f32)>,
     /// Raw mono samples for detail view rendering.
-    mono: Vec<f32>,
-    sample_rate: u32,
+    mono: Arc<Vec<f32>>,
 }
 
 impl WaveformData {
-    fn compute(mono: Vec<f32>, sample_rate: u32) -> Self {
+    fn compute(mono: Arc<Vec<f32>>, _sample_rate: u32) -> Self {
         let n = mono.len();
         let chunk_size = (n / OVERVIEW_RESOLUTION).max(1);
         let peaks = mono
@@ -495,37 +875,9 @@ impl WaveformData {
                 (min.max(-1.0), max.min(1.0))
             })
             .collect();
-        Self { peaks, mono, sample_rate }
+        Self { peaks, mono }
     }
 
-    /// Compute peak envelope for the detail view window centred on `pos`.
-    /// Returns `cols` (min, max) pairs.
-    fn detail_peaks(&self, pos: Duration, window_secs: f32, cols: usize) -> Vec<(f32, f32)> {
-        if cols == 0 {
-            return vec![];
-        }
-        let center = (pos.as_secs_f32() * self.sample_rate as f32) as usize;
-        let half = (window_secs * self.sample_rate as f32 / 2.0) as usize;
-        let start = center.saturating_sub(half);
-        let end = (center + half).min(self.mono.len());
-        let window = &self.mono[start..end];
-
-        if window.is_empty() {
-            return vec![(0.0, 0.0); cols];
-        }
-
-        let chunk_size = (window.len() / cols).max(1);
-        let mut result: Vec<(f32, f32)> = window
-            .chunks(chunk_size)
-            .map(|chunk| {
-                let min = chunk.iter().cloned().fold(f32::INFINITY, f32::min);
-                let max = chunk.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                (min.max(-1.0), max.min(1.0))
-            })
-            .collect();
-        result.resize(cols, (0.0, 0.0));
-        result
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -655,7 +1007,12 @@ impl SeekHandle {
 // ---------------------------------------------------------------------------
 
 /// Decode an audio file. Returns (mono_f32, interleaved_f32, sample_rate, channels).
-fn decode_audio(path: &str) -> Result<(Vec<f32>, Vec<f32>, u32, u16), Box<dyn std::error::Error>> {
+/// Updates `decoded_samples` and `estimated_total` atomics as decode progresses.
+fn decode_audio(
+    path: &str,
+    decoded_samples: Arc<AtomicUsize>,
+    estimated_total: Arc<AtomicUsize>,
+) -> Result<(Vec<f32>, Vec<f32>, u32, u16), Box<dyn std::error::Error>> {
     let src = std::fs::File::open(path)?;
     let mss = MediaSourceStream::new(Box::new(src), Default::default());
 
@@ -679,6 +1036,10 @@ fn decode_audio(path: &str) -> Result<(Vec<f32>, Vec<f32>, u32, u16), Box<dyn st
     let sample_rate = track.codec_params.sample_rate.ok_or("track has no sample rate")?;
     let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(2) as u16;
 
+    if let Some(n_frames) = track.codec_params.n_frames {
+        estimated_total.store((n_frames as usize).saturating_mul(channels as usize), Ordering::Relaxed);
+    }
+
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())?;
 
@@ -699,6 +1060,7 @@ fn decode_audio(path: &str) -> Result<(Vec<f32>, Vec<f32>, u32, u16), Box<dyn st
                 });
                 buf.copy_interleaved_ref(decoded);
                 interleaved.extend_from_slice(buf.samples());
+                decoded_samples.store(interleaved.len(), Ordering::Relaxed);
             }
             Err(SymphoniaError::IoError(_)) | Err(SymphoniaError::DecodeError(_)) => continue,
             Err(e) => return Err(e.into()),
@@ -764,6 +1126,10 @@ impl Cache {
 
     fn set(&mut self, hash: String, entry: CacheEntry) {
         self.entries.insert(hash, entry);
+    }
+
+    fn entries_snapshot(&self) -> std::collections::HashMap<String, CacheEntry> {
+        self.entries.clone()
     }
 
     fn save(&self) {
