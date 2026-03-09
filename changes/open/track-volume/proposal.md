@@ -13,3 +13,7 @@ Allow the user to adjust the playback volume of the current track at runtime, di
 - Key bindings: likely `↑`/`↓` or dedicated keys — to be decided when keyboard mapping is designed.
 - Volume range and step size (e.g. 0–100% in 5% steps).
 - Whether volume is persisted between sessions (per-track or global).
+### Steer
+- Arrow keys is fine for now.
+- 5% steps is good
+- Volume isn't persisted for now

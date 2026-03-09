@@ -6,11 +6,14 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, MouseButton, MouseEventKind};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind,
+    DisableMouseCapture, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -52,7 +55,10 @@ fn main() {
     // Set up terminal once — shared by browser and player.
     let setup = (|| -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
         enable_raw_mode()?;
-        io::stdout().execute(EnterAlternateScreen)?.execute(EnableMouseCapture)?;
+        io::stdout()
+            .execute(EnterAlternateScreen)?
+            .execute(EnableMouseCapture)?
+            .execute(PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES))?;
         Terminal::new(CrosstermBackend::new(io::stdout()))
     })();
     let mut terminal = match setup {
@@ -71,12 +77,12 @@ fn main() {
             Ok(BrowserResult::Selected(p)) => p,
             Ok(BrowserResult::ReturnToPlayer) | Ok(BrowserResult::Quit) => {
                 let _ = disable_raw_mode();
-                let _ = io::stdout().execute(DisableMouseCapture).and_then(|s| s.execute(LeaveAlternateScreen));
+                let _ = io::stdout().execute(PopKeyboardEnhancementFlags).and_then(|s| s.execute(DisableMouseCapture)).and_then(|s| s.execute(LeaveAlternateScreen));
                 return;
             }
             Err(e) => {
                 let _ = disable_raw_mode();
-                let _ = io::stdout().execute(DisableMouseCapture).and_then(|s| s.execute(LeaveAlternateScreen));
+                let _ = io::stdout().execute(PopKeyboardEnhancementFlags).and_then(|s| s.execute(DisableMouseCapture)).and_then(|s| s.execute(LeaveAlternateScreen));
                 eprintln!("Browser error: {e}");
                 std::process::exit(1);
             }
@@ -87,7 +93,7 @@ fn main() {
         Ok(h) => h,
         Err(e) => {
             let _ = disable_raw_mode();
-            let _ = io::stdout().execute(DisableMouseCapture).and_then(|s| s.execute(LeaveAlternateScreen));
+            let _ = io::stdout().execute(PopKeyboardEnhancementFlags).and_then(|s| s.execute(DisableMouseCapture)).and_then(|s| s.execute(LeaveAlternateScreen));
             eprintln!("Audio output error: {e}");
             std::process::exit(1);
         }
@@ -142,7 +148,7 @@ fn main() {
                 if let Ok(Event::Key(key)) = event::read() {
                     if key.code == KeyCode::Char('q') {
                         let _ = disable_raw_mode();
-                        let _ = io::stdout().execute(DisableMouseCapture).and_then(|s| s.execute(LeaveAlternateScreen));
+                        let _ = io::stdout().execute(PopKeyboardEnhancementFlags).and_then(|s| s.execute(DisableMouseCapture)).and_then(|s| s.execute(LeaveAlternateScreen));
                         return;
                     }
                 }
@@ -153,7 +159,7 @@ fn main() {
             Ok(v) => v,
             Err(e) => {
                 let _ = disable_raw_mode();
-                let _ = io::stdout().execute(DisableMouseCapture).and_then(|s| s.execute(LeaveAlternateScreen));
+                let _ = io::stdout().execute(PopKeyboardEnhancementFlags).and_then(|s| s.execute(DisableMouseCapture)).and_then(|s| s.execute(LeaveAlternateScreen));
                 eprintln!("Decode error: {e}");
                 std::process::exit(1);
             }
@@ -220,7 +226,7 @@ fn main() {
             Ok(None) => break,
             Err(e) => {
                 let _ = disable_raw_mode();
-                let _ = io::stdout().execute(DisableMouseCapture).and_then(|s| s.execute(LeaveAlternateScreen));
+                let _ = io::stdout().execute(PopKeyboardEnhancementFlags).and_then(|s| s.execute(DisableMouseCapture)).and_then(|s| s.execute(LeaveAlternateScreen));
                 eprintln!("TUI error: {e}");
                 std::process::exit(1);
             }
@@ -228,7 +234,7 @@ fn main() {
     }
 
     let _ = disable_raw_mode();
-    let _ = io::stdout().execute(DisableMouseCapture).and_then(|s| s.execute(LeaveAlternateScreen));
+    let _ = io::stdout().execute(PopKeyboardEnhancementFlags).and_then(|s| s.execute(DisableMouseCapture)).and_then(|s| s.execute(LeaveAlternateScreen));
 }
 
 fn tui_loop(
@@ -259,6 +265,7 @@ fn tui_loop(
     let mut detail_height: usize = 8;
     let mut overview_rect = ratatui::layout::Rect::default();
     let mut last_bar_cols: Vec<usize> = Vec::new();
+    let mut nudge: i8 = 0; // -1 = backward, 0 = none, +1 = forward
 
     // Shared state for the background detail-braille thread.
     let detail_cols = Arc::new(AtomicUsize::new(0));
@@ -396,12 +403,22 @@ fn tui_loop(
         // (also snaps) so any firing is visually obvious — for empirical observation only.
         if !player.is_paused() {
             smooth_display_samp += elapsed * sample_rate as f64;
+        } else if nudge != 0 {
+            // While paused and nudging, drift the display position at ±10% of normal speed
+            // and sync the actual position atomic so seeking remains accurate.
+            let total_mono_samps =
+                (seek_handle.samples.len() / seek_handle.channels as usize) as f64;
+            smooth_display_samp = (smooth_display_samp
+                + elapsed * sample_rate as f64 * nudge as f64 * 0.1)
+                .clamp(0.0, total_mono_samps);
+            // Use set_position (no quiet-frame search) — no audio is playing so no click occurs.
+            seek_handle.set_position(smooth_display_samp / sample_rate as f64);
         }
         let drift = smooth_display_samp - pos_samp as f64;
         // When paused there is no audio jitter, so snap on any non-trivial drift (e.g. after
         // a beat jump while paused). When playing, only snap on large drift (>500ms) to avoid
         // reacting to normal audio-burst jitter.
-        if drift.abs() > sample_rate as f64 * 0.5 || (player.is_paused() && drift.abs() > 1.0) {
+        if drift.abs() > sample_rate as f64 * 0.5 || (player.is_paused() && nudge == 0 && drift.abs() > 1.0) {
             // Large drift (seek / startup) — snap to the nearest column boundary so
             // sub_col=false after every seek. This prevents sub_col from alternating
             // when the seek distance is an odd number of half-columns, which would
@@ -705,6 +722,14 @@ fn tui_loop(
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
                     Span::styled(format!("[{status}]  "), Style::default().fg(Color::Cyan)),
+                    if nudge != 0 {
+                        Span::styled(
+                            format!("[nudge {}]  ", if nudge > 0 { "▶" } else { "◀" }),
+                            Style::default().fg(Color::Yellow),
+                        )
+                    } else {
+                        Span::raw("")
+                    },
                     Span::raw(time_str),
                     Span::styled(
                         format!("   zoom: {}s", zoom_secs),
@@ -716,7 +741,7 @@ fn tui_loop(
 
             // Key hints
             frame.render_widget(
-                Paragraph::new(format!("Space: play/pause   [/]: beat jump   1-7: unit   +/-: offset   z/Z: zoom   {{/}}: height({})   h/H: bpm½/×2   r: re-detect   b: browser   q: quit",
+                Paragraph::new(format!("Space: play/pause   [/]: beat jump   1-7: unit   +/-: offset   z/Z: zoom   {{/}}: height({})   ,/.: nudge   h/H: bpm½/×2   r: re-detect   b: browser   q: quit",
                     detail_height)
                 )
                     .style(Style::default().fg(Color::DarkGray)),
@@ -761,6 +786,24 @@ fn tui_loop(
                 }
             }
             Event::Key(key) => {
+                // Nudge: handled for all key kinds so release is detected.
+                match (key.kind, key.code) {
+                    (KeyEventKind::Press | KeyEventKind::Repeat, KeyCode::Char(',')) => {
+                        nudge = -1;
+                        player.set_speed(0.9);
+                    }
+                    (KeyEventKind::Press | KeyEventKind::Repeat, KeyCode::Char('.')) => {
+                        nudge = 1;
+                        player.set_speed(1.1);
+                    }
+                    (KeyEventKind::Release, KeyCode::Char(',') | KeyCode::Char('.')) => {
+                        nudge = 0;
+                        player.set_speed(1.0);
+                    }
+                    _ => {}
+                }
+                // All other actions fire only on Press or Repeat.
+                if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => {
                         player.stop();
@@ -853,7 +896,7 @@ fn tui_loop(
                             analysis_hash = None;
                         }
                     }
-                    KeyCode::Char(c @ '1'..='6') => {
+                    KeyCode::Char(c @ '1'..='7') => {
                         beat_unit_idx = (c as usize - '1' as usize).min(BEAT_UNITS.len() - 1);
                     }
                     KeyCode::Char('[') => {
@@ -879,6 +922,7 @@ fn tui_loop(
                     }
                     _ => {}
                 }
+                } // end if Press | Repeat
             }
             _ => {}
             }
@@ -1096,7 +1140,11 @@ impl Iterator for TrackingSource {
 }
 
 impl Source for TrackingSource {
-    fn current_span_len(&self) -> Option<usize> { None }
+    fn current_span_len(&self) -> Option<usize> {
+        // Return a short span so UniformSourceIterator re-checks sample_rate() frequently,
+        // enabling Player::set_speed() changes to take effect within ~100ms.
+        Some(self.sample_rate as usize / 10 * self.channels as usize)
+    }
     fn channels(&self) -> NonZero<u16> {
         NonZero::new(self.channels).unwrap_or(NonZero::new(2).unwrap())
     }
@@ -1177,6 +1225,18 @@ impl SeekHandle {
         let target_sample = (best_frame * frame_len).min(self.samples.len());
 
         // Write position directly and clear any in-progress fade.
+        self.pending_target.store(usize::MAX, Ordering::SeqCst);
+        self.fade_remaining.store(0, Ordering::SeqCst);
+        self.position.store(target_sample, Ordering::SeqCst);
+    }
+
+    /// Move to `target_secs` exactly, without a quiet-frame search or fade.
+    /// Used for paused nudge where no click can occur.
+    fn set_position(&self, target_secs: f64) {
+        let frame_len = self.channels as usize;
+        let total_frames = self.samples.len() / frame_len;
+        let target_frame = (target_secs * self.sample_rate as f64).round() as usize;
+        let target_sample = target_frame.min(total_frames) * frame_len;
         self.pending_target.store(usize::MAX, Ordering::SeqCst);
         self.fade_remaining.store(0, Ordering::SeqCst);
         self.position.store(target_sample, Ordering::SeqCst);
@@ -1487,6 +1547,7 @@ fn run_browser(
 
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press { continue; }
                 match key.code {
                     KeyCode::Up => state.move_up(),
                     KeyCode::Down => state.move_down(),

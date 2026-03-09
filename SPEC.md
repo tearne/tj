@@ -103,6 +103,12 @@ The render frame period adapts to the current zoom level and detail panel width,
 ### Needle Drop
 - A left mouse click anywhere on the Overview waveform seeks the transport to the start of the nearest bar marker at or to the left of the click position. Playback state is preserved — if playing, playback continues from the new position; if paused, the transport remains paused. The Detail view recentres on the new position immediately.
 
+### Nudge
+- Holding `,` (nudge backward) or `.` (nudge forward) applies a continuous ±10% speed offset to playback. Releasing the key returns to normal speed immediately.
+- While playing, speed and pitch shift by ±10%; the audio output reflects the change within ~100ms.
+- While paused, nudge has no audible effect but drifts the transport position at ±10% of normal playback speed for as long as the key is held.
+- The nudge state is indicated in the UI while active.
+
 ### Beat Jump
 - Beat jump moves the playhead backward or forward by a user-selected number of beats: 4, 8, 16, 32, 64, or 128.
 - The jump is by exactly N × beat_period seconds from the current position, preserving rhythmic continuity.
