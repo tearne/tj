@@ -72,11 +72,11 @@ tj [path]
 ### Waveform Visualisation
 - Two waveform views are displayed simultaneously:
   - **Overview**: full-track waveform, with a playhead marker showing current position.
-  - **Detail**: zoomed-in waveform centred on the playhead, with variable zoom level.
+  - **Detail view**: zoomed waveform centred on the playhead, with variable zoom level.
 - Both views update in real time during playback.
-- The detail view tracks the playhead as the track progresses.
-- Zoom level for the detail view is adjustable by the user.
-- The overview displays a bar marker (every 4 bars) as a full-height line drawn beneath the waveform, visible only in the gaps.
+- The Detail view tracks the playhead as the track progresses.
+- Zoom level for the Detail view is adjustable by the user.
+- The Overview displays bar markers as full-height lines drawn beneath the waveform, visible only in the gaps. The marker interval starts at every 4 bars and doubles if there are fewer than two characters between any pair of adjacent markers, repeating until all pairs have at least two characters between them. A legend in the top-right corner of the Overview shows the current interval (e.g. `4 bars`, `8 bars`).
 - The detail view displays a beat marker at each beat position as a full-height line drawn beneath the waveform, visible only in the gaps.
 - Buffer columns representing sample positions before the start of the track render as silence (zero amplitude), not as a mirror of position 0.
 - Both sets of markers shift immediately when the phase offset is adjusted.
@@ -94,16 +94,14 @@ The following principles are required to achieve smooth, stable rendering:
 - **Tick marks in screen space**: Beat tick marks must be computed in **screen space** from the **quantised viewport centre**, not encoded as isolated marks in **buffer space**. Isolated marks in buffer space produce completely different braille characters on alternating frames when processed through the half-column shift, causing visible oscillation at wide zoom.
 - **Consistent tick and viewport centre**: Tick mark positions and the waveform viewport must both be derived from the **quantised viewport centre**, not from the raw smooth display position. The two can differ by up to half a column, causing ticks to snap relative to the waveform on every frame at wide zoom.
 
-### Detail Waveform Render Modes
-The detail waveform supports two render modes, toggled at runtime with `m` (shown in the key hints):
-- **Buffer mode** (default): the background thread pre-renders a 3× wide braille buffer; the UI thread slides a viewport through it. Recomputes only on zoom change, resize, or when the playhead drifts within one screen-width of the buffer edge.
-- **Live mode**: the background thread recomputes a 2× wide buffer every 4 ms, always centred on the current smooth display position. Each frame reflects the exact playback position with minimal lag.
-
 The detail waveform height is user-adjustable at runtime with `{` (decrease) and `}` (increase), defaulting to 8 rows. Any unused space below the panel is left blank. The current height is shown in the key hints line.
 
 The detail waveform scrolls at half-column resolution: the viewport can be positioned at half-character offsets without modifying the pre-rendered buffer (see *Glossary — Half-column scrolling*).
 
 The render frame period adapts to the current zoom level and detail panel width, targeting one dot-column advance per frame. At very tight zoom it is capped at ~120 fps; at very wide zoom it is capped at ~5 fps to keep input responsive.
+
+### Needle Drop
+- A left mouse click anywhere on the Overview waveform seeks the transport to the start of the nearest bar marker at or to the left of the click position. Playback state is preserved — if playing, playback continues from the new position; if paused, the transport remains paused. The Detail view recentres on the new position immediately.
 
 ### Beat Jump
 - Beat jump moves the playhead backward or forward by a user-selected number of beats: 4, 8, 16, 32, 64, or 128.

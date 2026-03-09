@@ -8,6 +8,6 @@ Add a `## Glossary` section to `SPEC.md` containing the terms from the proposal 
 No code changes are required — this is a spec-only change.
 
 ## Tasks
-1. Impl: Add `## Glossary` section to `SPEC.md`
-2. Impl: Update `### Rendering` section in `SPEC.md` to reference glossary terms
-3. Process: confirm ready to archive
+1. ✓ Impl: Add `## Glossary` section to `SPEC.md`
+2. ✓ Impl: Update `### Rendering` section in `SPEC.md` to reference glossary terms
+3. ✓ Process: confirm ready to archive

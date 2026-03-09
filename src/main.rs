@@ -6,10 +6,11 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode};
+use crossterm::event::{self, Event, KeyCode, MouseButton, MouseEventKind};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
@@ -35,8 +36,8 @@ use stratum_dsp::{analyze_audio, AnalysisConfig};
 const OVERVIEW_RESOLUTION: usize = 4000;
 const ZOOM_LEVELS: &[f32] = &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
 const DEFAULT_ZOOM_IDX: usize = 2; // 4 seconds
-const BEAT_UNITS: &[u32] = &[4, 8, 16, 32, 64, 128];
-const DEFAULT_BEAT_UNIT_IDX: usize = 2; // 16 beats
+const BEAT_UNITS: &[u32] = &[1, 4, 8, 16, 32, 64, 128];
+const DEFAULT_BEAT_UNIT_IDX: usize = 3; // 16 beats
 const FADE_SAMPLES: i64 = 256; // ~5.8ms at 44100 Hz — fade-out then fade-in around each seek
 const DETECT_MODES: &[&str] = &["auto", "fusion", "legacy"];
 
@@ -51,7 +52,7 @@ fn main() {
     // Set up terminal once — shared by browser and player.
     let setup = (|| -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
         enable_raw_mode()?;
-        io::stdout().execute(EnterAlternateScreen)?;
+        io::stdout().execute(EnterAlternateScreen)?.execute(EnableMouseCapture)?;
         Terminal::new(CrosstermBackend::new(io::stdout()))
     })();
     let mut terminal = match setup {
@@ -70,12 +71,12 @@ fn main() {
             Ok(BrowserResult::Selected(p)) => p,
             Ok(BrowserResult::ReturnToPlayer) | Ok(BrowserResult::Quit) => {
                 let _ = disable_raw_mode();
-                let _ = io::stdout().execute(LeaveAlternateScreen);
+                let _ = io::stdout().execute(DisableMouseCapture).and_then(|s| s.execute(LeaveAlternateScreen));
                 return;
             }
             Err(e) => {
                 let _ = disable_raw_mode();
-                let _ = io::stdout().execute(LeaveAlternateScreen);
+                let _ = io::stdout().execute(DisableMouseCapture).and_then(|s| s.execute(LeaveAlternateScreen));
                 eprintln!("Browser error: {e}");
                 std::process::exit(1);
             }
@@ -86,7 +87,7 @@ fn main() {
         Ok(h) => h,
         Err(e) => {
             let _ = disable_raw_mode();
-            let _ = io::stdout().execute(LeaveAlternateScreen);
+            let _ = io::stdout().execute(DisableMouseCapture).and_then(|s| s.execute(LeaveAlternateScreen));
             eprintln!("Audio output error: {e}");
             std::process::exit(1);
         }
@@ -141,7 +142,7 @@ fn main() {
                 if let Ok(Event::Key(key)) = event::read() {
                     if key.code == KeyCode::Char('q') {
                         let _ = disable_raw_mode();
-                        let _ = io::stdout().execute(LeaveAlternateScreen);
+                        let _ = io::stdout().execute(DisableMouseCapture).and_then(|s| s.execute(LeaveAlternateScreen));
                         return;
                     }
                 }
@@ -152,7 +153,7 @@ fn main() {
             Ok(v) => v,
             Err(e) => {
                 let _ = disable_raw_mode();
-                let _ = io::stdout().execute(LeaveAlternateScreen);
+                let _ = io::stdout().execute(DisableMouseCapture).and_then(|s| s.execute(LeaveAlternateScreen));
                 eprintln!("Decode error: {e}");
                 std::process::exit(1);
             }
@@ -219,7 +220,7 @@ fn main() {
             Ok(None) => break,
             Err(e) => {
                 let _ = disable_raw_mode();
-                let _ = io::stdout().execute(LeaveAlternateScreen);
+                let _ = io::stdout().execute(DisableMouseCapture).and_then(|s| s.execute(LeaveAlternateScreen));
                 eprintln!("TUI error: {e}");
                 std::process::exit(1);
             }
@@ -227,7 +228,7 @@ fn main() {
     }
 
     let _ = disable_raw_mode();
-    let _ = io::stdout().execute(LeaveAlternateScreen);
+    let _ = io::stdout().execute(DisableMouseCapture).and_then(|s| s.execute(LeaveAlternateScreen));
 }
 
 fn tui_loop(
@@ -256,6 +257,8 @@ fn tui_loop(
     let mut beat_unit_idx: usize = DEFAULT_BEAT_UNIT_IDX;
     let mut detect_mode: usize = 0;
     let mut detail_height: usize = 8;
+    let mut overview_rect = ratatui::layout::Rect::default();
+    let mut last_bar_cols: Vec<usize> = Vec::new();
 
     // Shared state for the background detail-braille thread.
     let detail_cols = Arc::new(AtomicUsize::new(0));
@@ -263,9 +266,7 @@ fn tui_loop(
     let detail_zoom_at = Arc::new(AtomicUsize::new(zoom_idx));
     let detail_braille_shared: Arc<Mutex<Arc<BrailleBuffer>>> =
         Arc::new(Mutex::new(Arc::new(BrailleBuffer::empty())));
-    let live_mode_shared   = Arc::new(AtomicBool::new(false));
     let display_pos_shared = Arc::new(AtomicUsize::new(0));
-    let mut live_mode = false;
 
     // StopOnDrop sets the stop flag when tui_loop exits for any reason.
     struct StopOnDrop(Arc<AtomicBool>);
@@ -283,7 +284,6 @@ fn tui_loop(
         let stop_bg        = Arc::clone(&stop_detail);
         let wf_bg          = Arc::clone(&waveform);
 
-        let live_mode_bg   = Arc::clone(&live_mode_shared);
         let display_pos_bg = Arc::clone(&display_pos_shared);
         let sr_bg          = sample_rate;
         let ch_bg          = seek_handle.channels;
@@ -307,15 +307,13 @@ fn tui_loop(
 
                 let zoom         = zoom_bg.load(Ordering::Relaxed).min(ZOOM_LEVELS.len() - 1);
                 let zoom_secs    = ZOOM_LEVELS[zoom];
-                let live         = live_mode_bg.load(Ordering::Relaxed);
-                // Always use the smooth display position as the buffer centre — even in buffer mode.
-                // Using the raw audio position (pos_bg) causes premature recomputes and off-centre
+                // Always use the smooth display position as the buffer centre.
+                // Using the raw audio position causes premature recomputes and off-centre
                 // buffers whenever rodio bursts the audio position forward.
                 let pos_samp     = display_pos_bg.load(Ordering::Relaxed) / ch_bg as usize;
                 let col_samp     = ((zoom_secs * sr_bg as f32) as usize / cols).max(1);
 
                 // Recompute when dimensions/zoom change or the viewport approaches the buffer edge.
-                // In live mode, always recompute.
                 let drift_cols = if last_samples_per_col > 0 {
                     let drift = pos_samp as i64 - last_anchor_sample as i64;
                     drift.unsigned_abs() as usize / last_samples_per_col
@@ -323,11 +321,10 @@ fn tui_loop(
                     usize::MAX // force initial compute
                 };
 
-                let must_recompute = live
-                    || cols != last_cols || rows != last_rows || zoom != last_zoom || drift_cols >= cols * 3 / 4;
+                let must_recompute = cols != last_cols || rows != last_rows || zoom != last_zoom || drift_cols >= cols * 3 / 4;
 
                 if must_recompute {
-                    let buf_cols = if live { cols * 2 } else { cols * 5 };
+                    let buf_cols = cols * 5;
                     // Align anchor to the column grid so every buffer at this zoom level shares
                     // the same column boundaries — overlapping columns are byte-for-byte identical,
                     // making the buffer handoff visually seamless.
@@ -364,7 +361,7 @@ fn tui_loop(
                     last_samples_per_col = col_samp;
                 }
 
-                thread::sleep(Duration::from_millis(if live { 4 } else { 8 }));
+                thread::sleep(Duration::from_millis(8));
             }
         });
     }
@@ -384,7 +381,9 @@ fn tui_loop(
         let zoom_secs = ZOOM_LEVELS[zoom_idx];
         let col_secs = if dc > 0 { zoom_secs as f64 / dc as f64 } else { 0.033 };
         let elapsed = now.duration_since(last_render).as_secs_f64()
-            .min(col_secs * 0.75); // cap at 1.5× a dot-column (= 0.75× a full column)
+            // Cap at 4 columns per frame. Must exceed the minimum poll_dur (8ms) at every zoom
+            // level — a tighter cap causes systematic drift and periodic large-drift snapping.
+            .min(col_secs * 4.0);
         last_render = now;
 
         // Real audio position — used for beat flash, time display, overview playhead.
@@ -399,7 +398,10 @@ fn tui_loop(
             smooth_display_samp += elapsed * sample_rate as f64;
         }
         let drift = smooth_display_samp - pos_samp as f64;
-        if drift.abs() > sample_rate as f64 * 0.5 {
+        // When paused there is no audio jitter, so snap on any non-trivial drift (e.g. after
+        // a beat jump while paused). When playing, only snap on large drift (>500ms) to avoid
+        // reacting to normal audio-burst jitter.
+        if drift.abs() > sample_rate as f64 * 0.5 || (player.is_paused() && drift.abs() > 1.0) {
             // Large drift (seek / startup) — snap to the nearest column boundary so
             // sub_col=false after every seek. This prevents sub_col from alternating
             // when the seek distance is an odd number of half-columns, which would
@@ -413,7 +415,6 @@ fn tui_loop(
         }
         let display_pos_samp = smooth_display_samp as usize;
         display_pos_shared.store(display_pos_samp * seek_handle.channels as usize, Ordering::Relaxed);
-        live_mode_shared.store(live_mode, Ordering::Relaxed);
 
         // Beat-derived values — recomputed each frame so they react to bpm changes instantly.
         let beat_period = Duration::from_secs_f64(60.0 / bpm as f64);
@@ -491,25 +492,36 @@ fn tui_loop(
                 })
                 .collect();
             let ov_braille = render_braille(&ov_peaks, oh, ow);
-            let bar_cols: Vec<usize> = if !analysing {
+            let (bar_cols, bars_per_tick): (Vec<usize>, u32) = if !analysing {
                 bar_tick_cols(bpm as f64, offset_ms, total_duration.as_secs_f64(), ow)
             } else {
-                Vec::new()
+                (Vec::new(), 4)
             };
+            overview_rect = chunks[1];
+            last_bar_cols = bar_cols.clone();
+            let legend: String = if !analysing {
+                format!("{} bars", bars_per_tick)
+            } else {
+                String::new()
+            };
+            let legend_start = ow.saturating_sub(legend.len());
 
             let ov_lines: Vec<Line<'static>> = ov_braille
                 .into_iter()
-                .map(|row| {
+                .enumerate()
+                .map(|(r, row)| {
                     let mut spans: Vec<Span<'static>> = Vec::new();
                     let mut run = String::new();
                     let mut run_color = Color::Reset;
                     for (c, byte) in row.into_iter().enumerate() {
-                        // Replicate Canvas z-order: tick drawn first, waveform on top.
-                        // Tick is visible only where the waveform cell is empty (byte == 0).
-                        let (color, ch) = if c == playhead_col {
+                        // Row 0 top-right: legend overlay takes priority over everything.
+                        let (color, ch) = if r == 0 && c >= legend_start && !legend.is_empty() {
+                            let lch = legend.chars().nth(c - legend_start).unwrap_or(' ');
+                            (Color::DarkGray, lch)
+                        } else if c == playhead_col {
                             (Color::White, '\u{28FF}') // ⣿ solid playhead
-                        } else if bar_cols.contains(&c) && byte == 0 {
-                            (Color::DarkGray, '\u{28FF}') // ⣿ tick visible in gap
+                        } else if bar_cols.contains(&c) && (r == 0 || r + 1 == oh) {
+                            (Color::DarkGray, '\u{28FF}') // ⣿ tick at top and bottom rows only
                         } else {
                             (Color::Green, char::from_u32(0x2800 | byte as u32).unwrap_or(' '))
                         };
@@ -648,7 +660,7 @@ fn tui_loop(
                         let (color, ch) = if c == centre_col {
                             (Color::White, '\u{28FF}') // ⣿ solid centre line
                         } else if is_tick_row {
-                            (Color::DarkGray, char::from_u32(0x2800 | byte as u32).unwrap_or(' '))
+                            (Color::Gray, char::from_u32(0x2800 | byte as u32).unwrap_or(' '))
                         } else {
                             (Color::Cyan, char::from_u32(0x2800 | byte as u32).unwrap_or(' '))
                         };
@@ -704,8 +716,8 @@ fn tui_loop(
 
             // Key hints
             frame.render_widget(
-                Paragraph::new(format!("Space: play/pause   [/]: beat jump   1-6: unit   +/-: offset   z/Z: zoom   {{/}}: height({})   m: mode({})   h/H: bpm½/×2   r: re-detect   b: browser   q: quit",
-                    detail_height, if live_mode { "live" } else { "buf" })
+                Paragraph::new(format!("Space: play/pause   [/]: beat jump   1-7: unit   +/-: offset   z/Z: zoom   {{/}}: height({})   h/H: bpm½/×2   r: re-detect   b: browser   q: quit",
+                    detail_height)
                 )
                     .style(Style::default().fg(Color::DarkGray)),
                 chunks[5],
@@ -722,7 +734,33 @@ fn tui_loop(
         };
 
         if event::poll(poll_dur)? {
-            if let Event::Key(key) = event::read()? {
+            match event::read()? {
+            Event::Mouse(mouse_event) => {
+                if mouse_event.kind == MouseEventKind::Down(MouseButton::Left) {
+                    let col = mouse_event.column as usize;
+                    let row = mouse_event.row as usize;
+                    let rect = overview_rect;
+                    if col >= rect.x as usize
+                        && col < (rect.x + rect.width) as usize
+                        && row >= rect.y as usize
+                        && row < (rect.y + rect.height) as usize
+                    {
+                        let ow = rect.width as usize;
+                        let click_col = col - rect.x as usize;
+                        let target_col = last_bar_cols.iter().copied().filter(|&c| c <= click_col).last();
+                        let target_secs = match target_col {
+                            Some(c) => c as f64 / ow as f64 * total_duration.as_secs_f64(),
+                            None => 0.0,
+                        };
+                        if player.is_paused() {
+                            seek_handle.seek_direct(target_secs);
+                        } else {
+                            seek_handle.seek_to(target_secs);
+                        }
+                    }
+                }
+            }
+            Event::Key(key) => {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => {
                         player.stop();
@@ -769,9 +807,6 @@ fn tui_loop(
                     }
                     KeyCode::Char('Z') => {
                         if zoom_idx + 1 < ZOOM_LEVELS.len() { zoom_idx += 1; }
-                    }
-                    KeyCode::Char('m') => {
-                        live_mode = !live_mode;
                     }
                     KeyCode::Char('{') => {
                         if detail_height > 1 { detail_height -= 1; }
@@ -824,18 +859,28 @@ fn tui_loop(
                     KeyCode::Char('[') => {
                         let jump = BEAT_UNITS[beat_unit_idx] as f64 * 60.0 / bpm as f64;
                         let target = seek_handle.current_pos().as_secs_f64() - jump;
-                        seek_handle.seek_to(target.max(0.0));
+                        if player.is_paused() {
+                            seek_handle.seek_direct(target.max(0.0));
+                        } else {
+                            seek_handle.seek_to(target.max(0.0));
+                        }
                     }
                     KeyCode::Char(']') => {
                         let jump = BEAT_UNITS[beat_unit_idx] as f64 * 60.0 / bpm as f64;
                         let target = seek_handle.current_pos().as_secs_f64() + jump;
                         let max = total_duration.as_secs_f64();
                         if target < max {
-                            seek_handle.seek_to(target);
+                            if player.is_paused() {
+                                seek_handle.seek_direct(target);
+                            } else {
+                                seek_handle.seek_to(target);
+                            }
                         }
                     }
                     _ => {}
                 }
+            }
+            _ => {}
             }
         }
 
@@ -925,26 +970,38 @@ fn render_braille(peaks: &[(f32, f32)], rows: usize, cols: usize) -> Vec<Vec<u8>
 ///
 /// Replaces `draw_beat_lines` — callers colour these columns instead of drawing Canvas lines.
 
-/// Return the column indices of bar-tick lines within the overview.
+/// Return the column indices of bar-tick lines within the overview, and the bars-per-tick interval.
 ///
-/// Replaces `draw_bar_ticks` — callers colour these columns instead of drawing Canvas lines.
-fn bar_tick_cols(bpm: f64, offset_ms: i64, total_secs: f64, cols: usize) -> Vec<usize> {
-    let mut result = Vec::new();
+/// Starts at 4 bars and doubles until all adjacent ticks are at least 2 columns apart
+/// (leaving at least 1 blank character gap between every pair of markers).
+fn bar_tick_cols(bpm: f64, offset_ms: i64, total_secs: f64, cols: usize) -> (Vec<usize>, u32) {
     if bpm <= 0.0 || total_secs <= 0.0 || cols == 0 {
-        return result;
+        return (Vec::new(), 4);
     }
-    let bar_period = 16.0 * 60.0 / bpm;
+    let beat_secs = 60.0 / bpm;
     let offset_secs = offset_ms as f64 / 1000.0;
-    let n_start = (-offset_secs / bar_period).ceil() as i64;
-    let mut t = offset_secs + n_start as f64 * bar_period;
-    while t <= total_secs {
-        let col = ((t / total_secs) * cols as f64).round() as usize;
-        if col < cols {
-            result.push(col);
+    let mut bars: u32 = 4;
+    loop {
+        let bar_period = bars as f64 * 4.0 * beat_secs; // bars × 4 beats/bar × secs/beat
+        let n_start = (-offset_secs / bar_period).ceil() as i64;
+        let mut result = Vec::new();
+        let mut t = offset_secs + n_start as f64 * bar_period;
+        while t <= total_secs {
+            let col = ((t / total_secs) * cols as f64).round() as usize;
+            if col < cols {
+                result.push(col);
+            }
+            t += bar_period;
         }
-        t += bar_period;
+        let min_gap = result.windows(2)
+            .map(|w| w[1].saturating_sub(w[0]))
+            .min()
+            .unwrap_or(usize::MAX);
+        if min_gap >= 2 || bars >= 512 {
+            return (result, bars);
+        }
+        bars *= 2;
     }
-    result
 }
 
 // ---------------------------------------------------------------------------
@@ -1094,6 +1151,35 @@ impl SeekHandle {
         // when the fade-out completes and then fades back in.
         self.pending_target.store(target_sample, Ordering::SeqCst);
         self.fade_remaining.store(-FADE_SAMPLES, Ordering::SeqCst);
+    }
+
+    /// Seek to `target_secs` directly, without a fade. Used when paused — the audio
+    /// thread is not calling next(), so the fade-based seek would never execute.
+    fn seek_direct(&self, target_secs: f64) {
+        let frame_len = self.channels as usize;
+        let total_frames = self.samples.len() / frame_len;
+        let target_frame = (target_secs * self.sample_rate as f64).round() as i64;
+        let window = self.sample_rate as i64 / 100;
+
+        let search_start = (target_frame - window).max(0) as usize;
+        let search_end = (target_frame + window).min(total_frames as i64) as usize;
+
+        let best_frame = (search_start..=search_end)
+            .min_by_key(|&f| {
+                let base = f * frame_len;
+                let amp: f32 = (0..frame_len)
+                    .map(|c| self.samples.get(base + c).copied().unwrap_or(0.0).abs())
+                    .sum();
+                (amp * 1_000_000.0) as u64
+            })
+            .unwrap_or(target_frame.max(0) as usize);
+
+        let target_sample = (best_frame * frame_len).min(self.samples.len());
+
+        // Write position directly and clear any in-progress fade.
+        self.pending_target.store(usize::MAX, Ordering::SeqCst);
+        self.fade_remaining.store(0, Ordering::SeqCst);
+        self.position.store(target_sample, Ordering::SeqCst);
     }
 }
 
