@@ -78,19 +78,21 @@ tj [path]
 - Zoom level for the detail view is adjustable by the user.
 - The overview displays a bar marker (every 4 bars) as a full-height line drawn beneath the waveform, visible only in the gaps.
 - The detail view displays a beat marker at each beat position as a full-height line drawn beneath the waveform, visible only in the gaps.
+- Buffer columns representing sample positions before the start of the track render as silence (zero amplitude), not as a mirror of position 0.
 - Both sets of markers shift immediately when the phase offset is adjusted.
 
 ### Rendering
 The following principles are required to achieve smooth, stable rendering:
 
-- **Smooth display position**: The position used for all visual rendering (detail viewport, beat markers) advances by wall-clock elapsed time rather than reading the audio output position directly. The audio output position advances in bursts as the output device requests audio buffers; using it directly causes visible periodic jumps in the display. Small accumulated drift (>20 ms) is corrected gradually rather than snapped, to avoid introducing a jump of its own. Large drift (e.g. after seek or startup) is snapped immediately.
-- **Consistent position**: Beat marker columns must be computed from the same smooth display position as the waveform viewport. Using different position sources causes markers to oscillate relative to the waveform.
-- **Waveform computation off the UI thread**: Braille dot rasterisation runs on a background thread. The UI thread performs only lightweight per-frame work (colour assignment, span construction) to stay within the frame budget.
-- **Stable buffer between recomputes**: The background thread pre-renders a buffer wider than the visible area. The UI thread slides a viewport through this buffer each frame. This avoids recomputing the waveform on every frame tick and prevents ratatui from receiving a changed grid every frame (which would cause a full widget repaint and visible flicker).
-- **Background thread uses smooth position**: The background thread must use the smooth display position (not the raw audio position) as both the drift trigger and the buffer centre. Using the raw audio position causes the buffer to recompute prematurely on audio bursts and to be centred at a different position than the viewport expects, producing a visible jump on each recompute.
-- **Fixed column grid**: The buffer anchor is aligned to a multiple of `col_samp` and peaks are computed by direct per-column indexing (not by slicing a window and dividing). This ensures any two buffers at the same zoom level share identical column boundaries, so overlapping columns are byte-for-byte equal and the buffer handoff is visually seamless.
+- **Smooth display position**: The position used for all visual rendering (detail viewport, beat markers) advances by wall-clock elapsed time rather than reading the audio output position directly. The audio output position advances in bursts as the output device requests audio buffers; using it directly causes visible periodic jumps. Small accumulated drift (>20 ms) is corrected gradually. Large drift (e.g. after seek or startup) is snapped to the nearest **column-grid** boundary — not to the raw sample position — ensuring `sub_col = false` immediately after every seek.
+- **Consistent position**: Beat marker columns must be computed from the same **smooth display position** as the waveform viewport. Using different position sources causes markers to oscillate relative to the waveform.
+- **Waveform computation off the UI thread**: Braille dot rasterisation runs on a background thread, producing a buffer in **buffer space**. The UI thread performs only lightweight per-frame work (translating to **screen space**, colour assignment, span construction) to stay within the frame budget.
+- **Stable buffer between recomputes**: The background thread pre-renders a buffer wider than the visible area. The UI thread slides a viewport through it each frame, avoiding a full recompute on every tick. Passing an unchanged buffer to ratatui prevents a full widget repaint and visible flicker.
+- **Background thread uses smooth position**: The background thread must use the **smooth display position** as both the drift trigger and the buffer centre. Using the raw audio position causes premature recomputes on audio bursts and centres the buffer at a different position than the viewport expects, producing a visible jump on each recompute.
+- **Fixed column grid**: The **anchor** is aligned to the **column grid** and peaks are computed by direct per-column indexing. This ensures any two buffers at the same zoom level share identical cell boundaries, so overlapping cells are byte-for-byte equal and the buffer handoff is visually seamless.
 - **Early recompute trigger**: The background thread begins computing a new buffer when drift reaches 3/4 of the screen width (not at the edge), ensuring the new buffer is ready before the old one runs out. A last-valid-viewport fallback prevents black frames in the rare case the OS delays the background thread.
-- **Consistent tick and viewport centre**: Beat marker columns must be computed from the same quantised position as the waveform viewport centre (i.e. `anchor + delta_cols × samples_per_col`), not from the raw smooth display position. The two differ by up to half a column due to rounding, causing ticks to oscillate by one column relative to the waveform if inconsistent sources are used.
+- **Tick marks in screen space**: Beat tick marks must be computed in **screen space** from the **quantised viewport centre**, not encoded as isolated marks in **buffer space**. Isolated marks in buffer space produce completely different braille characters on alternating frames when processed through the half-column shift, causing visible oscillation at wide zoom.
+- **Consistent tick and viewport centre**: Tick mark positions and the waveform viewport must both be derived from the **quantised viewport centre**, not from the raw smooth display position. The two can differ by up to half a column, causing ticks to snap relative to the waveform on every frame at wide zoom.
 
 ### Detail Waveform Render Modes
 The detail waveform supports two render modes, toggled at runtime with `m` (shown in the key hints):
@@ -99,7 +101,7 @@ The detail waveform supports two render modes, toggled at runtime with `m` (show
 
 The detail waveform height is user-adjustable at runtime with `{` (decrease) and `}` (increase), defaulting to 8 rows. Any unused space below the panel is left blank. The current height is shown in the key hints line.
 
-The detail waveform scrolls at dot-column resolution (half a braille character width). Each braille character encodes a 2×4 dot grid; by combining the right dot-column of one buffer cell with the left dot-column of the next, the viewport can be positioned at half-character offsets without modifying the pre-rendered buffer.
+The detail waveform scrolls at half-column resolution: the viewport can be positioned at half-character offsets without modifying the pre-rendered buffer (see *Glossary — Half-column scrolling*).
 
 The render frame period adapts to the current zoom level and detail panel width, targeting one dot-column advance per frame. At very tight zoom it is capped at ~120 fps; at very wide zoom it is capped at ~5 fps to keep input responsive.
 
@@ -117,6 +119,55 @@ The render frame period adapts to the current zoom level and detail panel width,
 - Audio playback runs on a dedicated thread.
 - TUI rendering runs on a separate thread.
 - State is shared between threads via lock-free or minimal-contention primitives to meet real-time rendering requirements.
+
+## Glossary
+
+### The rendering pipeline
+
+Waveform rendering proceeds in two stages:
+
+```
+Audio samples ──[background thread]──▶ Braille buffer ──[UI thread]──▶ Screen
+  (sample space)                        (buffer space)               (screen space)
+```
+
+The background thread rasterises peaks into a buffer wider than the screen. The UI thread slides a viewport through the buffer each frame, applying a half-column shift when needed, and passes the result to the terminal.
+
+**Sample space**
+The coordinate of raw audio data. A position is an integer sample index from 0 (start of track) to `total_samples − 1`.
+
+**Column grid**
+A coordinate system that partitions the timeline into discrete character-column cells, each `samples_per_col` samples wide. Cell `n` spans `[n × samples_per_col, (n+1) × samples_per_col)`. The grid is unbounded — cells extend before sample 0, which is what allows pre-track cells to render as silence rather than clamping to the first sample. Any two buffers computed at the same zoom level share identical cell boundaries wherever they overlap, making overlapping cells byte-for-byte equal.
+
+**Buffer space**
+The coordinate of the pre-rendered braille byte buffer: an array of cells indexed 0 to `buf_cols − 1`, each corresponding to one column-grid cell. The buffer is wider than the screen and centred on the **anchor** — the column-grid cell nearest the current playhead position. Elements that must appear in screen space (such as beat tick marks) should not be computed in buffer space: the half-column shift transforms isolated marks into different braille characters on alternating frames, causing visible oscillation.
+
+**Screen space**
+The coordinate of visible screen columns, indexed 0 (left edge) to `dw − 1` (right edge). The playhead is fixed at `centre_col`. At half-column resolution, positions are expressed in half-character units — even values are the left half of a character, odd values the right half — so that tick marks can be placed between character boundaries.
+
+### Half-column scrolling
+
+Each braille character encodes a 2×4 dot grid. By combining the right dot-column of one buffer cell with the left dot-column of the next, the viewport can be positioned at half-character offsets without modifying the buffer:
+
+```
+Buffer:   │  cell[n]  │  cell[n+1]  │
+          │ left│right│ left│right  │
+
+sub_col=false → screen column shows cell[vs+c]
+sub_col=true  → screen column shows right(cell[vs+c]) + left(cell[vs+c+1])
+                 ╰──────────────────────────────╯
+                        shift_braille_half
+```
+
+`sub_col` flips each time the smooth display position crosses a half-column boundary, advancing the viewport by one dot-column per flip.
+
+### Rendering positions
+
+**Smooth display position**
+The sample position used as the rendering playhead. It advances by wall-clock elapsed time rather than from the audio output position (which advances in bursts). After a large drift — on seek or startup — it snaps to the nearest column-grid boundary, ensuring `sub_col = false` immediately after a seek. The single source of truth for all rendering.
+
+**Quantised viewport centre**
+The smooth display position rounded to the nearest half-column boundary. Both the waveform viewport and beat tick marks must be derived from this value — not from the raw smooth display position, which can differ by up to half a column, causing visible oscillation at wide zoom.
 
 ## Constraints
 - Implementation language: Rust.

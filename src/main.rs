@@ -327,7 +327,7 @@ fn tui_loop(
                     || cols != last_cols || rows != last_rows || zoom != last_zoom || drift_cols >= cols * 3 / 4;
 
                 if must_recompute {
-                    let buf_cols = if live { cols * 2 } else { cols * 3 };
+                    let buf_cols = if live { cols * 2 } else { cols * 5 };
                     // Align anchor to the column grid so every buffer at this zoom level shares
                     // the same column boundaries — overlapping columns are byte-for-byte identical,
                     // making the buffer handoff visually seamless.
@@ -335,8 +335,12 @@ fn tui_loop(
                     let mono   = &wf_bg.mono;
 
                     let peaks: Vec<(f32, f32)> = (0..buf_cols).map(|c| {
-                        let offset     = c as i64 - (buf_cols / 2) as i64;
-                        let samp_start = (anchor as i64 + offset * col_samp as i64).max(0) as usize;
+                        let offset    = c as i64 - (buf_cols / 2) as i64;
+                        let raw_start = anchor as i64 + offset * col_samp as i64;
+                        if raw_start < 0 {
+                            return (1.0, -1.0); // before track start — render as blank
+                        }
+                        let samp_start = raw_start as usize;
                         let samp_end   = (samp_start + col_samp).min(mono.len());
                         if samp_start >= mono.len() {
                             return (0.0, 0.0);
@@ -396,8 +400,16 @@ fn tui_loop(
         }
         let drift = smooth_display_samp - pos_samp as f64;
         if drift.abs() > sample_rate as f64 * 0.5 {
-            // Large drift (seek / startup) — snap immediately.
-            smooth_display_samp = pos_samp as f64;
+            // Large drift (seek / startup) — snap to the nearest column boundary so
+            // sub_col=false after every seek. This prevents sub_col from alternating
+            // when the seek distance is an odd number of half-columns, which would
+            // oscillate the viewport by 0.5 columns on every other seek.
+            let col_samp_f64 = col_secs * sample_rate as f64;
+            smooth_display_samp = if col_samp_f64 > 0.0 {
+                (pos_samp as f64 / col_samp_f64).round() * col_samp_f64
+            } else {
+                pos_samp as f64
+            };
         }
         let display_pos_samp = smooth_display_samp as usize;
         display_pos_shared.store(display_pos_samp * seek_handle.channels as usize, Ordering::Relaxed);
@@ -525,29 +537,30 @@ fn tui_loop(
             let dw = detail_area.width as usize;
             let dh = detail_area.height as usize;
             detail_cols.store(dw, Ordering::Relaxed);
-            detail_rows.store(dh, Ordering::Relaxed);
+            // Reserve top and bottom rows for tick marks; waveform uses the inner rows.
+            let waveform_rows = dh.saturating_sub(2);
+            detail_rows.store(waveform_rows, Ordering::Relaxed);
             let buf = Arc::clone(&*detail_braille_shared.lock().unwrap());
             let centre_col = dw / 2;
 
             // Compute the column offset into the buffer that places the playhead at centre.
             // Uses smooth_display_samp (wall-clock based) to avoid audio-buffer-burst jitter.
-            // Also derive the quantised viewport centre in seconds for beat_line_cols, so that
-            // ticks are anchored to the same column grid as the waveform (avoids ±1-col jitter).
-            let mut viewport_centre_secs = display_pos_samp as f64 / sample_rate as f64;
+            // delta_half and half_col_samp are hoisted out so the tick renderer can use the
+            // same quantized visual centre as the waveform (they share an identical reference).
             let mut sub_col = false;
+            let mut delta_half_global: i64 = 0;
+            let mut half_col_samp_global: f64 = 1.0;
             let viewport_start: Option<usize> = if buf.buf_cols >= dw && buf.samples_per_col > 0 {
                 let delta = display_pos_samp as i64 - buf.anchor_sample as i64;
-                // Track at half-column (dot-column) resolution for sub-column scrolling.
                 let half_col_samp = buf.samples_per_col as f64 / 2.0;
                 let delta_half = (delta as f64 / half_col_samp).round() as i64;
                 sub_col = delta_half % 2 != 0;
-                let delta_cols = delta_half / 2;
+                delta_half_global = delta_half;
+                half_col_samp_global = half_col_samp;
+                // div_euclid gives floor division so column-step phase is symmetric across
+                // positive and negative delta (vs advances once per full column, consistently).
+                let delta_cols = delta_half.div_euclid(2);
                 let vs = buf.buf_cols as i64 / 2 + delta_cols - dw as i64 / 2;
-                // Snap beat_line_cols centre to the same quantised position as the viewport,
-                // offset by half a column when sub_col so ticks stay aligned with the waveform.
-                let sub_col_offset = if sub_col { buf.samples_per_col as f64 / 2.0 } else { 0.0 };
-                viewport_centre_secs = ((buf.anchor_sample as i64 + delta_cols * buf.samples_per_col as i64)
-                    .max(0) as f64 + sub_col_offset) / sample_rate as f64;
                 // Need dw+1 columns when sub_col to supply the extra byte for the shift.
                 let need = if sub_col { dw + 1 } else { dw };
                 if vs >= 0 && (vs as usize) + need <= buf.buf_cols {
@@ -555,40 +568,75 @@ fn tui_loop(
                     last_viewport_start = v;
                     Some(v)
                 } else {
-                    // Buffer not yet ready (new buffer being computed) — reuse last valid frame.
-                    if buf.buf_cols >= dw && last_viewport_start + need <= buf.buf_cols {
-                        Some(last_viewport_start)
-                    } else {
-                        None // first frame or seek — show blank
-                    }
+                    // vs out of bounds means either a seek just happened or the buffer hasn't
+                    // been recomputed yet. Show blank — the background thread recomputes at 75%
+                    // capacity, so in normal playback vs never reaches the buffer edges.
+                    None
                 }
             } else {
                 None
             };
 
-            let beat_cols: Vec<usize> = if !analysing {
-                beat_line_cols(bpm as f64, offset_ms, viewport_centre_secs, zoom_secs as f64, dw)
+            // Compute tick marks directly in display space at half-column resolution.
+            // Uses the same quantized visual centre as the waveform (anchor + delta_half * half_spc)
+            // so ticks and waveform step in exact lock-step.
+            // Each beat: disp_half = round((t_samp - view_start) / half_spc);
+            //   even → left-half tick  (0x47 = ⡇), odd → right-half tick (0xB8 = ⢸).
+            let tick_display: Vec<u8> = if !analysing && buf.samples_per_col > 0 {
+                let mut row = vec![0u8; dw];
+                let spc = buf.samples_per_col as f64;
+                let half_spc = half_col_samp_global;
+                let beat_period_samp = 60.0 / bpm as f64 * sample_rate as f64;
+                let offset_samp = offset_ms as f64 / 1000.0 * sample_rate as f64;
+                // Quantized visual centre: same reference point the waveform uses.
+                let visual_centre = buf.anchor_sample as f64 + delta_half_global as f64 * half_spc;
+                let view_start = visual_centre - centre_col as f64 * spc;
+                let view_end = view_start + dw as f64 * spc;
+                let n_start = ((view_start - offset_samp) / beat_period_samp).floor() as i64 - 1;
+                let mut t_samp = offset_samp + n_start as f64 * beat_period_samp;
+                while t_samp <= view_end {
+                    let disp_half = ((t_samp - view_start) / half_spc).round() as i64;
+                    if disp_half >= 0 {
+                        let col = (disp_half / 2) as usize;
+                        if col < dw {
+                            row[col] = if disp_half % 2 != 0 { 0xB8 } else { 0x47 };
+                        }
+                    }
+                    t_samp += beat_period_samp;
+                }
+                row
             } else {
-                Vec::new()
+                vec![]
             };
 
             let detail_lines: Vec<Line<'static>> = (0..dh)
                 .map(|r| {
-                    // When sub_col, shift each character by one dot-column using the next byte.
-                    let shifted: Option<Vec<u8>> = if sub_col {
-                        viewport_start.and_then(|vs| {
-                            buf.grid.get(r).map(|row| {
-                                (0..dw).map(|c| shift_braille_half(row[vs + c], row[vs + c + 1])).collect()
+                    let is_tick_row = r == 0 || r + 1 == dh;
+                    // Tick rows: computed directly in display space — no viewport slice or
+                    // shift_braille_half needed. Waveform rows: apply shift_braille_half when
+                    // sub_col for smooth half-column scrolling.
+                    // `shifted` must be declared here so it outlives `row_slice`.
+                    let shifted: Option<Vec<u8>>;
+                    let row_slice: Option<&[u8]>;
+                    if is_tick_row {
+                        shifted = None;
+                        row_slice = if tick_display.len() == dw { Some(&tick_display) } else { None };
+                    } else {
+                        let buf_r = r - 1;
+                        shifted = if sub_col {
+                            viewport_start.and_then(|vs| {
+                                buf.grid.get(buf_r).map(|row| {
+                                    (0..dw).map(|c| shift_braille_half(row[vs + c], row[vs + c + 1])).collect()
+                                })
                             })
-                        })
-                    } else {
-                        None
-                    };
-                    let row_slice: Option<&[u8]> = if sub_col {
-                        shifted.as_deref()
-                    } else {
-                        viewport_start.and_then(|vs| buf.grid.get(r).map(|row| &row[vs..vs + dw]))
-                    };
+                        } else { None };
+                        row_slice = if sub_col {
+                            shifted.as_deref()
+                        } else {
+                            viewport_start.and_then(|vs| buf.grid.get(buf_r).map(|row| &row[vs..vs + dw]))
+                        };
+                    }
+                    let _ = &shifted; // lifetime anchor — keeps shifted alive until row_slice is done
                     let row = match row_slice {
                         None => return Line::from(Span::raw("\u{2800}".repeat(dw))),
                         Some(s) => s,
@@ -597,12 +645,10 @@ fn tui_loop(
                     let mut run = String::new();
                     let mut run_color = Color::Reset;
                     for (c, &byte) in row.iter().enumerate() {
-                        // Replicate Canvas z-order: tick drawn first, waveform on top.
-                        // Tick is visible only where the waveform cell is empty (byte == 0).
                         let (color, ch) = if c == centre_col {
                             (Color::White, '\u{28FF}') // ⣿ solid centre line
-                        } else if beat_cols.contains(&c) && byte == 0 {
-                            (Color::DarkGray, '\u{28FF}') // ⣿ beat tick visible in gap
+                        } else if is_tick_row {
+                            (Color::DarkGray, char::from_u32(0x2800 | byte as u32).unwrap_or(' '))
                         } else {
                             (Color::Cyan, char::from_u32(0x2800 | byte as u32).unwrap_or(' '))
                         };
@@ -878,34 +924,6 @@ fn render_braille(peaks: &[(f32, f32)], rows: usize, cols: usize) -> Vec<Vec<u8>
 /// Return the column indices of beat lines within the detail view window.
 ///
 /// Replaces `draw_beat_lines` — callers colour these columns instead of drawing Canvas lines.
-fn beat_line_cols(
-    bpm: f64,
-    offset_ms: i64,
-    pos_secs: f64,
-    zoom_secs: f64,
-    cols: usize,
-) -> Vec<usize> {
-    let mut result = Vec::new();
-    if bpm <= 0.0 || zoom_secs <= 0.0 || cols == 0 {
-        return result;
-    }
-    let beat_period = 60.0 / bpm;
-    let offset_secs = offset_ms as f64 / 1000.0;
-    let window_start = pos_secs - zoom_secs / 2.0;
-    let window_end = pos_secs + zoom_secs / 2.0;
-    let n_start = ((window_start - offset_secs) / beat_period).ceil() as i64;
-    let mut t = offset_secs + n_start as f64 * beat_period;
-    while t <= window_end {
-        if t >= window_start {
-            let col = ((t - window_start) / zoom_secs * cols as f64).round() as usize;
-            if col < cols {
-                result.push(col);
-            }
-        }
-        t += beat_period;
-    }
-    result
-}
 
 /// Return the column indices of bar-tick lines within the overview.
 ///
