@@ -53,10 +53,9 @@ const SPECTRAL_PALETTES: &[(&str, (u8,u8,u8), (u8,u8,u8))] = &[
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
-    let start = match args.get(1) {
-        Some(p) => std::path::PathBuf::from(p),
-        None => std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-    };
+    let arg = args.get(1).map(std::path::PathBuf::from);
+    let start = arg.clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")));
 
     // Set up terminal once — shared by browser and player.
     let setup = (|| -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
@@ -75,13 +74,37 @@ fn main() {
         }
     };
 
+    // Load cache early so we can read last_browser_path before the browser opens.
+    let cache_file = cache_path();
+    let mut cache = Cache::load(cache_file);
+
+    // Compute the initial browser directory:
+    //   CLI dir arg  → that directory (overrides last-visited for this first open only)
+    //   CLI file arg → the file's parent directory
+    //   no arg       → last visited path from cache (if it still exists), else CWD
+    let mut browser_dir: std::path::PathBuf = if arg.as_deref().map(|p| p.is_dir()).unwrap_or(false) {
+        start.clone()
+    } else if start.is_file() {
+        start.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| start.clone())
+    } else {
+        cache.last_browser_path()
+            .filter(|p| p.exists())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")))
+    };
+
     // If start is a directory (or CWD), run the browser first.
     let file_path = if start.is_file() {
         start
     } else {
-        match run_browser(&mut terminal, start) {
-            Ok(BrowserResult::Selected(p)) => p,
-            Ok(BrowserResult::ReturnToPlayer) | Ok(BrowserResult::Quit) => {
+        match run_browser(&mut terminal, browser_dir.clone()) {
+            Ok((BrowserResult::Selected(p), cwd)) => {
+                browser_dir = cwd;
+                cache.set_last_browser_path(&browser_dir);
+                cache.save();
+                p
+            }
+            Ok((BrowserResult::ReturnToPlayer, _)) | Ok((BrowserResult::Quit, _)) => {
                 let _ = disable_raw_mode();
                 let _ = io::stdout().execute(PopKeyboardEnhancementFlags).and_then(|s| s.execute(DisableMouseCapture)).and_then(|s| s.execute(LeaveAlternateScreen));
                 return;
@@ -105,7 +128,6 @@ fn main() {
         }
     };
     let mixer = handle.mixer();
-    let mut cache = Cache::load(cache_path());
     let mut next_path = file_path;
 
     loop {
@@ -229,6 +251,7 @@ fn main() {
             &mono,
             sample_rate,
             &mut cache,
+            &mut browser_dir,
         ) {
             Ok(Some(path)) => { next_path = path; }
             Ok(None) => break,
@@ -257,8 +280,9 @@ fn tui_loop(
     mono: &Arc<Vec<f32>>,
     sample_rate: u32,
     cache: &mut Cache,
+    browser_dir: &mut std::path::PathBuf,
 ) -> io::Result<Option<std::path::PathBuf>> {
-    let keymap = load_keymap();
+    let (keymap, display_cfg) = load_config();
     let mut bpm: f32 = 120.0;
     let mut base_bpm: f32 = 120.0; // detected BPM; speed factor = bpm / base_bpm
     let mut offset_ms: i64 = 0;
@@ -276,6 +300,8 @@ fn tui_loop(
     let mut last_bar_cols: Vec<usize> = Vec::new();
     let mut nudge: i8 = 0; // -1 = backward, 0 = none, +1 = forward
     let mut nudge_mode = NudgeMode::Jump;
+    let mut space_held = false;
+    let mut space_chord_fired = false;
     let mut volume: f32 = 1.0;
     let mut help_open = false;
     let mut palette_idx: usize = 0;
@@ -454,12 +480,15 @@ fn tui_loop(
         display_pos_shared.store(display_pos_samp * seek_handle.channels as usize, Ordering::Relaxed);
 
         // Beat-derived values — recomputed each frame so they react to bpm changes instantly.
-        let beat_period = Duration::from_secs_f64(60.0 / bpm as f64);
+        // Use base_bpm and smooth_display_samp so the flash is in exact sync with tick marks.
+        let beat_period = Duration::from_secs_f64(60.0 / base_bpm as f64);
         let flash_window = beat_period.mul_f64(0.15);
 
-        // Beat flash
-        let pos_ns = pos.as_nanos() as i128 + offset_ms as i128 * 1_000_000;
-        let phase = pos_ns.rem_euclid(beat_period.as_nanos() as i128);
+        // Beat flash — subtract offset so phase==0 when cursor is on a tick.
+        // Ticks are at (samp - offset_samp) % beat_period_samp == 0, so we subtract here.
+        let smooth_pos_ns = (smooth_display_samp / sample_rate as f64 * 1_000_000_000.0) as i128
+            - offset_ms as i128 * 1_000_000;
+        let phase = smooth_pos_ns.rem_euclid(beat_period.as_nanos() as i128);
         let beat_on = phase < flash_window.as_nanos() as i128;
 
         let analysing = analysis_hash.is_none();
@@ -637,9 +666,10 @@ fn tui_loop(
             let waveform_rows = dh.saturating_sub(2);
             detail_rows.store(waveform_rows, Ordering::Relaxed);
             let buf = Arc::clone(&*detail_braille_shared.lock().unwrap());
-            let centre_col = dw / 2;
+            let centre_col = ((dw as f64 * display_cfg.playhead_position as f64 / 100.0) as usize)
+                .clamp(0, dw.saturating_sub(1));
 
-            // Compute the column offset into the buffer that places the playhead at centre.
+            // Compute the column offset into the buffer that places the playhead at centre_col.
             // Uses smooth_display_samp (wall-clock based) to avoid audio-buffer-burst jitter.
             // delta_half and half_col_samp are hoisted out so the tick renderer can use the
             // same quantized visual centre as the waveform (they share an identical reference).
@@ -656,7 +686,7 @@ fn tui_loop(
                 // div_euclid gives floor division so column-step phase is symmetric across
                 // positive and negative delta (vs advances once per full column, consistently).
                 let delta_cols = delta_half.div_euclid(2);
-                let vs = buf.buf_cols as i64 / 2 + delta_cols - dw as i64 / 2;
+                let vs = buf.buf_cols as i64 / 2 + delta_cols - centre_col as i64;
                 // Need dw+1 columns when sub_col to supply the extra byte for the shift.
                 let need = if sub_col { dw + 1 } else { dw };
                 if vs >= 0 && (vs as usize) + need <= buf.buf_cols {
@@ -771,7 +801,8 @@ fn tui_loop(
             // Help popup
             if help_open {
                 const HELP: &str = "\
-Space          play / pause
+Space+Z        play / pause
+Space+F/V      reset tempo to detected BPM
 1/2/3/4        beat jump forward 1/4/16/64 beats
 q/w/e/r        beat jump backward 1/4/16/64 beats
 c  /  d        nudge backward / forward (mode-dependent)
@@ -855,9 +886,17 @@ Esc            quit";
                     }
                     return Ok(None);
                 }
+                // Space modifier: track held state for chords.
+                if key.code == KeyCode::Char(' ') {
+                    match key.kind {
+                        KeyEventKind::Press  => { space_held = true; space_chord_fired = false; }
+                        KeyEventKind::Release => { space_held = false; }
+                        _ => {}
+                    }
+                }
                 // Nudge/toggle: handled for all key kinds so Release is detected.
                 match key.kind {
-                    KeyEventKind::Press if keymap.get(&key.code) == Some(&Action::NudgeModeToggle) => {
+                    KeyEventKind::Press if keymap.get(&KeyBinding::Key(key.code)) == Some(&Action::NudgeModeToggle) => {
                         if nudge != 0 {
                             nudge = 0;
                             player.set_speed(bpm / base_bpm);
@@ -868,7 +907,7 @@ Esc            quit";
                         };
                     }
                     KeyEventKind::Press | KeyEventKind::Repeat
-                        if keymap.get(&key.code) == Some(&Action::NudgeBackward) =>
+                        if keymap.get(&KeyBinding::Key(key.code)) == Some(&Action::NudgeBackward) =>
                     {
                         match nudge_mode {
                             NudgeMode::Jump => {
@@ -884,7 +923,7 @@ Esc            quit";
                         }
                     }
                     KeyEventKind::Press | KeyEventKind::Repeat
-                        if keymap.get(&key.code) == Some(&Action::NudgeForward) =>
+                        if keymap.get(&KeyBinding::Key(key.code)) == Some(&Action::NudgeForward) =>
                     {
                         match nudge_mode {
                             NudgeMode::Jump => {
@@ -900,7 +939,7 @@ Esc            quit";
                         }
                     }
                     KeyEventKind::Release
-                        if matches!(keymap.get(&key.code),
+                        if matches!(keymap.get(&KeyBinding::Key(key.code)),
                             Some(&Action::NudgeBackward) | Some(&Action::NudgeForward)) =>
                     {
                         if nudge_mode == NudgeMode::Warp {
@@ -919,7 +958,17 @@ Esc            quit";
                 }
                 // All other actions fire on Press only.
                 if key.kind == KeyEventKind::Press {
-                    match keymap.get(&key.code) {
+                    let action = if space_held && key.code != KeyCode::Char(' ') {
+                        if let Some(a) = keymap.get(&KeyBinding::SpaceChord(key.code)) {
+                            space_chord_fired = true;
+                            Some(a)
+                        } else {
+                            keymap.get(&KeyBinding::Key(key.code))
+                        }
+                    } else {
+                        keymap.get(&KeyBinding::Key(key.code))
+                    };
+                    match action {
                     Some(Action::Quit) => {
                         player.stop();
                         if let Some(ref hash) = analysis_hash {
@@ -931,26 +980,34 @@ Esc            quit";
                         return Ok(None);
                     }
                     Some(Action::OpenBrowser) => {
-                        match run_browser(terminal, file_dir.to_path_buf())? {
-                            BrowserResult::ReturnToPlayer => {}
-                            BrowserResult::Selected(path) => {
+                        match run_browser(terminal, browser_dir.clone())? {
+                            (BrowserResult::ReturnToPlayer, cwd) => {
+                                *browser_dir = cwd;
+                                cache.set_last_browser_path(browser_dir);
+                                cache.save();
+                            }
+                            (BrowserResult::Selected(path), cwd) => {
+                                *browser_dir = cwd;
+                                cache.set_last_browser_path(browser_dir);
                                 player.stop();
                                 if let Some(ref hash) = analysis_hash {
                                     if let Some(entry) = cache.get(hash.as_str()).cloned() {
                                         cache.set(hash.clone(), CacheEntry { offset_ms, ..entry });
-                                        cache.save();
                                     }
                                 }
+                                cache.save();
                                 return Ok(Some(path));
                             }
-                            BrowserResult::Quit => {
+                            (BrowserResult::Quit, cwd) => {
+                                *browser_dir = cwd;
+                                cache.set_last_browser_path(browser_dir);
                                 player.stop();
                                 if let Some(ref hash) = analysis_hash {
                                     if let Some(entry) = cache.get(hash.as_str()).cloned() {
                                         cache.set(hash.clone(), CacheEntry { offset_ms, ..entry });
-                                        cache.save();
                                     }
                                 }
+                                cache.save();
                                 return Ok(None);
                             }
                         }
@@ -1047,6 +1104,10 @@ Esc            quit";
                     Some(Action::JumpBackward16)=> do_jump(&seek_handle, &player, bpm, total_duration, -16),
                     Some(Action::JumpForward64) => do_jump(&seek_handle, &player, bpm, total_duration,  64),
                     Some(Action::JumpBackward64)=> do_jump(&seek_handle, &player, bpm, total_duration, -64),
+                    Some(Action::TempoReset) => {
+                        bpm = base_bpm;
+                        player.set_speed(1.0);
+                    }
                     Some(Action::NudgeBackward) | Some(Action::NudgeForward) | Some(Action::NudgeModeToggle) => {}
                     None => {}
                     }
@@ -1116,7 +1177,7 @@ enum Action {
     HeightIncrease, HeightDecrease,
     VolumeUp, VolumeDown,
     BpmHalve, BpmDouble, BpmIncrease, BpmDecrease, BpmRedetect,
-    PaletteCycle, OpenBrowser, Help, WaveformStyle,
+    PaletteCycle, OpenBrowser, Help, WaveformStyle, TempoReset,
 }
 
 static ACTION_NAMES: &[(&str, Action)] = &[
@@ -1150,9 +1211,23 @@ static ACTION_NAMES: &[(&str, Action)] = &[
     ("open_browser",     Action::OpenBrowser),
     ("help",             Action::Help),
     ("waveform_style",   Action::WaveformStyle),
+    ("tempo_reset",      Action::TempoReset),
 ];
 
-fn parse_key(s: &str) -> Option<KeyCode> {
+#[derive(Hash, Eq, PartialEq)]
+enum KeyBinding {
+    Key(KeyCode),
+    SpaceChord(KeyCode),
+}
+
+fn parse_key(s: &str) -> Option<KeyBinding> {
+    if let Some(rest) = s.strip_prefix("space+") {
+        return parse_bare_key(rest).map(KeyBinding::SpaceChord);
+    }
+    parse_bare_key(s).map(KeyBinding::Key)
+}
+
+fn parse_bare_key(s: &str) -> Option<KeyCode> {
     match s {
         "space"     => Some(KeyCode::Char(' ')),
         "left"      => Some(KeyCode::Left),
@@ -1172,44 +1247,66 @@ fn parse_key(s: &str) -> Option<KeyCode> {
 
 const DEFAULT_CONFIG: &str = include_str!("../resources/config.toml");
 
-fn load_keymap() -> std::collections::HashMap<KeyCode, Action> {
-    let mut map = std::collections::HashMap::new();
+struct DisplayConfig {
+    playhead_position: u8, // 0–100, clamped
+}
+
+impl Default for DisplayConfig {
+    fn default() -> Self { Self { playhead_position: 20 } }
+}
+
+/// Finds or creates the config file and returns its text.
+fn resolve_config() -> String {
     // Check next to the binary first, then ~/.config/tj/config.toml, then auto-create.
     let adjacent = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("config.toml")))
         .filter(|p| p.exists());
-    let text = if let Some(path) = adjacent {
-        match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(_) => return map,
-        }
-    } else {
-        let user_path = match home_dir() {
-            Some(h) => h.join(".config/tj/config.toml"),
-            None => return parse_keymap(DEFAULT_CONFIG, &mut map),
-        };
-        if user_path.exists() {
-            match std::fs::read_to_string(&user_path) {
-                Ok(t) => t,
-                Err(_) => return map,
-            }
-        } else {
-            // Auto-create from embedded default.
-            if let Some(dir) = user_path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            if std::fs::write(&user_path, DEFAULT_CONFIG).is_ok() {
-                eprintln!("tj: created default config at {}", user_path.display());
-            }
-            DEFAULT_CONFIG.to_string()
-        }
+    if let Some(path) = adjacent {
+        return std::fs::read_to_string(&path).unwrap_or_default();
+    }
+    let user_path = match home_dir() {
+        Some(h) => h.join(".config/tj/config.toml"),
+        None => return DEFAULT_CONFIG.to_string(),
     };
-    parse_keymap(&text, &mut map)
+    if user_path.exists() {
+        std::fs::read_to_string(&user_path).unwrap_or_default()
+    } else {
+        // Auto-create from embedded default.
+        if let Some(dir) = user_path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if std::fs::write(&user_path, DEFAULT_CONFIG).is_ok() {
+            eprintln!("tj: created default config at {}", user_path.display());
+        }
+        DEFAULT_CONFIG.to_string()
+    }
 }
 
-fn parse_keymap(text: &str, map: &mut std::collections::HashMap<KeyCode, Action>)
-    -> std::collections::HashMap<KeyCode, Action>
+fn load_config() -> (std::collections::HashMap<KeyBinding, Action>, DisplayConfig) {
+    let text = resolve_config();
+    let mut map = std::collections::HashMap::new();
+    let keymap = parse_keymap(&text, &mut map);
+    let display = parse_display_config(&text);
+    (keymap, display)
+}
+
+fn parse_display_config(text: &str) -> DisplayConfig {
+    let parsed: toml::Value = match toml::from_str(text) {
+        Ok(v) => v,
+        Err(_) => return DisplayConfig::default(),
+    };
+    let pos = parsed
+        .get("display")
+        .and_then(|v| v.get("playhead_position"))
+        .and_then(|v| v.as_integer())
+        .unwrap_or(20)
+        .clamp(0, 100) as u8;
+    DisplayConfig { playhead_position: pos }
+}
+
+fn parse_keymap(text: &str, map: &mut std::collections::HashMap<KeyBinding, Action>)
+    -> std::collections::HashMap<KeyBinding, Action>
 {
     let parsed: toml::Value = match toml::from_str(text) {
         Ok(v) => v,
@@ -1233,8 +1330,8 @@ fn parse_keymap(text: &str, map: &mut std::collections::HashMap<KeyCode, Action>
             continue;
         };
         for key_str in key_strs {
-            if let Some(keycode) = parse_key(key_str) {
-                map.insert(keycode, action);
+            if let Some(binding) = parse_key(key_str) {
+                map.insert(binding, action);
             }
         }
     }
@@ -1685,18 +1782,38 @@ struct CacheEntry {
     name: String,
 }
 
+#[derive(Serialize, Deserialize, Default)]
+struct CacheFile {
+    #[serde(default)]
+    last_browser_path: Option<String>,
+    #[serde(default)]
+    entries: std::collections::HashMap<String, CacheEntry>,
+}
+
 struct Cache {
     path: std::path::PathBuf,
+    last_browser_path: Option<std::path::PathBuf>,
     entries: std::collections::HashMap<String, CacheEntry>,
 }
 
 impl Cache {
     fn load(path: std::path::PathBuf) -> Self {
-        let entries = std::fs::read_to_string(&path)
+        let file: CacheFile = std::fs::read_to_string(&path)
             .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
+            .and_then(|text| {
+                // Try new wrapped format first; fall back to legacy flat HashMap.
+                serde_json::from_str::<CacheFile>(&text).ok().or_else(|| {
+                    serde_json::from_str::<std::collections::HashMap<String, CacheEntry>>(&text)
+                        .ok()
+                        .map(|entries| CacheFile { entries, ..Default::default() })
+                })
+            })
             .unwrap_or_default();
-        Self { path, entries }
+        Self {
+            path,
+            last_browser_path: file.last_browser_path.map(std::path::PathBuf::from),
+            entries: file.entries,
+        }
     }
 
     fn get(&self, hash: &str) -> Option<&CacheEntry> {
@@ -1705,6 +1822,14 @@ impl Cache {
 
     fn set(&mut self, hash: String, entry: CacheEntry) {
         self.entries.insert(hash, entry);
+    }
+
+    fn last_browser_path(&self) -> Option<&std::path::Path> {
+        self.last_browser_path.as_deref()
+    }
+
+    fn set_last_browser_path(&mut self, p: &std::path::Path) {
+        self.last_browser_path = Some(p.to_path_buf());
     }
 
     fn entries_snapshot(&self) -> std::collections::HashMap<String, CacheEntry> {
@@ -1716,7 +1841,13 @@ impl Cache {
             let _ = std::fs::create_dir_all(dir);
         }
         let tmp = self.path.with_extension("tmp");
-        if let Ok(text) = serde_json::to_string_pretty(&self.entries) {
+        let file = CacheFile {
+            last_browser_path: self.last_browser_path
+                .as_ref()
+                .and_then(|p| p.to_str().map(|s| s.to_string())),
+            entries: self.entries.clone(),
+        };
+        if let Ok(text) = serde_json::to_string_pretty(&file) {
             if std::fs::write(&tmp, text).is_ok() {
                 let _ = std::fs::rename(&tmp, &self.path);
             }
@@ -1833,7 +1964,7 @@ enum BrowserResult {
 fn run_browser(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     start_dir: std::path::PathBuf,
-) -> io::Result<BrowserResult> {
+) -> io::Result<(BrowserResult, std::path::PathBuf)> {
     let mut state = BrowserState::new(start_dir)?;
 
     loop {
@@ -1886,7 +2017,7 @@ fn run_browser(
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    return Ok(BrowserResult::Quit);
+                    return Ok((BrowserResult::Quit, state.cwd));
                 }
                 if key.kind != KeyEventKind::Press { continue; }
                 match key.code {
@@ -1899,7 +2030,10 @@ fn run_browser(
                                     let path = entry.path.clone();
                                     state = BrowserState::new(path)?;
                                 }
-                                EntryKind::Audio => return Ok(BrowserResult::Selected(entry.path.clone())),
+                                EntryKind::Audio => {
+                                    let cwd = state.cwd.clone();
+                                    return Ok((BrowserResult::Selected(entry.path.clone()), cwd));
+                                }
                                 EntryKind::Other => {}
                             }
                         }
@@ -1909,8 +2043,8 @@ fn run_browser(
                             state = BrowserState::new(parent)?;
                         }
                     }
-                    KeyCode::Char('q') => return Ok(BrowserResult::Quit),
-                    KeyCode::Esc => return Ok(BrowserResult::ReturnToPlayer),
+                    KeyCode::Char('q') => return Ok((BrowserResult::Quit, state.cwd)),
+                    KeyCode::Esc => return Ok((BrowserResult::ReturnToPlayer, state.cwd)),
                     _ => {}
                 }
             }

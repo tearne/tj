@@ -25,7 +25,8 @@ tj [path]
 ### Player Controls
 | Key | Action |
 |-----|--------|
-| `Space` | Play / Pause |
+| `Space+Z` | Play / Pause |
+| `Space+F` / `Space+V` | Reset tempo to detected BPM (speed → 1×) |
 | `+` / `-` | Adjust beat phase offset (10ms steps) |
 | `Left` / `Right` | Seek backward / forward (small increment, e.g. 5s) |
 | `1` / `2` / `3` / `4` | Beat jump forward 1 / 4 / 16 / 64 beats |
@@ -53,7 +54,8 @@ tj [path]
 - Non-audio files are shown but cannot be selected or navigated into.
 - A header shows the current directory path.
 - Selecting an audio file dismisses the browser and begins playback.
-- The browser can be opened from the player at any time with `b`, rooted at the directory of the currently playing file. Audio continues playing while the browser is open. Pressing `Esc` returns to the player view; selecting a new file loads and plays it.
+- The browser can be opened from the player at any time with `b`. Audio continues playing while the browser is open. Pressing `Esc` returns to the player view; selecting a new file loads and plays it.
+- The last visited directory is persisted to the cache between sessions. The browser always opens at the last visited path (falling back to CWD if it no longer exists). If a directory or file argument is given on the command line, it overrides the last visited path for the first browser open of that session only; subsequent opens resume from last visited.
 
 ### Playback
 - Supports audio formats: FLAC, MP3, OGG Vorbis, WAV, AAC, OPUS.
@@ -72,7 +74,7 @@ tj [path]
   - `f` increases the effective BPM by 0.1; `v` decreases it by 0.1. Adjustments affect playback speed proportionally (relative to the detected BPM) and clamp to the range 40.0–240.0.
   - `r` re-runs detection cycling through modes: `auto` (default tempogram), `fusion` (tempogram + legacy in parallel), `legacy` (autocorrelation + comb filter). Non-blocking: returns immediately, shows the animated indicator while detection runs in the background.
   - Corrections are persisted to the cache immediately.
-- Detected BPM and phase offset are cached in `~/.local/share/tj/cache.json`, keyed by a Blake3 hash of the decoded audio samples. This makes the cache invariant of filename, tags, and container format.
+- Detected BPM and phase offset are cached in `~/.local/share/tj/cache.json`, keyed by a Blake3 hash of the decoded audio samples. This makes the cache invariant of filename, tags, and container format. The cache also stores the last browser directory.
 - Each cache entry includes the filename at time of first detection as a human-readable hint to aid manual cache management.
 - On quit, the current phase offset is persisted to the cache.
 
@@ -109,6 +111,8 @@ The following principles are required to achieve smooth, stable rendering:
 - **Consistent tick and viewport centre**: Tick mark positions and the waveform viewport must both be derived from the **quantised viewport centre**, not from the raw smooth display position. The two can differ by up to half a column, causing ticks to snap relative to the waveform on every frame at wide zoom.
 
 The detail waveform height is user-adjustable at runtime with `{` (decrease) and `}` (increase), defaulting to 8 rows. Any unused space below the panel is left blank.
+
+The playhead column in the detail panel is set by `playhead_position` (0–100, default `20`) in the `[display]` section of `config.toml`. The value is a percentage of the panel width from the left edge; out-of-range values are clamped silently.
 
 The detail waveform scrolls at half-column resolution: the viewport can be positioned at half-character offsets without modifying the pre-rendered buffer (see *Glossary — Half-column scrolling*).
 
@@ -193,8 +197,10 @@ The smooth display position rounded to the nearest half-column boundary. Both th
 ### Keyboard Mapping
 - Key bindings are loaded from `config.toml` at startup — first from the same directory as the binary, then from `~/.config/tj/config.toml`. If neither file is found, the embedded default config is written to `~/.config/tj/config.toml` and loaded automatically.
 - Bindings are declared under a `[keys]` table as `function_name = "key_string"` or `function_name = ["key1", "key2"]` for multiple keys per function.
-- Key strings: printable characters as-is (`q`, `+`, `H`); special keys as lowercase names (`space`, `esc`, `up`, `down`, `left`, `right`, `enter`, `backspace`).
+- Key strings: printable characters as-is (`q`, `+`, `H`); special keys as lowercase names (`space`, `esc`, `up`, `down`, `left`, `right`, `enter`, `backspace`); `space+<key>` for Space-modifier chords (e.g. `space+z`).
+- `Space` acts as a modifier key: holding it and pressing another key fires a chord action. `Space` released alone has no effect.
 - Ctrl-C always quits unconditionally and is not configurable.
+- Display parameters are declared under a `[display]` table. Missing `[display]` keys fall back to their defaults; existing config files are never modified automatically.
 
 ## Constraints
 - Implementation language: Rust.

@@ -1,5 +1,6 @@
 [keys]
-play_pause       = "space"
+play_pause       = "space+z"
+tempo_reset      = ["space+f", "space+v"]
 quit             = "esc"
 jump_forward_1   = "1"
 jump_backward_1  = "q"
@@ -29,3 +30,6 @@ palette_cycle    = "p"
 waveform_style   = "o"
 open_browser     = "b"
 help             = "?"
+
+[display]
+playhead_position = 20   # 0–100, percentage from left edge of detail panel
