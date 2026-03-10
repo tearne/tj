@@ -7,7 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind,
+    self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
     DisableMouseCapture, EnableMouseCapture,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
@@ -39,10 +39,16 @@ use stratum_dsp::{analyze_audio, AnalysisConfig};
 const OVERVIEW_RESOLUTION: usize = 4000;
 const ZOOM_LEVELS: &[f32] = &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
 const DEFAULT_ZOOM_IDX: usize = 2; // 4 seconds
-const BEAT_UNITS: &[u32] = &[1, 4, 8, 16, 32, 64, 128];
-const DEFAULT_BEAT_UNIT_IDX: usize = 3; // 16 beats
-const FADE_SAMPLES: i64 = 256; // ~5.8ms at 44100 Hz — fade-out then fade-in around each seek
+const FADE_SAMPLES: i64 = 256;       // ~5.8ms at 44100 Hz — fade-out then fade-in around each seek
+const MICRO_FADE_SAMPLES: i64 = 8;  // ~0.2ms — used for micro-jumps (c/d keys)
 const DETECT_MODES: &[&str] = &["auto", "fusion", "legacy"];
+/// Spectral colour palettes: (name, bass_rgb, treble_rgb).
+const SPECTRAL_PALETTES: &[(&str, (u8,u8,u8), (u8,u8,u8))] = &[
+    ("amber/cyan", (255, 140,   0), (  0, 200, 200)),
+    ("soft",       (200, 130,  50), ( 50, 190, 200)),
+    ("spectrum",   ( 80, 110, 220), (220, 200,  60)),
+    ("green",      (120, 200,  60), ( 60, 200, 170)),
+];
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -178,11 +184,13 @@ fn main() {
         let samples = Arc::new(stereo);
         let position = Arc::new(AtomicUsize::new(0));
         let fade_remaining = Arc::new(AtomicI64::new(0));
+        let fade_len = Arc::new(AtomicI64::new(FADE_SAMPLES));
         let pending_target = Arc::new(AtomicUsize::new(usize::MAX));
         let seek_handle = SeekHandle {
             samples: Arc::clone(&samples),
             position: Arc::clone(&position),
             fade_remaining: Arc::clone(&fade_remaining),
+            fade_len: Arc::clone(&fade_len),
             pending_target: Arc::clone(&pending_target),
             sample_rate,
             channels,
@@ -190,7 +198,7 @@ fn main() {
 
         let player = Player::connect_new(&mixer);
         player.append(TrackingSource::new(
-            samples, position, fade_remaining, pending_target, sample_rate, channels,
+            samples, position, fade_remaining, fade_len, pending_target, sample_rate, channels,
         ));
 
         let (bpm_tx, bpm_rx) = mpsc::channel::<(String, f32, i64)>();
@@ -251,6 +259,7 @@ fn tui_loop(
     cache: &mut Cache,
 ) -> io::Result<Option<std::path::PathBuf>> {
     let mut bpm: f32 = 120.0;
+    let mut base_bpm: f32 = 120.0; // detected BPM; speed factor = bpm / base_bpm
     let mut offset_ms: i64 = 0;
     let mut analysis_hash: Option<String> = None;
     let mut frame_count: usize = 0;
@@ -260,12 +269,15 @@ fn tui_loop(
     let mut last_viewport_start: usize = 0;
     const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let mut zoom_idx: usize = DEFAULT_ZOOM_IDX;
-    let mut beat_unit_idx: usize = DEFAULT_BEAT_UNIT_IDX;
     let mut detect_mode: usize = 0;
     let mut detail_height: usize = 8;
     let mut overview_rect = ratatui::layout::Rect::default();
     let mut last_bar_cols: Vec<usize> = Vec::new();
     let mut nudge: i8 = 0; // -1 = backward, 0 = none, +1 = forward
+    let mut nudge_mode = NudgeMode::Jump;
+    let mut volume: f32 = 1.0;
+    let mut help_open = false;
+    let mut palette_idx: usize = 0;
 
     // Shared state for the background detail-braille thread.
     let detail_cols = Arc::new(AtomicUsize::new(0));
@@ -377,6 +389,7 @@ fn tui_loop(
         frame_count += 1;
         if let Ok((hash, new_bpm, new_offset)) = bpm_rx.try_recv() {
             bpm = new_bpm;
+            base_bpm = new_bpm;
             offset_ms = new_offset;
             cache.set(hash.clone(), CacheEntry { bpm, offset_ms, name: filename.to_string() });
             cache.save();
@@ -402,7 +415,8 @@ fn tui_loop(
         // Large drift (seek / startup) snaps immediately. Small drift correction rate is 1.0
         // (also snaps) so any firing is visually obvious — for empirical observation only.
         if !player.is_paused() {
-            smooth_display_samp += elapsed * sample_rate as f64;
+            let speed = (bpm / base_bpm) as f64 * (1.0 + nudge as f64 * 0.1);
+            smooth_display_samp += elapsed * sample_rate as f64 * speed;
         } else if nudge != 0 {
             // While paused and nudging, drift the display position at ±10% of normal speed
             // and sync the actual position atomic so seeking remains accurate.
@@ -449,7 +463,6 @@ fn tui_loop(
             format!("{:02}:{:02}", s / 60, s % 60)
         };
         let time_str = format!("{} / {}", fmt_dur(pos), fmt_dur(total_duration));
-        let status = if player.is_paused() { "Paused" } else { "Playing" };
         detail_zoom_at.store(zoom_idx, Ordering::Relaxed);
 
         terminal.draw(|frame| {
@@ -464,12 +477,9 @@ fn tui_loop(
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(1), // BPM + offset
+                    Constraint::Length(1), // info bar
                     Constraint::Length(5), // overview waveform
                     Constraint::Min(0),    // detail waveform + blank space
-                    Constraint::Length(1), // beat indicator
-                    Constraint::Length(1), // status + time
-                    Constraint::Length(1), // key hints
                 ])
                 .split(inner);
             // Sub-split the detail area: fixed height + blank space below.
@@ -481,15 +491,50 @@ fn tui_loop(
                 ])
                 .split(chunks[2])[0];
 
-            // BPM + offset
-            let bpm_line = if analysing {
-                format!("BPM: --- [analysing {}]   unit: {} beats",
-                    SPINNER[frame_count % SPINNER.len()], BEAT_UNITS[beat_unit_idx])
-            } else {
-                format!("BPM: {bpm:.0} [{}]   offset: {:+}ms   unit: {} beats",
-                    DETECT_MODES[detect_mode], offset_ms, BEAT_UNITS[beat_unit_idx])
-            };
-            frame.render_widget(Paragraph::new(bpm_line), chunks[0]);
+            // Info bar
+            {
+                let play_icon = if player.is_paused() { "⏸" } else { "▶" };
+                let mode_str = match nudge_mode {
+                    NudgeMode::Jump => "jump",
+                    NudgeMode::Warp => "warp",
+                };
+                let nudge_str = match nudge {
+                    1  => "  ▶nudge",
+                    -1 => "  ◀nudge",
+                    _  => "",
+                };
+                let dim = Style::default().fg(Color::DarkGray);
+                let info_line = if analysing {
+                    Line::from(vec![
+                        Span::styled(format!("{play_icon}  "), dim),
+                        Span::styled(
+                            format!("[analysing {}]", SPINNER[frame_count % SPINNER.len()]),
+                            dim,
+                        ),
+                    ])
+                } else {
+                    let bpm_style = if beat_on {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .bg(Color::Rgb(60, 50, 0))
+                    } else {
+                        dim
+                    };
+                    Line::from(vec![
+                        Span::styled(format!("{play_icon}  "), dim),
+                        Span::styled(format!("{:.1} bpm", bpm), bpm_style),
+                        Span::styled(
+                            format!("  {:+}ms  {}s  vol:{}%{}  nudge:{}  {}  [?]",
+                                offset_ms, zoom_secs,
+                                (volume * 100.0).round() as u32, nudge_str,
+                                mode_str,
+                                SPECTRAL_PALETTES[palette_idx].0),
+                            dim,
+                        ),
+                    ])
+                };
+                frame.render_widget(Paragraph::new(info_line), chunks[0]);
+            }
 
             // Overview waveform — Braille rendered fresh each frame (O(cols×rows), negligible).
             let ow = chunks[1].width as usize;
@@ -502,15 +547,15 @@ fn tui_loop(
             };
             let playhead_col = ((playhead_frac * ow as f64) as usize).min(ow.saturating_sub(1));
 
-            let ov_peaks: Vec<(f32, f32)> = (0..ow)
+            let (ov_peaks, ov_bass): (Vec<(f32, f32)>, Vec<f32>) = (0..ow)
                 .map(|col| {
                     let idx = (col * total_peaks / ow.max(1)).min(total_peaks.saturating_sub(1));
-                    waveform.peaks[idx]
+                    (waveform.peaks[idx], waveform.bass_ratio[idx])
                 })
-                .collect();
+                .unzip();
             let ov_braille = render_braille(&ov_peaks, oh, ow);
             let (bar_cols, bars_per_tick): (Vec<usize>, u32) = if !analysing {
-                bar_tick_cols(bpm as f64, offset_ms, total_duration.as_secs_f64(), ow)
+                bar_tick_cols(base_bpm as f64, offset_ms, total_duration.as_secs_f64(), ow)
             } else {
                 (Vec::new(), 4)
             };
@@ -540,7 +585,14 @@ fn tui_loop(
                         } else if bar_cols.contains(&c) && (r == 0 || r + 1 == oh) {
                             (Color::DarkGray, '\u{28FF}') // ⣿ tick at top and bottom rows only
                         } else {
-                            (Color::Green, char::from_u32(0x2800 | byte as u32).unwrap_or(' '))
+                            let r = ov_bass[c];
+                            let (_, (br, bg, bb), (tr, tg, tb)) = SPECTRAL_PALETTES[palette_idx];
+                            let spectral = Color::Rgb(
+                                (br as f32 * r + tr as f32 * (1.0 - r)) as u8,
+                                (bg as f32 * r + tg as f32 * (1.0 - r)) as u8,
+                                (bb as f32 * r + tb as f32 * (1.0 - r)) as u8,
+                            );
+                            (spectral, char::from_u32(0x2800 | byte as u32).unwrap_or(' '))
                         };
                         if color != run_color {
                             if !run.is_empty() {
@@ -615,7 +667,7 @@ fn tui_loop(
                 let mut row = vec![0u8; dw];
                 let spc = buf.samples_per_col as f64;
                 let half_spc = half_col_samp_global;
-                let beat_period_samp = 60.0 / bpm as f64 * sample_rate as f64;
+                let beat_period_samp = 60.0 / base_bpm as f64 * sample_rate as f64;
                 let offset_samp = offset_ms as f64 / 1000.0 * sample_rate as f64;
                 // Quantized visual centre: same reference point the waveform uses.
                 let visual_centre = buf.anchor_sample as f64 + delta_half_global as f64 * half_spc;
@@ -701,52 +753,42 @@ fn tui_loop(
 
             frame.render_widget(Paragraph::new(detail_lines), detail_area);
 
-            // Beat indicator (single line)
-            let (label, style) = if beat_on && !analysing {
-                (
-                    "  ██  BEAT  ██  ",
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                ("  ··  beat  ··  ", Style::default().fg(Color::DarkGray))
-            };
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(label, style))),
-                chunks[3],
-            );
-
-            // Status + time
-            frame.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(format!("[{status}]  "), Style::default().fg(Color::Cyan)),
-                    if nudge != 0 {
-                        Span::styled(
-                            format!("[nudge {}]  ", if nudge > 0 { "▶" } else { "◀" }),
-                            Style::default().fg(Color::Yellow),
-                        )
-                    } else {
-                        Span::raw("")
-                    },
-                    Span::raw(time_str),
-                    Span::styled(
-                        format!("   zoom: {}s", zoom_secs),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ])),
-                chunks[4],
-            );
-
-            // Key hints
-            frame.render_widget(
-                Paragraph::new(format!("Space: play/pause   [/]: beat jump   1-7: unit   +/-: offset   z/Z: zoom   {{/}}: height({})   ,/.: nudge   h/H: bpm½/×2   r: re-detect   b: browser   q: quit",
-                    detail_height)
-                )
-                    .style(Style::default().fg(Color::DarkGray)),
-                chunks[5],
-            );
+            // Help popup
+            if help_open {
+                const HELP: &str = "\
+Space          play / pause
+1/2/3/4        beat jump forward 1/4/16/64 beats
+q/w/e/r        beat jump backward 1/4/16/64 beats
+c  /  d        nudge backward / forward (mode-dependent)
+C  /  D        toggle nudge mode: jump (10ms) / warp (±10% speed)
++  /  -        beat phase offset ±10ms
+z  /  Z        zoom out / in
+{  /  }        detail height decrease / increase
+h  /  H        BPM ½ / ×2
+f  /  v        BPM +0.1 / -0.1
+t              re-run BPM detection
+↑  /  ↓        volume up / down (5% steps)
+p              cycle spectral colour palette
+b              open file browser
+?              toggle this help
+Esc            quit";
+                let popup_w = 48u16;
+                let popup_h = HELP.lines().count() as u16 + 2;
+                let px = area.x + area.width.saturating_sub(popup_w) / 2;
+                let py = area.y + area.height.saturating_sub(popup_h) / 2;
+                let popup_rect = ratatui::layout::Rect {
+                    x: px, y: py,
+                    width: popup_w.min(area.width),
+                    height: popup_h.min(area.height),
+                };
+                frame.render_widget(ratatui::widgets::Clear, popup_rect);
+                frame.render_widget(
+                    Paragraph::new(HELP)
+                        .block(Block::default().borders(Borders::ALL).title(" Key Bindings "))
+                        .style(Style::default().fg(Color::White)),
+                    popup_rect,
+                );
+            }
         })?;
 
         // Adaptive frame rate: target one dot-column (half a character) per frame.
@@ -786,26 +828,60 @@ fn tui_loop(
                 }
             }
             Event::Key(key) => {
-                // Nudge: handled for all key kinds so release is detected.
+                // Ctrl-C: unconditional quit.
+                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    player.stop();
+                    if let Some(ref hash) = analysis_hash {
+                        if let Some(entry) = cache.get(hash.as_str()).cloned() {
+                            cache.set(hash.clone(), CacheEntry { offset_ms, ..entry });
+                            cache.save();
+                        }
+                    }
+                    return Ok(None);
+                }
+                // Nudge / c/d: handled for all key kinds so release is detected.
                 match (key.kind, key.code) {
-                    (KeyEventKind::Press | KeyEventKind::Repeat, KeyCode::Char(',')) => {
+                    (KeyEventKind::Press, KeyCode::Char('C') | KeyCode::Char('D')) => {
+                        if nudge != 0 {
+                            nudge = 0;
+                            player.set_speed(bpm / base_bpm);
+                        }
+                        nudge_mode = match nudge_mode {
+                            NudgeMode::Jump => NudgeMode::Warp,
+                            NudgeMode::Warp => NudgeMode::Jump,
+                        };
+                    }
+                    (KeyEventKind::Press | KeyEventKind::Repeat, KeyCode::Char('c'))
+                        if nudge_mode == NudgeMode::Warp =>
+                    {
                         nudge = -1;
-                        player.set_speed(0.9);
+                        player.set_speed(bpm / base_bpm * 0.9);
                     }
-                    (KeyEventKind::Press | KeyEventKind::Repeat, KeyCode::Char('.')) => {
+                    (KeyEventKind::Press | KeyEventKind::Repeat, KeyCode::Char('d'))
+                        if nudge_mode == NudgeMode::Warp =>
+                    {
                         nudge = 1;
-                        player.set_speed(1.1);
+                        player.set_speed(bpm / base_bpm * 1.1);
                     }
-                    (KeyEventKind::Release, KeyCode::Char(',') | KeyCode::Char('.')) => {
+                    (KeyEventKind::Release, KeyCode::Char('c') | KeyCode::Char('d'))
+                        if nudge_mode == NudgeMode::Warp =>
+                    {
                         nudge = 0;
-                        player.set_speed(1.0);
+                        player.set_speed(bpm / base_bpm);
                     }
                     _ => {}
+                }
+                // While help is open, any key dismisses it.
+                if help_open {
+                    if key.kind == KeyEventKind::Press {
+                        help_open = false;
+                    }
+                    continue;
                 }
                 // All other actions fire only on Press or Repeat.
                 if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat {
                 match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => {
+                    KeyCode::Esc => {
                         player.stop();
                         if let Some(ref hash) = analysis_hash {
                             if let Some(entry) = cache.get(hash.as_str()).cloned() {
@@ -843,6 +919,18 @@ fn tui_loop(
                     KeyCode::Char(' ') => {
                         if player.is_paused() { player.play(); } else { player.pause(); }
                     }
+                    KeyCode::Up => {
+                        volume = (volume + 0.05).min(1.0);
+                        player.set_volume(volume);
+                    }
+                    KeyCode::Down => {
+                        volume = (volume - 0.05).max(0.0);
+                        player.set_volume(volume);
+                    }
+                    KeyCode::Char('?') => { help_open = true; }
+                    KeyCode::Char('p') => {
+                        palette_idx = (palette_idx + 1) % SPECTRAL_PALETTES.len();
+                    }
                     KeyCode::Char('+') | KeyCode::Char('=') => offset_ms += 10,
                     KeyCode::Char('-') | KeyCode::Char('_') => offset_ms -= 10,
                     KeyCode::Char('z') => {
@@ -859,6 +947,8 @@ fn tui_loop(
                     }
                     KeyCode::Char('h') => {
                         bpm = (bpm * 0.5).max(40.0);
+                        base_bpm = bpm;
+                        player.set_speed(1.0);
                         if let Some(ref hash) = analysis_hash {
                             if let Some(entry) = cache.get(hash.as_str()).cloned() {
                                 cache.set(hash.clone(), CacheEntry { bpm, offset_ms, ..entry });
@@ -868,6 +958,8 @@ fn tui_loop(
                     }
                     KeyCode::Char('H') => {
                         bpm = (bpm * 2.0).min(240.0);
+                        base_bpm = bpm;
+                        player.set_speed(1.0);
                         if let Some(ref hash) = analysis_hash {
                             if let Some(entry) = cache.get(hash.as_str()).cloned() {
                                 cache.set(hash.clone(), CacheEntry { bpm, offset_ms, ..entry });
@@ -875,7 +967,15 @@ fn tui_loop(
                             }
                         }
                     }
-                    KeyCode::Char('r') => {
+                    KeyCode::Char('f') => {
+                        bpm = (bpm + 0.1).min(240.0);
+                        player.set_speed(bpm / base_bpm);
+                    }
+                    KeyCode::Char('v') => {
+                        bpm = (bpm - 0.1).max(40.0);
+                        player.set_speed(bpm / base_bpm);
+                    }
+                    KeyCode::Char('t') => {
                         if let Some(ref hash) = analysis_hash {
                             let hash = hash.clone();
                             detect_mode = (detect_mode + 1) % DETECT_MODES.len();
@@ -896,30 +996,28 @@ fn tui_loop(
                             analysis_hash = None;
                         }
                     }
-                    KeyCode::Char(c @ '1'..='7') => {
-                        beat_unit_idx = (c as usize - '1' as usize).min(BEAT_UNITS.len() - 1);
+                    KeyCode::Char('d') if nudge_mode == NudgeMode::Jump => {
+                        let current = seek_handle.current_pos().as_secs_f64();
+                        let target = (current + 0.010).min(total_duration.as_secs_f64());
+                        let delta = target - current;
+                        seek_handle.set_position(target);
+                        smooth_display_samp += delta * sample_rate as f64;
                     }
-                    KeyCode::Char('[') => {
-                        let jump = BEAT_UNITS[beat_unit_idx] as f64 * 60.0 / bpm as f64;
-                        let target = seek_handle.current_pos().as_secs_f64() - jump;
-                        if player.is_paused() {
-                            seek_handle.seek_direct(target.max(0.0));
-                        } else {
-                            seek_handle.seek_to(target.max(0.0));
-                        }
+                    KeyCode::Char('c') if nudge_mode == NudgeMode::Jump => {
+                        let current = seek_handle.current_pos().as_secs_f64();
+                        let target = (current - 0.010).max(0.0);
+                        let delta = target - current;
+                        seek_handle.set_position(target);
+                        smooth_display_samp += delta * sample_rate as f64;
                     }
-                    KeyCode::Char(']') => {
-                        let jump = BEAT_UNITS[beat_unit_idx] as f64 * 60.0 / bpm as f64;
-                        let target = seek_handle.current_pos().as_secs_f64() + jump;
-                        let max = total_duration.as_secs_f64();
-                        if target < max {
-                            if player.is_paused() {
-                                seek_handle.seek_direct(target);
-                            } else {
-                                seek_handle.seek_to(target);
-                            }
-                        }
-                    }
+                    KeyCode::Char('1') => do_jump(&seek_handle, &player, bpm, total_duration,  1),
+                    KeyCode::Char('q') => do_jump(&seek_handle, &player, bpm, total_duration, -1),
+                    KeyCode::Char('2') => do_jump(&seek_handle, &player, bpm, total_duration,  4),
+                    KeyCode::Char('w') => do_jump(&seek_handle, &player, bpm, total_duration, -4),
+                    KeyCode::Char('3') => do_jump(&seek_handle, &player, bpm, total_duration,  16),
+                    KeyCode::Char('e') => do_jump(&seek_handle, &player, bpm, total_duration, -16),
+                    KeyCode::Char('4') => do_jump(&seek_handle, &player, bpm, total_duration,  64),
+                    KeyCode::Char('r') => do_jump(&seek_handle, &player, bpm, total_duration, -64),
                     _ => {}
                 }
                 } // end if Press | Repeat
@@ -970,6 +1068,23 @@ impl BrailleBuffer {
 /// `peaks` — one (min, max) pair per column, values in [-1, 1].
 /// Mapping: y = +1 → top dot row 0; y = −1 → bottom dot row (rows×4 − 1).
 /// Combine two adjacent braille bytes into a half-column-shifted result.
+#[derive(Clone, Copy, PartialEq)]
+enum NudgeMode { Jump, Warp }
+
+/// Beat-jump helper. Positive `beats` = forward, negative = backward.
+fn do_jump(seek_handle: &SeekHandle, player: &rodio::Player, bpm: f32, total_duration: std::time::Duration, beats: i32) {
+    let jump = beats.unsigned_abs() as f64 * 60.0 / bpm as f64;
+    if beats < 0 {
+        let target = (seek_handle.current_pos().as_secs_f64() - jump).max(0.0);
+        if player.is_paused() { seek_handle.seek_direct(target); } else { seek_handle.seek_to(target); }
+    } else {
+        let target = seek_handle.current_pos().as_secs_f64() + jump;
+        if target < total_duration.as_secs_f64() {
+            if player.is_paused() { seek_handle.seek_direct(target); } else { seek_handle.seek_to(target); }
+        }
+    }
+}
+
 /// Takes the right dot-column of `a` (bits 3,4,5,7) as the new left column (bits 0,1,2,6)
 /// and the left dot-column of `b` (bits 0,1,2,6) as the new right column (bits 3,4,5,7).
 fn shift_braille_half(a: u8, b: u8) -> u8 {
@@ -1055,25 +1170,32 @@ fn bar_tick_cols(bpm: f64, offset_ms: i64, total_secs: f64, cols: usize) -> (Vec
 struct WaveformData {
     /// Full-track peak envelope at OVERVIEW_RESOLUTION buckets.
     peaks: Vec<(f32, f32)>,
+    /// Per-bucket bass ratio in [0,1]: 1.0 = bass-heavy, 0.0 = treble-heavy.
+    bass_ratio: Vec<f32>,
     /// Raw mono samples for detail view rendering.
     mono: Arc<Vec<f32>>,
 }
 
 impl WaveformData {
-    fn compute(mono: Arc<Vec<f32>>, _sample_rate: u32) -> Self {
+    fn compute(mono: Arc<Vec<f32>>, sample_rate: u32) -> Self {
         let n = mono.len();
         let chunk_size = (n / OVERVIEW_RESOLUTION).max(1);
-        let peaks = mono
+        // k: spectral rate at crossover (250 Hz); bass_ratio = 0.5 at this frequency.
+        let k = (2.0 * std::f32::consts::TAU * 250.0 / sample_rate as f32).max(1e-6);
+        let (peaks, bass_ratio) = mono
             .chunks(chunk_size)
             .map(|chunk| {
                 let min = chunk.iter().cloned().fold(f32::INFINITY, f32::min);
                 let max = chunk.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                (min.max(-1.0), max.min(1.0))
+                let total_energy: f32 = chunk.iter().map(|&s| s * s).sum::<f32>() / chunk.len() as f32;
+                let diff_energy: f32 = chunk.windows(2).map(|w| (w[1] - w[0]).powi(2)).sum::<f32>()
+                    / (chunk.len() as f32 - 1.0).max(1.0);
+                let bass = (1.0 - (diff_energy / (total_energy + 1e-10)).sqrt() / k).clamp(0.0, 1.0);
+                ((min.max(-1.0), max.min(1.0)), bass)
             })
-            .collect();
-        Self { peaks, mono }
+            .unzip();
+        Self { peaks, bass_ratio, mono }
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -1085,6 +1207,8 @@ struct TrackingSource {
     position: Arc<AtomicUsize>,
     /// Fade state: negative = fading out (counting toward 0), positive = fading in (counting down).
     fade_remaining: Arc<AtomicI64>,
+    /// Length of the current fade in samples (FADE_SAMPLES or MICRO_FADE_SAMPLES).
+    fade_len: Arc<AtomicI64>,
     /// Pending seek target sample index; usize::MAX means no seek pending.
     pending_target: Arc<AtomicUsize>,
     sample_rate: u32,
@@ -1096,11 +1220,12 @@ impl TrackingSource {
         samples: Arc<Vec<f32>>,
         position: Arc<AtomicUsize>,
         fade_remaining: Arc<AtomicI64>,
+        fade_len: Arc<AtomicI64>,
         pending_target: Arc<AtomicUsize>,
         sample_rate: u32,
         channels: u16,
     ) -> Self {
-        Self { samples, position, fade_remaining, pending_target, sample_rate, channels }
+        Self { samples, position, fade_remaining, fade_len, pending_target, sample_rate, channels }
     }
 }
 
@@ -1111,9 +1236,10 @@ impl Iterator for TrackingSource {
 
         if fade < 0 {
             // Fading out: read current position, apply descending envelope.
+            let fl = self.fade_len.load(Ordering::Relaxed);
             let pos = self.position.fetch_add(1, Ordering::Relaxed);
             let raw = self.samples.get(pos).copied().unwrap_or(0.0);
-            let t = (-fade) as f32 / FADE_SAMPLES as f32;
+            let t = (-fade) as f32 / fl as f32;
             let new_fade = self.fade_remaining.fetch_add(1, Ordering::Relaxed) + 1;
             if new_fade == 0 {
                 // Fade-out complete — apply pending seek then start fade-in.
@@ -1121,14 +1247,15 @@ impl Iterator for TrackingSource {
                 if target != usize::MAX {
                     self.position.store(target, Ordering::SeqCst);
                 }
-                self.fade_remaining.store(FADE_SAMPLES, Ordering::Relaxed);
+                self.fade_remaining.store(fl, Ordering::Relaxed);
             }
             Some(raw * t)
         } else if fade > 0 {
             // Fading in: read new position, apply ascending envelope.
+            let fl = self.fade_len.load(Ordering::Relaxed);
             let pos = self.position.fetch_add(1, Ordering::Relaxed);
             let raw = self.samples.get(pos).copied().unwrap_or(0.0);
-            let t = (FADE_SAMPLES - fade) as f32 / FADE_SAMPLES as f32;
+            let t = (fl - fade) as f32 / fl as f32;
             self.fade_remaining.fetch_sub(1, Ordering::Relaxed);
             Some(raw * t)
         } else {
@@ -1159,6 +1286,7 @@ struct SeekHandle {
     samples: Arc<Vec<f32>>,
     position: Arc<AtomicUsize>,
     fade_remaining: Arc<AtomicI64>,
+    fade_len: Arc<AtomicI64>,
     pending_target: Arc<AtomicUsize>,
     sample_rate: u32,
     channels: u16,
@@ -1197,12 +1325,27 @@ impl SeekHandle {
 
         // Store the target, then trigger fade-out. The audio thread applies the seek
         // when the fade-out completes and then fades back in.
+        self.fade_len.store(FADE_SAMPLES, Ordering::SeqCst);
         self.pending_target.store(target_sample, Ordering::SeqCst);
         self.fade_remaining.store(-FADE_SAMPLES, Ordering::SeqCst);
     }
 
+    /// Seek to `target_secs` with a short ~0.2ms fade — for micro-jumps where a full
+    /// 6ms fade would be longer than the jump itself.
+    fn seek_micro_fade(&self, target_secs: f64) {
+        let frame_len = self.channels as usize;
+        let total_frames = self.samples.len() / frame_len;
+        let target_frame = (target_secs * self.sample_rate as f64).round() as usize;
+        let target_sample = (target_frame * frame_len).min(self.samples.len());
+        self.fade_len.store(MICRO_FADE_SAMPLES, Ordering::SeqCst);
+        self.pending_target.store(target_sample, Ordering::SeqCst);
+        self.fade_remaining.store(-MICRO_FADE_SAMPLES, Ordering::SeqCst);
+        let _ = total_frames; // used implicitly via clamp above
+    }
+
     /// Seek to `target_secs` directly, without a fade. Used when paused — the audio
     /// thread is not calling next(), so the fade-based seek would never execute.
+
     fn seek_direct(&self, target_secs: f64) {
         let frame_len = self.channels as usize;
         let total_frames = self.samples.len() / frame_len;
@@ -1547,6 +1690,9 @@ fn run_browser(
 
         if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
+                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    return Ok(BrowserResult::Quit);
+                }
                 if key.kind != KeyEventKind::Press { continue; }
                 match key.code {
                     KeyCode::Up => state.move_up(),

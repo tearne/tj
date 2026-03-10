@@ -28,10 +28,19 @@ tj [path]
 | `Space` | Play / Pause |
 | `+` / `-` | Adjust beat phase offset (10ms steps) |
 | `Left` / `Right` | Seek backward / forward (small increment, e.g. 5s) |
-| `[` / `]` | Beat jump backward / forward by the current beat unit |
-| `1`–`6` | Set beat jump unit (4, 8, 16, 32, 64 beats) |
+| `1` / `2` / `3` / `4` | Beat jump forward 1 / 4 / 16 / 64 beats |
+| `q` / `w` / `e` / `r` | Beat jump backward 1 / 4 / 16 / 64 beats |
+| `↑` / `↓` | Volume up / down (5% steps) |
+| `c` / `d` | Nudge backward / forward (mode-dependent) |
+| `C` / `D` | Toggle nudge mode: `jump` (10ms seek) / `warp` (±10% speed) |
+| `z` / `Z` | Zoom out / in |
+| `{` / `}` | Detail height decrease / increase |
+| `h` / `H` | BPM ½ / ×2 |
+| `f` / `v` | BPM +0.1 / −0.1 |
+| `t` | Re-run BPM detection |
+| `?` | Toggle key binding help popup |
 | `b` | Open file browser |
-| `q` | Quit |
+| `Esc` / `Ctrl-C` | Quit |
 
 > Key bindings are indicative; exact bindings are an implementation concern.
 
@@ -60,14 +69,18 @@ tj [path]
 - A beat phase offset (in milliseconds) can be adjusted at runtime to align the beat indicator with the audio. The offset and BPM are displayed in the UI.
 - The user can correct an inaccurate detection at runtime:
   - `h` halves the BPM; `H` doubles it. Takes effect immediately.
+  - `f` increases the effective BPM by 0.1; `v` decreases it by 0.1. Adjustments affect playback speed proportionally (relative to the detected BPM) and clamp to the range 40.0–240.0.
   - `r` re-runs detection cycling through modes: `auto` (default tempogram), `fusion` (tempogram + legacy in parallel), `legacy` (autocorrelation + comb filter). Non-blocking: returns immediately, shows the animated indicator while detection runs in the background.
   - Corrections are persisted to the cache immediately.
 - Detected BPM and phase offset are cached in `~/.local/share/tj/cache.json`, keyed by a Blake3 hash of the decoded audio samples. This makes the cache invariant of filename, tags, and container format.
 - Each cache entry includes the filename at time of first detection as a human-readable hint to aid manual cache management.
 - On quit, the current phase offset is persisted to the cache.
 
-### Beat Indicator
-- A visual indicator flashes on each beat in real time, derived from the detected BPM, playback position, and phase offset.
+### Info Bar
+- A single line at the top of the player view displays: play/pause icon (`▶`/`⏸`), BPM value (one decimal place), phase offset, zoom level, and a `[?]` help hint. The bar wraps naturally if the terminal is too narrow.
+- The BPM value receives a soft amber highlight for the duration of each beat flash window, providing a subtle per-beat pulse without a separate indicator panel.
+- Pressing `?` opens a modal key binding reference overlay; any key dismisses it.
+- During BPM analysis the BPM field shows an animated spinner.
 
 ### Waveform Visualisation
 - Two waveform views are displayed simultaneously:
@@ -76,6 +89,7 @@ tj [path]
 - Both views update in real time during playback.
 - The Detail view tracks the playhead as the track progresses.
 - Zoom level for the Detail view is adjustable by the user.
+- The Overview waveform is coloured by spectral content: each column blends between an orange/warm colour (bass-heavy) and a cyan/cool colour (treble-heavy), based on the ratio of low-frequency to high-frequency energy in that section. The frequency crossover is ~250 Hz. Several colour palettes are available and cycle with `p`; the active palette name is shown in the info bar.
 - The Overview displays bar markers as full-height lines drawn beneath the waveform, visible only in the gaps. The marker interval starts at every 4 bars and doubles if there are fewer than two characters between any pair of adjacent markers, repeating until all pairs have at least two characters between them. A legend in the top-right corner of the Overview shows the current interval (e.g. `4 bars`, `8 bars`).
 - The detail view displays a beat marker at each beat position as a full-height line drawn beneath the waveform, visible only in the gaps.
 - Buffer columns representing sample positions before the start of the track render as silence (zero amplitude), not as a mirror of position 0.
@@ -94,7 +108,7 @@ The following principles are required to achieve smooth, stable rendering:
 - **Tick marks in screen space**: Beat tick marks must be computed in **screen space** from the **quantised viewport centre**, not encoded as isolated marks in **buffer space**. Isolated marks in buffer space produce completely different braille characters on alternating frames when processed through the half-column shift, causing visible oscillation at wide zoom.
 - **Consistent tick and viewport centre**: Tick mark positions and the waveform viewport must both be derived from the **quantised viewport centre**, not from the raw smooth display position. The two can differ by up to half a column, causing ticks to snap relative to the waveform on every frame at wide zoom.
 
-The detail waveform height is user-adjustable at runtime with `{` (decrease) and `}` (increase), defaulting to 8 rows. Any unused space below the panel is left blank. The current height is shown in the key hints line.
+The detail waveform height is user-adjustable at runtime with `{` (decrease) and `}` (increase), defaulting to 8 rows. Any unused space below the panel is left blank.
 
 The detail waveform scrolls at half-column resolution: the viewport can be positioned at half-character offsets without modifying the pre-rendered buffer (see *Glossary — Half-column scrolling*).
 
@@ -103,19 +117,22 @@ The render frame period adapts to the current zoom level and detail panel width,
 ### Needle Drop
 - A left mouse click anywhere on the Overview waveform seeks the transport to the start of the nearest bar marker at or to the left of the click position. Playback state is preserved — if playing, playback continues from the new position; if paused, the transport remains paused. The Detail view recentres on the new position immediately.
 
+### Volume Control
+- The playback volume is adjustable at runtime using `↑` (increase) and `↓` (decrease) in 5% steps, from 0% to 100%. The current volume is displayed in the info bar. Changes take effect immediately without interrupting playback. Volume is not persisted between sessions.
+
 ### Nudge
-- Holding `,` (nudge backward) or `.` (nudge forward) applies a continuous ±10% speed offset to playback. Releasing the key returns to normal speed immediately.
-- While playing, speed and pitch shift by ±10%; the audio output reflects the change within ~100ms.
-- While paused, nudge has no audible effect but drifts the transport position at ±10% of normal playback speed for as long as the key is held.
-- The nudge state is indicated in the UI while active.
+- `c`/`d` nudge the transport backward/forward. Behaviour depends on the active nudge mode, toggled with `C`/`D`:
+  - **`jump` mode** (default): each press (and key-repeat while held) seeks the playhead ±10ms.
+  - **`warp` mode**: holding `c`/`d` applies a continuous ±10% speed offset; releasing returns to normal speed. While paused, drifts the transport position at ±10% of normal playback speed for as long as the key is held.
+- The active nudge mode is shown in the info bar (`nudge:jump` / `nudge:warp`).
+- While playing in warp mode, speed and pitch shift by ±10%; the audio output reflects the change within ~100ms.
+- The nudge active state is indicated in the UI while a warp is held.
 
 ### Beat Jump
-- Beat jump moves the playhead backward or forward by a user-selected number of beats: 4, 8, 16, 32, 64, or 128.
-- The jump is by exactly N × beat_period seconds from the current position, preserving rhythmic continuity.
+- Eight dedicated beat jump actions cover four sizes (1, 4, 16, 64 beats) in each direction. Each action jumps by exactly N × beat_period seconds from the current position, preserving rhythmic continuity.
 - Jumping backward past the start clamps to position 0. Jumping forward past the end is a no-op.
 - Seeking is implemented via an atomic position counter shared with the audio thread; the audio thread never pauses.
 - A ~6ms fade-out before the cut and ~6ms fade-in after eliminate click artefacts without any perceptible gap.
-- The detected BPM and current beat jump unit are displayed in the UI.
 
 ### Threading
 - Audio decode runs on a background thread with progress reported to the TUI via atomics; the TUI render loop starts immediately and remains responsive during decode.

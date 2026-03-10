@@ -1,39 +1,55 @@
 # Proposal: Keyboard Mapping
-**Status: Note**
+**Status: Approved**
 
 ## Intent
-All player controls are currently hard-coded. A user-configurable keyboard mapping would allow rebinding any control without recompiling, and provide a canonical list of all mappable UI functions.
+All player controls are currently hard-coded. A user-configurable keyboard mapping allows rebinding any control without recompiling.
 
-## Unresolved
-
-### Configuration format
-Three realistic options:
-
-**TOML**
-- Pros: widely known, simple key-value structure, good Rust library support (`toml` crate), human-readable, no programming knowledge required.
-- Cons: no scripting or logic; complex conditional bindings are not expressible.
-- Best for: simple rebinding with no dynamic behaviour.
-
-**KDL**
-- Pros: clean node-based syntax, growing ecosystem, expressive for nested config.
-- Cons: less widely known than TOML, smaller Rust ecosystem, unfamiliar to most users.
-- Best for: richer config structures where nesting is natural.
-
-**Lua**
-- Pros: fully programmable, could support conditional bindings and custom logic; familiar to power users from tools like Neovim.
-- Cons: requires embedding a Lua runtime; significantly more complex to implement and maintain; overkill if only key rebinding is needed.
-- Best for: extensible plugin-style configuration.
-
-**Recommendation**: TOML for initial implementation. It covers all straightforward rebinding needs with minimal complexity. Lua can be reconsidered if scripting requirements emerge.
-
-### Other open questions
-- Where does the config file live? (`~/.config/tj/keys.toml` or similar XDG path.)
-- What is the fallback when a key has no binding (warn silently or show in UI)?
-- Should the config list all functions explicitly, or only overrides from the default map?
-- The spec should enumerate all mappable UI functions as a canonical list.
-
-## Specification Deltas (provisional)
+## Specification Deltas
 
 ### ADDED
-- **Keyboard mapping**: Key bindings are configurable via a TOML file at `~/.config/tj/keys.toml`. The file maps function names to key combinations. Unrecognised keys are ignored; unbound functions use their default binding. The spec enumerates all mappable functions.
-- **Mappable functions** (canonical list — to be finalised): `play_pause`, `quit`, `seek_backward`, `seek_forward`, `beat_jump_backward`, `beat_jump_forward`, `beat_unit_1` through `beat_unit_7`, `zoom_in`, `zoom_out`, `height_increase`, `height_decrease`, `offset_increase`, `offset_decrease`, `bpm_halve`, `bpm_double`, `bpm_redetect`, `open_browser`, `nudge_forward`, `nudge_backward`, `volume_up`, `volume_down`.
+- **Keyboard mapping**: Key bindings are loaded from `~/.config/tj/config.toml` at startup under a `[keys]` table. Each entry maps a function name to a key string. If a function has no entry in the file, it has no binding and cannot be triggered. If the file is absent or the `[keys]` table is missing, all functions are unbound.
+- **Mappable functions** (canonical list):
+
+| Function | Default key (dev config) |
+|----------|--------------------------|
+| `play_pause` | `space` |
+| `quit` | `esc` |
+| `jump_forward_1` | `1` |
+| `jump_backward_1` | `q` |
+| `jump_forward_4` | `2` |
+| `jump_backward_4` | `w` |
+| `jump_forward_16` | `3` |
+| `jump_backward_16` | `e` |
+| `jump_forward_64` | `4` |
+| `jump_backward_64` | `r` |
+| `nudge_backward` | `,` |
+| `nudge_forward` | `.` |
+| `micro_jump_backward` | `c` |
+| `micro_jump_forward` | `d` |
+| `offset_increase` | `+` |
+| `offset_decrease` | `-` |
+| `zoom_in` | `Z` |
+| `zoom_out` | `z` |
+| `height_increase` | `}` |
+| `height_decrease` | `{` |
+| `volume_up` | `j` |
+| `volume_down` | `m` |
+| `bpm_halve` | `h` |
+| `bpm_double` | `H` |
+| `bpm_increase` | `f` |
+| `bpm_decrease` | `v` |
+| `bpm_redetect` | `t` |
+| `palette_cycle` | `p` |
+| `open_browser` | `b` |
+| `help` | `?` |
+
+- **Key string format**: single printable characters are written as-is (`q`, `[`, `+`). Special keys use lowercase names: `space`, `left`, `right`, `up`, `down`, `enter`, `backspace`, `esc`. Case-sensitive characters are written as-is (`H` vs `h`).
+- **Hard-coded quit**: Ctrl-C always quits unconditionally and is not configurable via the keymap.
+- **Hold actions**: `nudge_backward` and `nudge_forward` activate on key press and deactivate on release. All other actions fire on press.
+
+### MODIFIED
+- The hard-coded key bindings in the player event loop are replaced by a dispatch table derived from the config file.
+
+## Scope
+- **In scope**: loading and parsing the config; building the dispatch table; replacing hard-coded bindings; creating a working dev config at `~/.config/tj/config.toml`.
+- **Out of scope**: auto-creating the config file with defaults when absent (separate proposal).
