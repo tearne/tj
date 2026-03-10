@@ -1,0 +1,2 @@
+- new proposal: playlists - creation, maximum compatibility with established industry standards.  Doesn't automatically que tracks, but indicates where the user is in the playlist and allows easyily loading the next track when desired.  Needs a mechanism to add and rearrange tracks.  Big proposal, will probably require breaking down.
+- new proposal: HPF and LPF filters, with Space modifier which snaps back to zero

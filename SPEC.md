@@ -40,7 +40,8 @@ tj [path]
 | `f` / `v` | BPM +0.1 / −0.1 |
 | `t` | Re-run BPM detection |
 | `?` | Toggle key binding help popup |
-| `b` | Open file browser |
+| `b` | Tap BPM detection |
+| `Space+A` | Open file browser |
 | `Esc` / `Ctrl-C` | Quit |
 
 > Key bindings reflect the defaults in `config.toml`. All player bindings are user-configurable.
@@ -72,7 +73,8 @@ tj [path]
 - The user can correct an inaccurate detection at runtime:
   - `h` halves the BPM; `H` doubles it. Takes effect immediately.
   - `f` increases the effective BPM by 0.1; `v` decreases it by 0.1. Adjustments affect playback speed proportionally (relative to the detected BPM) and clamp to the range 40.0–240.0.
-  - `r` re-runs detection cycling through modes: `auto` (default tempogram), `fusion` (tempogram + legacy in parallel), `legacy` (autocorrelation + comb filter). Non-blocking: returns immediately, shows the animated indicator while detection runs in the background.
+  - `t` re-runs detection cycling through modes: `auto` (default tempogram), `fusion` (tempogram + legacy in parallel), `legacy` (autocorrelation + comb filter). Non-blocking: returns immediately, shows the animated indicator while detection runs in the background.
+  - `b` tap-detects BPM: press in time with the beat. After 8 taps a rolling median of inter-tap intervals sets `base_bpm` and derives `offset_ms` from the tap phase. Any active `f`/`v` speed ratio is preserved relative to the new `base_bpm`. The tap count is shown in the info bar (`tap:N`) while a session is active; tapping stops 2 seconds after the last tap.
   - Corrections are persisted to the cache immediately.
 - Detected BPM and phase offset are cached in `~/.local/share/tj/cache.json`, keyed by a Blake3 hash of the decoded audio samples. This makes the cache invariant of filename, tags, and container format. The cache also stores the last browser directory.
 - Each cache entry includes the filename at time of first detection as a human-readable hint to aid manual cache management.
@@ -131,6 +133,7 @@ The render frame period adapts to the current zoom level and detail panel width,
 - The active nudge mode is shown in the info bar (`nudge:jump` / `nudge:warp`).
 - While playing in warp mode, speed and pitch shift by ±10%; the audio output reflects the change within ~100ms.
 - The nudge active state is indicated in the UI while a warp is held.
+- While paused, each nudge step plays a short audio snippet at the new position — one half-column width of audio injected directly into the mixer. In jump mode a snippet fires on each key press/repeat; in warp mode snippets fire continuously at half-column intervals as the position drifts. Snippets play independently of the paused transport and do not interrupt each other.
 
 ### Beat Jump
 - Eight dedicated beat jump actions cover four sizes (1, 4, 16, 64 beats) in each direction. Each action jumps by exactly N × beat_period seconds from the current position, preserving rhythmic continuity.

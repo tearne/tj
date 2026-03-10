@@ -252,6 +252,7 @@ fn main() {
             sample_rate,
             &mut cache,
             &mut browser_dir,
+            &mixer,
         ) {
             Ok(Some(path)) => { next_path = path; }
             Ok(None) => break,
@@ -281,6 +282,7 @@ fn tui_loop(
     sample_rate: u32,
     cache: &mut Cache,
     browser_dir: &mut std::path::PathBuf,
+    mixer: &rodio::mixer::Mixer,
 ) -> io::Result<Option<std::path::PathBuf>> {
     let (keymap, display_cfg) = load_config();
     let mut bpm: f32 = 120.0;
@@ -288,6 +290,10 @@ fn tui_loop(
     let mut offset_ms: i64 = 0;
     let mut analysis_hash: Option<String> = None;
     let mut frame_count: usize = 0;
+    let mut last_scrub_samp: f64 = -1.0; // tracks position of last warp scrub for throttling
+    let mut tap_times: Vec<f64> = Vec::new();
+    let mut last_tap_wall: Option<Instant> = None;
+    let mut tap_offset_pending: Option<i64> = None; // Some = tap-guided detection in flight
     // Smooth display position: advances via wall clock to avoid audio-buffer-burst jitter.
     let mut smooth_display_samp: f64 = 0.0;
     let mut last_render = Instant::now();
@@ -428,6 +434,9 @@ fn tui_loop(
             analysis_hash = Some(hash);
         }
 
+        // Snapshot samples_per_col for use in scrub outside the draw closure.
+        let scrub_spc = detail_braille_shared.lock().unwrap().samples_per_col;
+
         let now = Instant::now();
         let dc = detail_cols.load(Ordering::Relaxed);
         let zoom_secs = ZOOM_LEVELS[zoom_idx];
@@ -459,6 +468,15 @@ fn tui_loop(
                 .clamp(0.0, total_mono_samps);
             // Use set_position (no quiet-frame search) — no audio is playing so no click occurs.
             seek_handle.set_position(smooth_display_samp / sample_rate as f64);
+            // Scrub: fire a snippet once per half-column advance for smooth continuity.
+            let half_spc = (scrub_spc / 2).max(1);
+            if scrub_spc > 0
+                && (smooth_display_samp - last_scrub_samp).abs() >= half_spc as f64
+            {
+                scrub_audio(mixer, &seek_handle.samples, seek_handle.channels as u16,
+                            sample_rate, smooth_display_samp as usize, half_spc);
+                last_scrub_samp = smooth_display_samp;
+            }
         }
         let drift = smooth_display_samp - pos_samp as f64;
         // When paused there is no audio jitter, so snap on any non-trivial drift (e.g. after
@@ -538,6 +556,13 @@ fn tui_loop(
                     -1 => "  ◀nudge",
                     _  => "",
                 };
+                let tap_active = !tap_times.is_empty()
+                    && last_tap_wall.map_or(false, |t| t.elapsed().as_secs_f64() < 2.0);
+                let tap_str = if tap_active {
+                    format!("  tap:{}", tap_times.len())
+                } else {
+                    String::new()
+                };
                 let dim = Style::default().fg(Color::DarkGray);
                 let info_line = if analysing {
                     Line::from(vec![
@@ -568,10 +593,10 @@ fn tui_loop(
                         info_spans.push(Span::styled(format!("{}", base_bpm as u32), beat_style));
                     }
                     info_spans.push(Span::styled(
-                        format!("  {:+}ms  {}s  vol:{}%{}  nudge:{}  {}  [?]",
+                        format!("  {:+}ms  {}s  vol:{}%{}  nudge:{}{}  {}  [?]",
                             offset_ms, zoom_secs,
                             (volume * 100.0).round() as u32, nudge_str,
-                            mode_str,
+                            mode_str, tap_str,
                             SPECTRAL_PALETTES[palette_idx].0),
                         dim,
                     ));
@@ -812,11 +837,12 @@ z  /  Z        zoom out / in
 {  /  }        detail height decrease / increase
 h  /  H        BPM ½ / ×2
 f  /  v        BPM +0.1 / -0.1
+b              tap in time to set BPM + phase
 t              re-run BPM detection
 ↑  /  ↓        volume up / down (5% steps)
 p              cycle spectral colour palette
 o              toggle waveform fill / outline
-b              open file browser
+Space+A        open file browser
 ?              toggle this help
 Esc            quit";
                 let popup_w = 48u16;
@@ -915,6 +941,10 @@ Esc            quit";
                                 let target = (current - 0.010).max(0.0);
                                 seek_handle.set_position(target);
                                 smooth_display_samp += (target - current) * sample_rate as f64;
+                                if player.is_paused() {
+                                    scrub_audio(mixer, &seek_handle.samples, seek_handle.channels as u16,
+                                                sample_rate, smooth_display_samp as usize, scrub_spc);
+                                }
                             }
                             NudgeMode::Warp => {
                                 nudge = -1;
@@ -931,6 +961,10 @@ Esc            quit";
                                 let target = (current + 0.010).min(total_duration.as_secs_f64());
                                 seek_handle.set_position(target);
                                 smooth_display_samp += (target - current) * sample_rate as f64;
+                                if player.is_paused() {
+                                    scrub_audio(mixer, &seek_handle.samples, seek_handle.channels as u16,
+                                                sample_rate, smooth_display_samp as usize, scrub_spc);
+                                }
                             }
                             NudgeMode::Warp => {
                                 nudge = 1;
@@ -1108,6 +1142,28 @@ Esc            quit";
                         bpm = base_bpm;
                         player.set_speed(1.0);
                     }
+                    Some(Action::BpmTap) => {
+                        let now = Instant::now();
+                        if let Some(last) = last_tap_wall {
+                            if now.duration_since(last).as_secs_f64() > 2.0 {
+                                tap_times.clear();
+                            }
+                        }
+                        tap_times.push(smooth_display_samp / sample_rate as f64);
+                        last_tap_wall = Some(now);
+                        if tap_times.len() >= 8 {
+                            let (tapped_bpm, tapped_offset) = compute_tap_bpm_offset(&tap_times);
+                            // Preserve any f/v speed ratio across the base_bpm correction.
+                            // Without this, bpm stays at the old detected value (e.g. 117)
+                            // while base_bpm changes (e.g. to 120), making playback 97.5% speed
+                            // and causing ticks to drift ahead of the audio.
+                            let speed_ratio = bpm / base_bpm;
+                            base_bpm = tapped_bpm;
+                            bpm = (base_bpm * speed_ratio).clamp(40.0, 240.0);
+                            offset_ms = tapped_offset;
+                            player.set_speed(bpm / base_bpm);
+                        }
+                    }
                     Some(Action::NudgeBackward) | Some(Action::NudgeForward) | Some(Action::NudgeModeToggle) => {}
                     None => {}
                     }
@@ -1176,7 +1232,7 @@ enum Action {
     ZoomIn, ZoomOut,
     HeightIncrease, HeightDecrease,
     VolumeUp, VolumeDown,
-    BpmHalve, BpmDouble, BpmIncrease, BpmDecrease, BpmRedetect,
+    BpmHalve, BpmDouble, BpmIncrease, BpmDecrease, BpmRedetect, BpmTap,
     PaletteCycle, OpenBrowser, Help, WaveformStyle, TempoReset,
 }
 
@@ -1207,6 +1263,7 @@ static ACTION_NAMES: &[(&str, Action)] = &[
     ("bpm_increase",     Action::BpmIncrease),
     ("bpm_decrease",     Action::BpmDecrease),
     ("bpm_redetect",     Action::BpmRedetect),
+    ("bpm_tap",          Action::BpmTap),
     ("palette_cycle",    Action::PaletteCycle),
     ("open_browser",     Action::OpenBrowser),
     ("help",             Action::Help),
@@ -1340,6 +1397,57 @@ fn parse_keymap(text: &str, map: &mut std::collections::HashMap<KeyBinding, Acti
 
 fn home_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(std::path::PathBuf::from)
+}
+
+/// Compute BPM and phase offset from a list of tap times (track position in seconds).
+/// BPM = 60 / median inter-tap interval.
+/// Offset = mean residual anchored to the first tap, avoiding phase drift from imprecise period.
+fn compute_tap_bpm_offset(tap_times: &[f64]) -> (f32, i64) {
+    let intervals: Vec<f64> = tap_times.windows(2).map(|w| w[1] - w[0]).collect();
+    let mut sorted = intervals.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = sorted.len();
+    let beat_period = if n % 2 == 0 {
+        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+    } else {
+        sorted[n / 2]
+    };
+    if beat_period <= 0.0 { return (120.0, 0); }
+    let bpm = (60.0 / beat_period) as f32;
+    // Anchor residuals to the first tap so deltas are small.
+    // Computing t % beat_period on large absolute positions causes phase drift when
+    // beat_period is even slightly imprecise — error accumulates with distance from zero.
+    let t0 = tap_times[0];
+    let mean_residual = tap_times.iter()
+        .map(|&t| { let d = t - t0; d - (d / beat_period).round() * beat_period })
+        .sum::<f64>() / tap_times.len() as f64;
+    let offset_secs = (t0 + mean_residual).rem_euclid(beat_period);
+    let offset_ms = (offset_secs * 1000.0).round() as i64;
+    (bpm.clamp(40.0, 240.0), offset_ms)
+}
+
+/// Play a one-shot scrub snippet from the interleaved sample buffer at the given mono position.
+/// Injects directly into the mixer so it plays independently of the paused main player.
+fn scrub_audio(
+    mixer: &rodio::mixer::Mixer,
+    samples: &[f32],
+    channels: u16,
+    sample_rate: u32,
+    mono_pos: usize,
+    mono_len: usize,
+) {
+    use rodio::buffer::SamplesBuffer;
+    use std::num::NonZero;
+    let start = (mono_pos * channels as usize).min(samples.len());
+    let end = ((mono_pos + mono_len) * channels as usize).min(samples.len());
+    if start >= end { return; }
+    let snippet: Vec<f32> = samples[start..end].to_vec();
+    let src = SamplesBuffer::new(
+        NonZero::new(channels).unwrap(),
+        NonZero::new(sample_rate).unwrap(),
+        snippet,
+    );
+    mixer.add(src);
 }
 
 /// Beat-jump helper. Positive `beats` = forward, negative = backward.

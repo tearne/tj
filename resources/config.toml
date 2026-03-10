@@ -28,7 +28,8 @@ bpm_decrease     = "v"
 bpm_redetect     = "t"
 palette_cycle    = "p"
 waveform_style   = "o"
-open_browser     = "b"
+open_browser     = "space+a"
+bpm_tap          = "b"
 help             = "?"
 
 [display]
