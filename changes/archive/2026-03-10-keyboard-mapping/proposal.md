@@ -22,18 +22,17 @@ All player controls are currently hard-coded. A user-configurable keyboard mappi
 | `jump_backward_16` | `e` |
 | `jump_forward_64` | `4` |
 | `jump_backward_64` | `r` |
-| `nudge_backward` | `,` |
-| `nudge_forward` | `.` |
-| `micro_jump_backward` | `c` |
-| `micro_jump_forward` | `d` |
+| `nudge_backward` | `c` |
+| `nudge_forward` | `d` |
+| `nudge_mode_toggle` | `C` |
 | `offset_increase` | `+` |
 | `offset_decrease` | `-` |
 | `zoom_in` | `Z` |
 | `zoom_out` | `z` |
 | `height_increase` | `}` |
 | `height_decrease` | `{` |
-| `volume_up` | `j` |
-| `volume_down` | `m` |
+| `volume_up` | `up` |
+| `volume_down` | `down` |
 | `bpm_halve` | `h` |
 | `bpm_double` | `H` |
 | `bpm_increase` | `f` |
@@ -45,11 +44,11 @@ All player controls are currently hard-coded. A user-configurable keyboard mappi
 
 - **Key string format**: single printable characters are written as-is (`q`, `[`, `+`). Special keys use lowercase names: `space`, `left`, `right`, `up`, `down`, `enter`, `backspace`, `esc`. Case-sensitive characters are written as-is (`H` vs `h`).
 - **Hard-coded quit**: Ctrl-C always quits unconditionally and is not configurable via the keymap.
-- **Hold actions**: `nudge_backward` and `nudge_forward` activate on key press and deactivate on release. All other actions fire on press.
+- **Hold/release actions**: `nudge_backward` and `nudge_forward` activate on key press and deactivate on release when in `warp` nudge mode. In `jump` nudge mode they fire on press and key-repeat. The `nudge_mode_toggle` fires on press only. All other actions fire on press.
 
 ### MODIFIED
 - The hard-coded key bindings in the player event loop are replaced by a dispatch table derived from the config file.
 
 ## Scope
 - **In scope**: loading and parsing the config; building the dispatch table; replacing hard-coded bindings; creating a working dev config at `~/.config/tj/config.toml`.
-- **Out of scope**: auto-creating the config file with defaults when absent (separate proposal).
+- **Out of scope**: auto-creating the config file with defaults when absent (separate proposal). Multiple keys per function (each function maps to exactly one key).

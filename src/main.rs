@@ -258,6 +258,7 @@ fn tui_loop(
     sample_rate: u32,
     cache: &mut Cache,
 ) -> io::Result<Option<std::path::PathBuf>> {
+    let keymap = load_keymap();
     let mut bpm: f32 = 120.0;
     let mut base_bpm: f32 = 120.0; // detected BPM; speed factor = bpm / base_bpm
     let mut offset_ms: i64 = 0;
@@ -283,6 +284,7 @@ fn tui_loop(
     let detail_cols = Arc::new(AtomicUsize::new(0));
     let detail_rows = Arc::new(AtomicUsize::new(0));
     let detail_zoom_at = Arc::new(AtomicUsize::new(zoom_idx));
+    let detail_style = Arc::new(AtomicUsize::new(0)); // 0 = fill, 1 = outline
     let detail_braille_shared: Arc<Mutex<Arc<BrailleBuffer>>> =
         Arc::new(Mutex::new(Arc::new(BrailleBuffer::empty())));
     let display_pos_shared = Arc::new(AtomicUsize::new(0));
@@ -299,6 +301,7 @@ fn tui_loop(
         let cols_bg        = Arc::clone(&detail_cols);
         let rows_bg        = Arc::clone(&detail_rows);
         let zoom_bg        = Arc::clone(&detail_zoom_at);
+        let style_bg       = Arc::clone(&detail_style);
         let braille_bg     = Arc::clone(&detail_braille_shared);
         let stop_bg        = Arc::clone(&stop_detail);
         let wf_bg          = Arc::clone(&waveform);
@@ -311,6 +314,7 @@ fn tui_loop(
             let mut last_cols            = 0usize;
             let mut last_rows            = 0usize;
             let mut last_zoom            = usize::MAX;
+            let mut last_style           = usize::MAX;
             let mut last_anchor_sample   = 0usize;
             let mut last_samples_per_col = 0usize;
 
@@ -340,7 +344,8 @@ fn tui_loop(
                     usize::MAX // force initial compute
                 };
 
-                let must_recompute = cols != last_cols || rows != last_rows || zoom != last_zoom || drift_cols >= cols * 3 / 4;
+                let style = style_bg.load(Ordering::Relaxed);
+                let must_recompute = cols != last_cols || rows != last_rows || zoom != last_zoom || style != last_style || drift_cols >= cols * 3 / 4;
 
                 if must_recompute {
                     let buf_cols = cols * 5;
@@ -368,7 +373,7 @@ fn tui_loop(
                     }).collect();
 
                     *braille_bg.lock().unwrap() = Arc::new(BrailleBuffer {
-                        grid: render_braille(&peaks, rows, buf_cols),
+                        grid: render_braille(&peaks, rows, buf_cols, style == 1),
                         buf_cols,
                         anchor_sample:   anchor,
                         samples_per_col: col_samp,
@@ -376,6 +381,7 @@ fn tui_loop(
                     last_cols            = cols;
                     last_rows            = rows;
                     last_zoom            = zoom;
+                    last_style           = style;
                     last_anchor_sample   = anchor;
                     last_samples_per_col = col_samp;
                 }
@@ -513,25 +519,34 @@ fn tui_loop(
                         ),
                     ])
                 } else {
-                    let bpm_style = if beat_on {
+                    let beat_style = if beat_on {
                         Style::default()
                             .fg(Color::Yellow)
                             .bg(Color::Rgb(60, 50, 0))
                     } else {
                         dim
                     };
-                    Line::from(vec![
+                    let adjusted = (bpm - base_bpm).abs() >= 0.05;
+                    let mut info_spans = vec![
                         Span::styled(format!("{play_icon}  "), dim),
-                        Span::styled(format!("{:.1} bpm", bpm), bpm_style),
-                        Span::styled(
-                            format!("  {:+}ms  {}s  vol:{}%{}  nudge:{}  {}  [?]",
-                                offset_ms, zoom_secs,
-                                (volume * 100.0).round() as u32, nudge_str,
-                                mode_str,
-                                SPECTRAL_PALETTES[palette_idx].0),
-                            dim,
-                        ),
-                    ])
+                    ];
+                    if adjusted {
+                        info_spans.push(Span::styled(format!("{} ", base_bpm as u32), dim));
+                        info_spans.push(Span::styled("(", dim));
+                        info_spans.push(Span::styled(format!("{:.1}", bpm), beat_style));
+                        info_spans.push(Span::styled(")", dim));
+                    } else {
+                        info_spans.push(Span::styled(format!("{}", base_bpm as u32), beat_style));
+                    }
+                    info_spans.push(Span::styled(
+                        format!("  {:+}ms  {}s  vol:{}%{}  nudge:{}  {}  [?]",
+                            offset_ms, zoom_secs,
+                            (volume * 100.0).round() as u32, nudge_str,
+                            mode_str,
+                            SPECTRAL_PALETTES[palette_idx].0),
+                        dim,
+                    ));
+                    Line::from(info_spans)
                 };
                 frame.render_widget(Paragraph::new(info_line), chunks[0]);
             }
@@ -553,7 +568,7 @@ fn tui_loop(
                     (waveform.peaks[idx], waveform.bass_ratio[idx])
                 })
                 .unzip();
-            let ov_braille = render_braille(&ov_peaks, oh, ow);
+            let ov_braille = render_braille(&ov_peaks, oh, ow, false);
             let (bar_cols, bars_per_tick): (Vec<usize>, u32) = if !analysing {
                 bar_tick_cols(base_bpm as f64, offset_ms, total_duration.as_secs_f64(), ow)
             } else {
@@ -769,6 +784,7 @@ f  /  v        BPM +0.1 / -0.1
 t              re-run BPM detection
 ↑  /  ↓        volume up / down (5% steps)
 p              cycle spectral colour palette
+o              toggle waveform fill / outline
 b              open file browser
 ?              toggle this help
 Esc            quit";
@@ -839,9 +855,9 @@ Esc            quit";
                     }
                     return Ok(None);
                 }
-                // Nudge / c/d: handled for all key kinds so release is detected.
-                match (key.kind, key.code) {
-                    (KeyEventKind::Press, KeyCode::Char('C') | KeyCode::Char('D')) => {
+                // Nudge/toggle: handled for all key kinds so Release is detected.
+                match key.kind {
+                    KeyEventKind::Press if keymap.get(&key.code) == Some(&Action::NudgeModeToggle) => {
                         if nudge != 0 {
                             nudge = 0;
                             player.set_speed(bpm / base_bpm);
@@ -851,23 +867,46 @@ Esc            quit";
                             NudgeMode::Warp => NudgeMode::Jump,
                         };
                     }
-                    (KeyEventKind::Press | KeyEventKind::Repeat, KeyCode::Char('c'))
-                        if nudge_mode == NudgeMode::Warp =>
+                    KeyEventKind::Press | KeyEventKind::Repeat
+                        if keymap.get(&key.code) == Some(&Action::NudgeBackward) =>
                     {
-                        nudge = -1;
-                        player.set_speed(bpm / base_bpm * 0.9);
+                        match nudge_mode {
+                            NudgeMode::Jump => {
+                                let current = seek_handle.current_pos().as_secs_f64();
+                                let target = (current - 0.010).max(0.0);
+                                seek_handle.set_position(target);
+                                smooth_display_samp += (target - current) * sample_rate as f64;
+                            }
+                            NudgeMode::Warp => {
+                                nudge = -1;
+                                player.set_speed(bpm / base_bpm * 0.9);
+                            }
+                        }
                     }
-                    (KeyEventKind::Press | KeyEventKind::Repeat, KeyCode::Char('d'))
-                        if nudge_mode == NudgeMode::Warp =>
+                    KeyEventKind::Press | KeyEventKind::Repeat
+                        if keymap.get(&key.code) == Some(&Action::NudgeForward) =>
                     {
-                        nudge = 1;
-                        player.set_speed(bpm / base_bpm * 1.1);
+                        match nudge_mode {
+                            NudgeMode::Jump => {
+                                let current = seek_handle.current_pos().as_secs_f64();
+                                let target = (current + 0.010).min(total_duration.as_secs_f64());
+                                seek_handle.set_position(target);
+                                smooth_display_samp += (target - current) * sample_rate as f64;
+                            }
+                            NudgeMode::Warp => {
+                                nudge = 1;
+                                player.set_speed(bpm / base_bpm * 1.1);
+                            }
+                        }
                     }
-                    (KeyEventKind::Release, KeyCode::Char('c') | KeyCode::Char('d'))
-                        if nudge_mode == NudgeMode::Warp =>
+                    KeyEventKind::Release
+                        if matches!(keymap.get(&key.code),
+                            Some(&Action::NudgeBackward) | Some(&Action::NudgeForward)) =>
                     {
-                        nudge = 0;
-                        player.set_speed(bpm / base_bpm);
+                        if nudge_mode == NudgeMode::Warp {
+                            nudge = 0;
+                            player.set_speed(bpm / base_bpm);
+                        }
                     }
                     _ => {}
                 }
@@ -878,10 +917,10 @@ Esc            quit";
                     }
                     continue;
                 }
-                // All other actions fire only on Press or Repeat.
-                if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat {
-                match key.code {
-                    KeyCode::Esc => {
+                // All other actions fire on Press only.
+                if key.kind == KeyEventKind::Press {
+                    match keymap.get(&key.code) {
+                    Some(Action::Quit) => {
                         player.stop();
                         if let Some(ref hash) = analysis_hash {
                             if let Some(entry) = cache.get(hash.as_str()).cloned() {
@@ -891,7 +930,7 @@ Esc            quit";
                         }
                         return Ok(None);
                     }
-                    KeyCode::Char('b') => {
+                    Some(Action::OpenBrowser) => {
                         match run_browser(terminal, file_dir.to_path_buf())? {
                             BrowserResult::ReturnToPlayer => {}
                             BrowserResult::Selected(path) => {
@@ -916,36 +955,40 @@ Esc            quit";
                             }
                         }
                     }
-                    KeyCode::Char(' ') => {
+                    Some(Action::PlayPause) => {
                         if player.is_paused() { player.play(); } else { player.pause(); }
                     }
-                    KeyCode::Up => {
+                    Some(Action::VolumeUp) => {
                         volume = (volume + 0.05).min(1.0);
                         player.set_volume(volume);
                     }
-                    KeyCode::Down => {
+                    Some(Action::VolumeDown) => {
                         volume = (volume - 0.05).max(0.0);
                         player.set_volume(volume);
                     }
-                    KeyCode::Char('?') => { help_open = true; }
-                    KeyCode::Char('p') => {
+                    Some(Action::Help) => { help_open = true; }
+                    Some(Action::WaveformStyle) => {
+                        let s = detail_style.load(Ordering::Relaxed);
+                        detail_style.store(1 - s, Ordering::Relaxed);
+                    }
+                    Some(Action::PaletteCycle) => {
                         palette_idx = (palette_idx + 1) % SPECTRAL_PALETTES.len();
                     }
-                    KeyCode::Char('+') | KeyCode::Char('=') => offset_ms += 10,
-                    KeyCode::Char('-') | KeyCode::Char('_') => offset_ms -= 10,
-                    KeyCode::Char('z') => {
+                    Some(Action::OffsetIncrease) => offset_ms += 10,
+                    Some(Action::OffsetDecrease) => offset_ms -= 10,
+                    Some(Action::ZoomOut) => {
                         if zoom_idx > 0 { zoom_idx -= 1; }
                     }
-                    KeyCode::Char('Z') => {
+                    Some(Action::ZoomIn) => {
                         if zoom_idx + 1 < ZOOM_LEVELS.len() { zoom_idx += 1; }
                     }
-                    KeyCode::Char('{') => {
+                    Some(Action::HeightDecrease) => {
                         if detail_height > 1 { detail_height -= 1; }
                     }
-                    KeyCode::Char('}') => {
-                        detail_height += 1; // clamped below at render time by ratatui
+                    Some(Action::HeightIncrease) => {
+                        detail_height += 1;
                     }
-                    KeyCode::Char('h') => {
+                    Some(Action::BpmHalve) => {
                         bpm = (bpm * 0.5).max(40.0);
                         base_bpm = bpm;
                         player.set_speed(1.0);
@@ -956,7 +999,7 @@ Esc            quit";
                             }
                         }
                     }
-                    KeyCode::Char('H') => {
+                    Some(Action::BpmDouble) => {
                         bpm = (bpm * 2.0).min(240.0);
                         base_bpm = bpm;
                         player.set_speed(1.0);
@@ -967,15 +1010,15 @@ Esc            quit";
                             }
                         }
                     }
-                    KeyCode::Char('f') => {
+                    Some(Action::BpmIncrease) => {
                         bpm = (bpm + 0.1).min(240.0);
                         player.set_speed(bpm / base_bpm);
                     }
-                    KeyCode::Char('v') => {
+                    Some(Action::BpmDecrease) => {
                         bpm = (bpm - 0.1).max(40.0);
                         player.set_speed(bpm / base_bpm);
                     }
-                    KeyCode::Char('t') => {
+                    Some(Action::BpmRedetect) => {
                         if let Some(ref hash) = analysis_hash {
                             let hash = hash.clone();
                             detect_mode = (detect_mode + 1) % DETECT_MODES.len();
@@ -996,31 +1039,18 @@ Esc            quit";
                             analysis_hash = None;
                         }
                     }
-                    KeyCode::Char('d') if nudge_mode == NudgeMode::Jump => {
-                        let current = seek_handle.current_pos().as_secs_f64();
-                        let target = (current + 0.010).min(total_duration.as_secs_f64());
-                        let delta = target - current;
-                        seek_handle.set_position(target);
-                        smooth_display_samp += delta * sample_rate as f64;
+                    Some(Action::JumpForward1)  => do_jump(&seek_handle, &player, bpm, total_duration,  1),
+                    Some(Action::JumpBackward1) => do_jump(&seek_handle, &player, bpm, total_duration, -1),
+                    Some(Action::JumpForward4)  => do_jump(&seek_handle, &player, bpm, total_duration,  4),
+                    Some(Action::JumpBackward4) => do_jump(&seek_handle, &player, bpm, total_duration, -4),
+                    Some(Action::JumpForward16) => do_jump(&seek_handle, &player, bpm, total_duration,  16),
+                    Some(Action::JumpBackward16)=> do_jump(&seek_handle, &player, bpm, total_duration, -16),
+                    Some(Action::JumpForward64) => do_jump(&seek_handle, &player, bpm, total_duration,  64),
+                    Some(Action::JumpBackward64)=> do_jump(&seek_handle, &player, bpm, total_duration, -64),
+                    Some(Action::NudgeBackward) | Some(Action::NudgeForward) | Some(Action::NudgeModeToggle) => {}
+                    None => {}
                     }
-                    KeyCode::Char('c') if nudge_mode == NudgeMode::Jump => {
-                        let current = seek_handle.current_pos().as_secs_f64();
-                        let target = (current - 0.010).max(0.0);
-                        let delta = target - current;
-                        seek_handle.set_position(target);
-                        smooth_display_samp += delta * sample_rate as f64;
-                    }
-                    KeyCode::Char('1') => do_jump(&seek_handle, &player, bpm, total_duration,  1),
-                    KeyCode::Char('q') => do_jump(&seek_handle, &player, bpm, total_duration, -1),
-                    KeyCode::Char('2') => do_jump(&seek_handle, &player, bpm, total_duration,  4),
-                    KeyCode::Char('w') => do_jump(&seek_handle, &player, bpm, total_duration, -4),
-                    KeyCode::Char('3') => do_jump(&seek_handle, &player, bpm, total_duration,  16),
-                    KeyCode::Char('e') => do_jump(&seek_handle, &player, bpm, total_duration, -16),
-                    KeyCode::Char('4') => do_jump(&seek_handle, &player, bpm, total_duration,  64),
-                    KeyCode::Char('r') => do_jump(&seek_handle, &player, bpm, total_duration, -64),
-                    _ => {}
-                }
-                } // end if Press | Repeat
+                } // end if Press
             }
             _ => {}
             }
@@ -1071,6 +1101,150 @@ impl BrailleBuffer {
 #[derive(Clone, Copy, PartialEq)]
 enum NudgeMode { Jump, Warp }
 
+// ---------------------------------------------------------------------------
+// Keyboard mapping
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq)]
+enum Action {
+    PlayPause, Quit,
+    JumpForward1, JumpForward4, JumpForward16, JumpForward64,
+    JumpBackward1, JumpBackward4, JumpBackward16, JumpBackward64,
+    NudgeBackward, NudgeForward, NudgeModeToggle,
+    OffsetIncrease, OffsetDecrease,
+    ZoomIn, ZoomOut,
+    HeightIncrease, HeightDecrease,
+    VolumeUp, VolumeDown,
+    BpmHalve, BpmDouble, BpmIncrease, BpmDecrease, BpmRedetect,
+    PaletteCycle, OpenBrowser, Help, WaveformStyle,
+}
+
+static ACTION_NAMES: &[(&str, Action)] = &[
+    ("play_pause",       Action::PlayPause),
+    ("quit",             Action::Quit),
+    ("jump_forward_1",   Action::JumpForward1),
+    ("jump_forward_4",   Action::JumpForward4),
+    ("jump_forward_16",  Action::JumpForward16),
+    ("jump_forward_64",  Action::JumpForward64),
+    ("jump_backward_1",  Action::JumpBackward1),
+    ("jump_backward_4",  Action::JumpBackward4),
+    ("jump_backward_16", Action::JumpBackward16),
+    ("jump_backward_64", Action::JumpBackward64),
+    ("nudge_backward",   Action::NudgeBackward),
+    ("nudge_forward",    Action::NudgeForward),
+    ("nudge_mode_toggle",Action::NudgeModeToggle),
+    ("offset_increase",  Action::OffsetIncrease),
+    ("offset_decrease",  Action::OffsetDecrease),
+    ("zoom_in",          Action::ZoomIn),
+    ("zoom_out",         Action::ZoomOut),
+    ("height_increase",  Action::HeightIncrease),
+    ("height_decrease",  Action::HeightDecrease),
+    ("volume_up",        Action::VolumeUp),
+    ("volume_down",      Action::VolumeDown),
+    ("bpm_halve",        Action::BpmHalve),
+    ("bpm_double",       Action::BpmDouble),
+    ("bpm_increase",     Action::BpmIncrease),
+    ("bpm_decrease",     Action::BpmDecrease),
+    ("bpm_redetect",     Action::BpmRedetect),
+    ("palette_cycle",    Action::PaletteCycle),
+    ("open_browser",     Action::OpenBrowser),
+    ("help",             Action::Help),
+    ("waveform_style",   Action::WaveformStyle),
+];
+
+fn parse_key(s: &str) -> Option<KeyCode> {
+    match s {
+        "space"     => Some(KeyCode::Char(' ')),
+        "left"      => Some(KeyCode::Left),
+        "right"     => Some(KeyCode::Right),
+        "up"        => Some(KeyCode::Up),
+        "down"      => Some(KeyCode::Down),
+        "enter"     => Some(KeyCode::Enter),
+        "backspace" => Some(KeyCode::Backspace),
+        "esc"       => Some(KeyCode::Esc),
+        s if s.chars().count() == 1 => Some(KeyCode::Char(s.chars().next().unwrap())),
+        other => {
+            eprintln!("tj: unknown key {:?} in config — binding skipped", other);
+            None
+        }
+    }
+}
+
+const DEFAULT_CONFIG: &str = include_str!("../resources/config.toml");
+
+fn load_keymap() -> std::collections::HashMap<KeyCode, Action> {
+    let mut map = std::collections::HashMap::new();
+    // Check next to the binary first, then ~/.config/tj/config.toml, then auto-create.
+    let adjacent = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("config.toml")))
+        .filter(|p| p.exists());
+    let text = if let Some(path) = adjacent {
+        match std::fs::read_to_string(&path) {
+            Ok(t) => t,
+            Err(_) => return map,
+        }
+    } else {
+        let user_path = match home_dir() {
+            Some(h) => h.join(".config/tj/config.toml"),
+            None => return parse_keymap(DEFAULT_CONFIG, &mut map),
+        };
+        if user_path.exists() {
+            match std::fs::read_to_string(&user_path) {
+                Ok(t) => t,
+                Err(_) => return map,
+            }
+        } else {
+            // Auto-create from embedded default.
+            if let Some(dir) = user_path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if std::fs::write(&user_path, DEFAULT_CONFIG).is_ok() {
+                eprintln!("tj: created default config at {}", user_path.display());
+            }
+            DEFAULT_CONFIG.to_string()
+        }
+    };
+    parse_keymap(&text, &mut map)
+}
+
+fn parse_keymap(text: &str, map: &mut std::collections::HashMap<KeyCode, Action>)
+    -> std::collections::HashMap<KeyCode, Action>
+{
+    let parsed: toml::Value = match toml::from_str(text) {
+        Ok(v) => v,
+        Err(e) => { eprintln!("tj: failed to parse config: {e}"); return std::mem::take(map); }
+    };
+    let keys = match parsed.get("keys").and_then(|v| v.as_table()) {
+        Some(t) => t,
+        None => return std::mem::take(map),
+    };
+    for (name, val) in keys {
+        let action = match ACTION_NAMES.iter().find(|(n, _)| *n == name.as_str()) {
+            Some((_, a)) => *a,
+            None => { eprintln!("tj: unknown function {name:?} in config — skipped"); continue; }
+        };
+        let key_strs: Vec<&str> = if let Some(s) = val.as_str() {
+            vec![s]
+        } else if let Some(arr) = val.as_array() {
+            arr.iter().filter_map(|v| v.as_str()).collect()
+        } else {
+            eprintln!("tj: key value for {name:?} must be a string or array of strings");
+            continue;
+        };
+        for key_str in key_strs {
+            if let Some(keycode) = parse_key(key_str) {
+                map.insert(keycode, action);
+            }
+        }
+    }
+    std::mem::take(map)
+}
+
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(std::path::PathBuf::from)
+}
+
 /// Beat-jump helper. Positive `beats` = forward, negative = backward.
 fn do_jump(seek_handle: &SeekHandle, player: &rodio::Player, bpm: f32, total_duration: std::time::Duration, beats: i32) {
     let jump = beats.unsigned_abs() as f64 * 60.0 / bpm as f64;
@@ -1093,7 +1267,7 @@ fn shift_braille_half(a: u8, b: u8) -> u8 {
     left | right
 }
 
-fn render_braille(peaks: &[(f32, f32)], rows: usize, cols: usize) -> Vec<Vec<u8>> {
+fn render_braille(peaks: &[(f32, f32)], rows: usize, cols: usize, outline: bool) -> Vec<Vec<u8>> {
     // Bit mask for left+right dots at each of the 4 dot-rows within a Braille cell.
     // Layout: dot1(bit0)/dot4(bit3), dot2(bit1)/dot5(bit4), dot3(bit2)/dot6(bit5), dot7(bit6)/dot8(bit7)
     const DOT_BITS: [u8; 4] = [0x09, 0x12, 0x24, 0xC0];
@@ -1104,22 +1278,43 @@ fn render_braille(peaks: &[(f32, f32)], rows: usize, cols: usize) -> Vec<Vec<u8>
     }
     let total_dots = rows * 4;
 
+    let mut set_dot = |c: usize, d: usize| {
+        let br = d / 4;
+        let dr = d % 4;
+        if br < rows {
+            grid[br][c] |= DOT_BITS[dr];
+        }
+    };
+
+    let mut prev_top: Option<usize> = None;
+    let mut prev_bot: Option<usize> = None;
+
     for (c, &(min_val, max_val)) in peaks.iter().take(cols).enumerate() {
         let clamped_max = max_val.min(1.0);
         let clamped_min = min_val.max(-1.0);
         if clamped_min > clamped_max {
+            prev_top = None;
+            prev_bot = None;
             continue;
         }
         // Map y ∈ [-1, 1] → dot row ∈ [0, total_dots); y=1 is top (row 0).
         let top_dot = ((1.0 - clamped_max) / 2.0 * total_dots as f32) as usize;
         let bot_dot = (((1.0 - clamped_min) / 2.0 * total_dots as f32) as usize)
             .min(total_dots - 1);
-        for d in top_dot..=bot_dot {
-            let br = d / 4;
-            let dr = d % 4;
-            if br < rows {
-                grid[br][c] |= DOT_BITS[dr];
+        if outline {
+            // Bridge vertical gap to previous column so the outline is continuous.
+            let top_from = prev_top.map(|p| p.min(top_dot)).unwrap_or(top_dot);
+            let top_to   = prev_top.map(|p| p.max(top_dot)).unwrap_or(top_dot);
+            for d in top_from..=top_to { set_dot(c, d); }
+            if bot_dot != top_dot {
+                let bot_from = prev_bot.map(|p| p.min(bot_dot)).unwrap_or(bot_dot);
+                let bot_to   = prev_bot.map(|p| p.max(bot_dot)).unwrap_or(bot_dot);
+                for d in bot_from..=bot_to { set_dot(c, d); }
             }
+            prev_top = Some(top_dot);
+            prev_bot = Some(bot_dot);
+        } else {
+            for d in top_dot..=bot_dot { set_dot(c, d); }
         }
     }
     grid

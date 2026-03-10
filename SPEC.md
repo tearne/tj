@@ -42,7 +42,7 @@ tj [path]
 | `b` | Open file browser |
 | `Esc` / `Ctrl-C` | Quit |
 
-> Key bindings are indicative; exact bindings are an implementation concern.
+> Key bindings reflect the defaults in `config.toml`. All player bindings are user-configurable.
 
 ## Behaviour
 
@@ -77,8 +77,8 @@ tj [path]
 - On quit, the current phase offset is persisted to the cache.
 
 ### Info Bar
-- A single line at the top of the player view displays: play/pause icon (`▶`/`⏸`), BPM value (one decimal place), phase offset, zoom level, and a `[?]` help hint. The bar wraps naturally if the terminal is too narrow.
-- The BPM value receives a soft amber highlight for the duration of each beat flash window, providing a subtle per-beat pulse without a separate indicator panel.
+- A single line at the top of the player view displays: play/pause icon (`▶`/`⏸`), BPM, phase offset, zoom level, and a `[?]` help hint. The bar wraps naturally if the terminal is too narrow.
+- When no tempo adjustment is active, the detected BPM is shown as an integer (e.g. `120`) and receives a soft amber beat-flash. When a `f`/`v` adjustment is active, the detected BPM is shown plain and the adjusted tempo is shown alongside in parentheses (e.g. `120 (124.4)`), with only the adjusted number receiving the beat-flash.
 - Pressing `?` opens a modal key binding reference overlay; any key dismisses it.
 - During BPM analysis the BPM field shows an animated spinner.
 
@@ -189,6 +189,12 @@ The sample position used as the rendering playhead. It advances by wall-clock el
 
 **Quantised viewport centre**
 The smooth display position rounded to the nearest half-column boundary. Both the waveform viewport and beat tick marks must be derived from this value — not from the raw smooth display position, which can differ by up to half a column, causing visible oscillation at wide zoom.
+
+### Keyboard Mapping
+- Key bindings are loaded from `config.toml` at startup — first from the same directory as the binary, then from `~/.config/tj/config.toml`. If neither file is found, the embedded default config is written to `~/.config/tj/config.toml` and loaded automatically.
+- Bindings are declared under a `[keys]` table as `function_name = "key_string"` or `function_name = ["key1", "key2"]` for multiple keys per function.
+- Key strings: printable characters as-is (`q`, `+`, `H`); special keys as lowercase names (`space`, `esc`, `up`, `down`, `left`, `right`, `enter`, `backspace`).
+- Ctrl-C always quits unconditionally and is not configurable.
 
 ## Constraints
 - Implementation language: Rust.
