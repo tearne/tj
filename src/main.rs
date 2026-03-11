@@ -319,6 +319,10 @@ fn tui_loop(
     let mut last_calib_pulse: Option<Instant> = None;
     const CALIB_PERIOD_SECS: f64 = 1.0; // 60 BPM = 1 s period
 
+    // Spectrum analyser state.
+    let mut spectrum_chars: [char; 8] = ['\u{2800}'; 8];
+    let mut last_spectrum_update: Option<Instant> = None;
+
     // Shared state for the background detail-braille thread.
     let detail_cols = Arc::new(AtomicUsize::new(0));
     let detail_rows = Arc::new(AtomicUsize::new(0));
@@ -595,6 +599,20 @@ fn tui_loop(
         }
         was_tap_active = tap_active_now;
 
+        // Spectrum analyser: recompute every half beat period (500ms fallback during analysis).
+        if !calibration_mode {
+            let half_period = if analysing {
+                Duration::from_millis(500)
+            } else {
+                beat_period / 2
+            };
+            let due = last_spectrum_update.map_or(true, |t| t.elapsed() >= half_period);
+            if due {
+                spectrum_chars = compute_spectrum(mono, display_pos_samp, sample_rate);
+                last_spectrum_update = Some(Instant::now());
+            }
+        }
+
         let fmt_dur = |d: Duration| {
             let s = d.as_secs();
             format!("{:02}:{:02}", s / 60, s % 60)
@@ -689,6 +707,15 @@ fn tui_loop(
                             SPECTRAL_PALETTES[palette_idx].0, lat_str),
                         dim,
                     ));
+                    if !calibration_mode {
+                        let spec_str: String = spectrum_chars.iter().collect();
+                        info_spans.push(Span::styled("  \u{2595}".to_string(), dim)); // ▕ left bound
+                        info_spans.push(Span::styled(
+                            spec_str,
+                            Style::default().fg(Color::Green),
+                        ));
+                        info_spans.push(Span::styled("\u{258F}".to_string(), dim)); // ▏ right bound
+                    }
                     Line::from(info_spans)
                 };
                 frame.render_widget(Paragraph::new(info_line), chunks[0]);
@@ -1394,7 +1421,7 @@ Esc            quit";
                                 tap_offset_pending = None;
                             }
                         }
-                        tap_times.push(smooth_display_samp / sample_rate as f64);
+                        tap_times.push(display_samp / sample_rate as f64);
                         last_tap_wall = Some(now);
                         if tap_times.len() >= 8 {
                             let (tapped_bpm, tapped_offset) = compute_tap_bpm_offset(&tap_times);
@@ -1732,6 +1759,52 @@ fn play_click_tone(mixer: &rodio::mixer::Mixer, sample_rate: u32) {
         samples,
     );
     mixer.add(src);
+}
+
+/// Compute 8 braille spectrum characters from mono samples at `pos`.
+/// Uses the Goertzel algorithm on 16 log-spaced bins, 20 Hz – 20 kHz.
+fn compute_spectrum(mono: &[f32], pos: usize, sample_rate: u32) -> [char; 8] {
+    const N: usize = 4096;
+    const LEFT_MASKS:  [u8; 5] = [0x00, 0x40, 0x44, 0x46, 0x47];
+    const RIGHT_MASKS: [u8; 5] = [0x00, 0x80, 0xA0, 0xB0, 0xB8];
+
+    // 16 log-spaced centre frequencies: 20 Hz … 20 kHz.
+    let freqs: [f64; 16] = std::array::from_fn(|i| {
+        20.0 * (1000.0_f64).powf(i as f64 / 15.0)
+    });
+
+    // Hann window coefficients.
+    let hann: Vec<f32> = (0..N)
+        .map(|n| 0.5 * (1.0 - (2.0 * std::f64::consts::PI * n as f64 / (N - 1) as f64).cos()) as f32)
+        .collect();
+
+    let sr = sample_rate as f64;
+    let mut heights = [0usize; 16];
+
+    for (k, &f) in freqs.iter().enumerate() {
+        let coeff = 2.0 * (2.0 * std::f64::consts::PI * f / sr).cos();
+        let (mut s1, mut s2) = (0.0f64, 0.0f64);
+        for i in 0..N {
+            let sample = mono.get(pos + i).copied().unwrap_or(0.0) as f64 * hann[i] as f64;
+            let s = sample + coeff * s1 - s2;
+            s2 = s1;
+            s1 = s;
+        }
+        let power = s1 * s1 + s2 * s2 - coeff * s1 * s2;
+        let magnitude = power.max(0.0).sqrt();
+        let db = if magnitude > 0.0 { 20.0 * magnitude.log10() } else { 0.0 };
+        // +3 dB/octave tilt to compensate for the ~1/f (pink noise) rolloff of typical music,
+        // making treble bins as visible as bass bins with equal perceptual loudness.
+        // 20 Hz → 0 dB boost; 20 kHz → +30 dB boost (~10 octaves × 3 dB).
+        let tilt_db = (f / 20.0).log2() * 3.0;
+        heights[k] = ((db + tilt_db - 10.0) / 12.5).round().clamp(0.0, 4.0) as usize;
+    }
+
+    std::array::from_fn(|c| {
+        let l = heights[c * 2];
+        let r = heights[c * 2 + 1];
+        char::from_u32(0x2800 | LEFT_MASKS[l] as u32 | RIGHT_MASKS[r] as u32).unwrap_or(' ')
+    })
 }
 
 /// Beat-jump helper. Positive `beats` = forward, negative = backward.
