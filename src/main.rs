@@ -1,7 +1,7 @@
 use std::io;
 use std::num::NonZero;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -218,9 +218,13 @@ fn main() {
             channels,
         };
 
+        let filter_offset_shared = Arc::new(AtomicI32::new(0));
         let player = Player::connect_new(&mixer);
-        player.append(TrackingSource::new(
-            samples, position, fade_remaining, fade_len, pending_target, sample_rate, channels,
+        player.append(FilterSource::new(
+            TrackingSource::new(
+                samples, position, fade_remaining, fade_len, pending_target, sample_rate, channels,
+            ),
+            Arc::clone(&filter_offset_shared),
         ));
 
         let (bpm_tx, bpm_rx) = mpsc::channel::<(String, f32, i64)>();
@@ -253,6 +257,7 @@ fn main() {
             &mut cache,
             &mut browser_dir,
             &mixer,
+            &filter_offset_shared,
         ) {
             Ok(Some(path)) => { next_path = path; }
             Ok(None) => break,
@@ -283,6 +288,7 @@ fn tui_loop(
     cache: &mut Cache,
     browser_dir: &mut std::path::PathBuf,
     mixer: &rodio::mixer::Mixer,
+    filter_offset_shared: &Arc<AtomicI32>,
 ) -> io::Result<Option<std::path::PathBuf>> {
     let (keymap, display_cfg) = load_config();
     let mut bpm: f32 = 120.0;
@@ -318,6 +324,9 @@ fn tui_loop(
     // Wall-clock time of the last calibration pulse fired (used for travelling marker and next-pulse scheduling).
     let mut last_calib_pulse: Option<Instant> = None;
     const CALIB_PERIOD_SECS: f64 = 1.0; // 60 BPM = 1 s period
+
+    // Filter state.
+    let mut filter_offset: i32 = 0;
 
     // Spectrum analyser state.
     let mut spectrum_chars: [char; 8] = ['\u{2800}'; 8];
@@ -608,7 +617,7 @@ fn tui_loop(
             };
             let due = last_spectrum_update.map_or(true, |t| t.elapsed() >= half_period);
             if due {
-                spectrum_chars = compute_spectrum(mono, display_pos_samp, sample_rate);
+                spectrum_chars = compute_spectrum(mono, display_pos_samp, sample_rate, filter_offset);
                 last_spectrum_update = Some(Instant::now());
             }
         }
@@ -708,6 +717,14 @@ fn tui_loop(
                         dim,
                     ));
                     if !calibration_mode {
+                        if filter_offset != 0 {
+                            let filter_str = if filter_offset < 0 {
+                                format!("  lpf:{}", -filter_offset)
+                            } else {
+                                format!("  hpf:{}", filter_offset)
+                            };
+                            info_spans.push(Span::styled(filter_str, Style::default().fg(Color::Cyan)));
+                        }
                         let spec_str: String = spectrum_chars.iter().collect();
                         info_spans.push(Span::styled("  \u{2595}".to_string(), dim)); // ▕ left bound
                         info_spans.push(Span::styled(
@@ -1289,6 +1306,18 @@ Esc            quit";
                             calibration_mode = true;
                         }
                     }
+                    Some(Action::FilterIncrease) => {
+                        filter_offset = (filter_offset + 1).min(10);
+                        filter_offset_shared.store(filter_offset, Ordering::Relaxed);
+                    }
+                    Some(Action::FilterDecrease) => {
+                        filter_offset = (filter_offset - 1).max(-10);
+                        filter_offset_shared.store(filter_offset, Ordering::Relaxed);
+                    }
+                    Some(Action::FilterReset) => {
+                        filter_offset = 0;
+                        filter_offset_shared.store(0, Ordering::Relaxed);
+                    }
                     Some(Action::WaveformStyle) => {
                         let s = detail_style.load(Ordering::Relaxed);
                         detail_style.store(1 - s, Ordering::Relaxed);
@@ -1511,6 +1540,7 @@ enum Action {
     BpmRedetect, BpmTap,
     PaletteCycle, OpenBrowser, Help, WaveformStyle, TempoReset,
     CalibrationToggle,
+    FilterIncrease, FilterDecrease, FilterReset,
 }
 
 static ACTION_NAMES: &[(&str, Action)] = &[
@@ -1549,6 +1579,9 @@ static ACTION_NAMES: &[(&str, Action)] = &[
     ("waveform_style",       Action::WaveformStyle),
     ("tempo_reset",          Action::TempoReset),
     ("calibration_toggle",   Action::CalibrationToggle),
+    ("filter_increase",      Action::FilterIncrease),
+    ("filter_decrease",      Action::FilterDecrease),
+    ("filter_reset",         Action::FilterReset),
 ];
 
 #[derive(Hash, Eq, PartialEq)]
@@ -1763,7 +1796,7 @@ fn play_click_tone(mixer: &rodio::mixer::Mixer, sample_rate: u32) {
 
 /// Compute 8 braille spectrum characters from mono samples at `pos`.
 /// Uses the Goertzel algorithm on 16 log-spaced bins, 20 Hz – 20 kHz.
-fn compute_spectrum(mono: &[f32], pos: usize, sample_rate: u32) -> [char; 8] {
+fn compute_spectrum(mono: &[f32], pos: usize, sample_rate: u32, filter_offset: i32) -> [char; 8] {
     const N: usize = 4096;
     const LEFT_MASKS:  [u8; 5] = [0x00, 0x40, 0x44, 0x46, 0x47];
     const RIGHT_MASKS: [u8; 5] = [0x00, 0x80, 0xA0, 0xB0, 0xB8];
@@ -1778,6 +1811,23 @@ fn compute_spectrum(mono: &[f32], pos: usize, sample_rate: u32) -> [char; 8] {
         .map(|n| 0.5 * (1.0 - (2.0 * std::f64::consts::PI * n as f64 / (N - 1) as f64).cos()) as f32)
         .collect();
 
+    // Pre-filter the window if a filter is active.
+    let filtered: Vec<f32> = if filter_offset != 0 {
+        let idx = (filter_offset.unsigned_abs() as usize - 1).min(9);
+        let is_lpf = filter_offset < 0;
+        let fc = if is_lpf { FILTER_CUTOFFS_HZ[idx] } else { FILTER_CUTOFFS_HZ[9 - idx] };
+        let (b0, b1, b2, a1, a2) = butterworth_biquad(fc, sample_rate, is_lpf);
+        let (mut x1, mut x2, mut y1, mut y2) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        (0..N).map(|i| {
+            let x = mono.get(pos + i).copied().unwrap_or(0.0);
+            let y = b0 * x + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+            x2 = x1; x1 = x; y2 = y1; y1 = y;
+            y
+        }).collect()
+    } else {
+        Vec::new()
+    };
+
     let sr = sample_rate as f64;
     let mut heights = [0usize; 16];
 
@@ -1785,7 +1835,12 @@ fn compute_spectrum(mono: &[f32], pos: usize, sample_rate: u32) -> [char; 8] {
         let coeff = 2.0 * (2.0 * std::f64::consts::PI * f / sr).cos();
         let (mut s1, mut s2) = (0.0f64, 0.0f64);
         for i in 0..N {
-            let sample = mono.get(pos + i).copied().unwrap_or(0.0) as f64 * hann[i] as f64;
+            let raw = if filter_offset != 0 {
+                filtered[i]
+            } else {
+                mono.get(pos + i).copied().unwrap_or(0.0)
+            };
+            let sample = raw as f64 * hann[i] as f64;
             let s = sample + coeff * s1 - s2;
             s2 = s1;
             s1 = s;
@@ -2035,6 +2090,121 @@ impl Source for TrackingSource {
     fn sample_rate(&self) -> NonZero<u32> {
         NonZero::new(self.sample_rate).unwrap_or(NonZero::new(44100).unwrap())
     }
+    fn total_duration(&self) -> Option<Duration> { None }
+}
+
+// ---------------------------------------------------------------------------
+// Filter source — second-order Butterworth IIR biquad (LPF or HPF)
+// ---------------------------------------------------------------------------
+
+/// Log-spaced cutoff frequencies for filter offsets ±1..±10.
+/// Index 0 = offset ±1 (near-flat), index 9 = offset ±10 (fully cut).
+const FILTER_CUTOFFS_HZ: [f64; 10] = [
+    18_000.0, 12_000.0, 8_000.0, 5_000.0, 3_000.0,
+     1_500.0,    700.0,   300.0,   100.0,    40.0,
+];
+
+/// Compute normalised Butterworth biquad coefficients for a LPF or HPF.
+/// Returns `(b0, b1, b2, a1, a2)` with a0 normalised to 1.
+fn butterworth_biquad(fc: f64, sample_rate: u32, is_lpf: bool) -> (f32, f32, f32, f32, f32) {
+    use std::f64::consts::PI;
+    let w0 = 2.0 * PI * fc / sample_rate as f64;
+    let cos_w0 = w0.cos();
+    let sin_w0 = w0.sin();
+    let alpha = sin_w0 / std::f64::consts::SQRT_2; // Q = 1/sqrt(2) → Butterworth
+    let a0 = 1.0 + alpha;
+    let (b0, b1, b2) = if is_lpf {
+        ((1.0 - cos_w0) / 2.0, 1.0 - cos_w0, (1.0 - cos_w0) / 2.0)
+    } else {
+        ((1.0 + cos_w0) / 2.0, -(1.0 + cos_w0), (1.0 + cos_w0) / 2.0)
+    };
+    (
+        (b0 / a0) as f32,
+        (b1 / a0) as f32,
+        (b2 / a0) as f32,
+        (-2.0 * cos_w0 / a0) as f32,
+        ((1.0 - alpha) / a0) as f32,
+    )
+}
+
+struct FilterSource<S: Source<Item = f32>> {
+    inner: S,
+    filter_offset: Arc<AtomicI32>,
+    last_offset: i32,
+    channels: u16,
+    sample_rate: u32,
+    // Per-channel biquad history
+    x1: Vec<f32>, x2: Vec<f32>,
+    y1: Vec<f32>, y2: Vec<f32>,
+    // Normalised coefficients (a0 = 1)
+    b0: f32, b1: f32, b2: f32, a1: f32, a2: f32,
+    // Which channel slot we are about to emit
+    ch_idx: usize,
+}
+
+impl<S: Source<Item = f32>> FilterSource<S> {
+    fn new(inner: S, filter_offset: Arc<AtomicI32>) -> Self {
+        let channels = inner.channels().get() as u16;
+        let sample_rate = inner.sample_rate().get();
+        let n = channels as usize;
+        FilterSource {
+            inner,
+            filter_offset,
+            last_offset: 0,
+            channels,
+            sample_rate,
+            x1: vec![0.0; n], x2: vec![0.0; n],
+            y1: vec![0.0; n], y2: vec![0.0; n],
+            b0: 1.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0,
+            ch_idx: 0,
+        }
+    }
+
+    fn recompute_coefficients(&mut self, offset: i32) {
+        if offset == 0 { return; }
+        let idx = (offset.unsigned_abs() as usize - 1).min(9);
+        let is_lpf = offset < 0;
+        let fc = if is_lpf {
+            FILTER_CUTOFFS_HZ[idx]
+        } else {
+            FILTER_CUTOFFS_HZ[9 - idx]
+        };
+        let (b0, b1, b2, a1, a2) = butterworth_biquad(fc, self.sample_rate, is_lpf);
+        self.b0 = b0; self.b1 = b1; self.b2 = b2;
+        self.a1 = a1; self.a2 = a2;
+        // Reset state to avoid transient
+        let n = self.channels as usize;
+        self.x1 = vec![0.0; n]; self.x2 = vec![0.0; n];
+        self.y1 = vec![0.0; n]; self.y2 = vec![0.0; n];
+    }
+}
+
+impl<S: Source<Item = f32>> Iterator for FilterSource<S> {
+    type Item = f32;
+    fn next(&mut self) -> Option<f32> {
+        let x = self.inner.next()?;
+        let offset = self.filter_offset.load(Ordering::Relaxed);
+        if offset != self.last_offset {
+            self.last_offset = offset;
+            self.recompute_coefficients(offset);
+        }
+        let ch = self.ch_idx;
+        self.ch_idx = (ch + 1) % self.channels as usize;
+        if offset == 0 {
+            return Some(x);
+        }
+        let y = self.b0 * x + self.b1 * self.x1[ch] + self.b2 * self.x2[ch]
+              - self.a1 * self.y1[ch] - self.a2 * self.y2[ch];
+        self.x2[ch] = self.x1[ch]; self.x1[ch] = x;
+        self.y2[ch] = self.y1[ch]; self.y1[ch] = y;
+        Some(y)
+    }
+}
+
+impl<S: Source<Item = f32>> Source for FilterSource<S> {
+    fn current_span_len(&self) -> Option<usize> { self.inner.current_span_len() }
+    fn channels(&self) -> NonZero<u16> { NonZero::new(self.channels).unwrap_or(NonZero::new(2).unwrap()) }
+    fn sample_rate(&self) -> NonZero<u32> { NonZero::new(self.sample_rate).unwrap_or(NonZero::new(44100).unwrap()) }
     fn total_duration(&self) -> Option<Duration> { None }
 }
 

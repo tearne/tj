@@ -29,6 +29,8 @@ tj [path]
 | `Space+F` / `Space+V` | Reset tempo to detected BPM (speed → 1×) |
 | `+` / `-` | Adjust beat phase offset (10ms steps); adjusts `audio_latency_ms` in calibration mode |
 | `~` | Toggle latency calibration mode (only while paused) |
+| `[` / `]` | Filter sweep: `[` toward LPF (lower cutoff), `]` toward HPF (higher cutoff) |
+| `Space+[` / `Space+]` | Snap filter to flat (bypass) |
 | `Left` / `Right` | Seek backward / forward (small increment, e.g. 5s) |
 | `1` / `2` / `3` / `4` | Beat jump forward 1 / 4 / 16 / 64 beats |
 | `q` / `w` / `e` / `r` | Beat jump backward 1 / 4 / 16 / 64 beats |
@@ -127,6 +129,18 @@ The render frame period adapts to the current zoom level and detail panel width,
 
 ### Needle Drop
 - A left mouse click anywhere on the Overview waveform seeks the transport to the start of the nearest bar marker at or to the left of the click position. Playback state is preserved — if playing, playback continues from the new position; if paused, the transport remains paused. The Detail view recentres on the new position immediately.
+
+### HPF / LPF Filter
+- A single `filter_offset` parameter (range −10 to +10, default 0) controls a real-time second-order Butterworth IIR filter on the playback output:
+  - `0` — flat (filter bypassed).
+  - `−1` to `−10` — low-pass filter; more negative = lower cutoff frequency.
+  - `+1` to `+10` — high-pass filter; more positive = higher cutoff frequency.
+- `[` decreases `filter_offset` by 1 (clamped at −10); `]` increases it by 1 (clamped at +10).
+- `Space+[` or `Space+]` snaps `filter_offset` to 0 (flat) immediately.
+- Cutoff frequencies are logarithmically spaced from ~40 Hz to ~18 kHz across the ±1–±10 range.
+- The info bar shows `lpf:N` or `hpf:N` (in cyan) when the filter is active.
+- The spectrum analyser reflects the filtered output.
+- Filter state is not persisted between sessions; it always initialises to flat.
 
 ### Spectrum Analyser
 - A compact spectrum analyser strip is displayed in the info bar, always active while a track is loaded. It is hidden during calibration mode.
@@ -243,7 +257,7 @@ The smooth display position rounded to the nearest half-column boundary. Both th
 
 ## Out of Scope (deferred)
 - Cover art display.
-- Volume control, shuffle, repeat.
+- Shuffle, repeat.
 - Multiple file / queue management.
 
 ## Verification

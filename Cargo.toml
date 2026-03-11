@@ -1,6 +1,6 @@
 [package]
 name = "tj"
-version = "0.4.102"
+version = "0.4.104"
 edition = "2024"
 
 [dependencies]

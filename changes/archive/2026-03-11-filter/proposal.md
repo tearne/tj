@@ -12,7 +12,7 @@ Provide a real-time high-pass / low-pass filter on the playback output, useful f
   - `−1` to `−10` — low-pass filter; more negative = lower cutoff frequency.
   - `+1` to `+10` — high-pass filter; more positive = higher cutoff frequency.
 - `[` decreases `filter_offset` by 1 (toward LPF); `]` increases it by 1 (toward HPF). Both clamp at ±10.
-- `Space+\` snaps `filter_offset` to 0 (flat) immediately.
+- `Space+[` or `Space+]` snaps `filter_offset` to 0 (flat) immediately.
 - The filter is a second-order Butterworth IIR filter applied to the audio output stream in real time, recomputed whenever `filter_offset` changes.
 - Cutoff frequencies are mapped from the offset steps on a logarithmic scale, covering roughly 40 Hz–18 kHz across the full range. The exact mapping is an implementation detail.
 - The filter state is not persisted between sessions; it always initialises to flat.
@@ -20,7 +20,7 @@ Provide a real-time high-pass / low-pass filter on the playback output, useful f
 
 ### MODIFIED
 - `[` and `]` are added as player key bindings.
-- `Space+\` is added as a player key binding.
+- `Space+[` and `Space+]` are added as player key bindings (snap to flat).
 - The info bar gains a filter indicator field.
 
 ## Scope
