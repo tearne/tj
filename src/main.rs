@@ -294,6 +294,8 @@ fn tui_loop(
     let mut tap_times: Vec<f64> = Vec::new();
     let mut last_tap_wall: Option<Instant> = None;
     let mut tap_offset_pending: Option<i64> = None; // Some = tap-guided detection in flight
+    let mut tap_guided_rx: bool = false;             // current bpm_rx is from a tap-guided spawn
+    let mut was_tap_active: bool = false;
     // Smooth display position: advances via wall clock to avoid audio-buffer-burst jitter.
     let mut smooth_display_samp: f64 = 0.0;
     let mut last_render = Instant::now();
@@ -311,6 +313,11 @@ fn tui_loop(
     let mut volume: f32 = 1.0;
     let mut help_open = false;
     let mut palette_idx: usize = 0;
+    let mut audio_latency_ms: i64 = cache.get_latency();
+    let mut calibration_mode = false;
+    // Wall-clock time of the last calibration pulse fired (used for travelling marker and next-pulse scheduling).
+    let mut last_calib_pulse: Option<Instant> = None;
+    const CALIB_PERIOD_SECS: f64 = 1.0; // 60 BPM = 1 s period
 
     // Shared state for the background detail-braille thread.
     let detail_cols = Arc::new(AtomicUsize::new(0));
@@ -426,12 +433,34 @@ fn tui_loop(
     loop {
         frame_count += 1;
         if let Ok((hash, new_bpm, new_offset)) = bpm_rx.try_recv() {
-            bpm = new_bpm;
-            base_bpm = new_bpm;
-            offset_ms = new_offset;
-            cache.set(hash.clone(), CacheEntry { bpm, offset_ms, name: filename.to_string() });
-            cache.save();
-            analysis_hash = Some(hash);
+            if tap_guided_rx {
+                tap_guided_rx = false;
+                match tap_offset_pending.take() {
+                    Some(tap_offset) => {
+                        // Tap-guided result arrived before tap reset: use analyser BPM, preserve tap phase.
+                        let speed_ratio = bpm / base_bpm;
+                        base_bpm = new_bpm;
+                        bpm = (base_bpm * speed_ratio).clamp(40.0, 240.0);
+                        offset_ms = tap_offset;
+                        player.set_speed(bpm / base_bpm);
+                        cache.set(hash.clone(), CacheEntry { bpm: base_bpm, offset_ms, name: filename.to_string() });
+                        cache.save();
+                        analysis_hash = Some(hash);
+                    }
+                    None => {
+                        // Tap session reset before result arrived — discard entirely.
+                        // Restore analysis_hash so the UI stops showing the spinner.
+                        analysis_hash = Some(hash);
+                    }
+                }
+            } else {
+                bpm = new_bpm;
+                base_bpm = new_bpm;
+                offset_ms = new_offset;
+                cache.set(hash.clone(), CacheEntry { bpm, offset_ms, name: filename.to_string() });
+                cache.save();
+                analysis_hash = Some(hash);
+            }
         }
 
         // Snapshot samples_per_col for use in scrub outside the draw closure.
@@ -494,22 +523,77 @@ fn tui_loop(
                 pos_samp as f64
             };
         }
-        let display_pos_samp = smooth_display_samp as usize;
+        // Apply audio latency compensation: shift the visual display backward by latency.
+        let display_samp = smooth_display_samp
+            - audio_latency_ms as f64 * sample_rate as f64 / 1000.0;
+        let display_pos_samp = display_samp.max(0.0) as usize;
         display_pos_shared.store(display_pos_samp * seek_handle.channels as usize, Ordering::Relaxed);
 
         // Beat-derived values — recomputed each frame so they react to bpm changes instantly.
-        // Use base_bpm and smooth_display_samp so the flash is in exact sync with tick marks.
+        // Use base_bpm and display_samp so the flash is in exact sync with tick marks.
         let beat_period = Duration::from_secs_f64(60.0 / base_bpm as f64);
         let flash_window = beat_period.mul_f64(0.15);
 
         // Beat flash — subtract offset so phase==0 when cursor is on a tick.
         // Ticks are at (samp - offset_samp) % beat_period_samp == 0, so we subtract here.
-        let smooth_pos_ns = (smooth_display_samp / sample_rate as f64 * 1_000_000_000.0) as i128
+        let smooth_pos_ns = (display_samp / sample_rate as f64 * 1_000_000_000.0) as i128
             - offset_ms as i128 * 1_000_000;
         let phase = smooth_pos_ns.rem_euclid(beat_period.as_nanos() as i128);
         let beat_on = phase < flash_window.as_nanos() as i128;
 
+        let remaining = total_duration.saturating_sub(pos);
+        let warning_active = !player.is_paused()
+            && remaining < Duration::from_secs_f32(display_cfg.warning_threshold_secs);
+        let beat_index = smooth_pos_ns.div_euclid(beat_period.as_nanos() as i128);
+        let warn_beat_on = warning_active && (beat_index % 2 == 0);
+
         let analysing = analysis_hash.is_none();
+
+        // Calibration pulse: fire a click tone at 120 BPM (every 0.5 s) while calibration_mode active.
+        if calibration_mode {
+            let fire = match last_calib_pulse {
+                None => true,
+                Some(t) => t.elapsed().as_secs_f64() >= CALIB_PERIOD_SECS,
+            };
+            if fire {
+                play_click_tone(mixer, sample_rate);
+                last_calib_pulse = Some(Instant::now());
+            }
+        } else {
+            last_calib_pulse = None;
+        }
+
+        // Detect tap session end: active last frame, now timed out.
+        let tap_active_now = !tap_times.is_empty()
+            && last_tap_wall.map_or(false, |t| t.elapsed().as_secs_f64() < 2.0);
+        if was_tap_active && !tap_active_now && tap_times.len() >= 8 {
+            if let Some(ref hash) = analysis_hash {
+                let (tapped_bpm, tapped_offset) = compute_tap_bpm_offset(&tap_times);
+                let config = AnalysisConfig {
+                    force_legacy_bpm: true,
+                    bpm_resolution: 0.1,
+                    min_bpm: tapped_bpm * 0.95,
+                    max_bpm: tapped_bpm * 1.05,
+                    legacy_bpm_preferred_min: tapped_bpm * 0.95,
+                    legacy_bpm_preferred_max: tapped_bpm * 1.05,
+                    ..AnalysisConfig::default()
+                };
+                let hash = hash.clone();
+                let mono_bg = Arc::clone(mono);
+                let (tx, rx) = mpsc::channel::<(String, f32, i64)>();
+                let offset_snap = tapped_offset;
+                thread::spawn(move || {
+                    if let Ok(result) = analyze_audio(&mono_bg, sample_rate, config) {
+                        let _ = tx.send((hash, result.bpm, offset_snap));
+                    }
+                });
+                bpm_rx = rx;
+                analysis_hash = None;
+                tap_offset_pending = Some(tapped_offset);
+                tap_guided_rx = true;
+            }
+        }
+        was_tap_active = tap_active_now;
 
         let fmt_dur = |d: Duration| {
             let s = d.as_secs();
@@ -585,19 +669,24 @@ fn tui_loop(
                         Span::styled(format!("{play_icon}  "), dim),
                     ];
                     if adjusted {
-                        info_spans.push(Span::styled(format!("{} ", base_bpm as u32), dim));
+                        info_spans.push(Span::styled(format!("{:.2} ", base_bpm), dim));
                         info_spans.push(Span::styled("(", dim));
-                        info_spans.push(Span::styled(format!("{:.1}", bpm), beat_style));
+                        info_spans.push(Span::styled(format!("{:.2}", bpm), beat_style));
                         info_spans.push(Span::styled(")", dim));
                     } else {
-                        info_spans.push(Span::styled(format!("{}", base_bpm as u32), beat_style));
+                        info_spans.push(Span::styled(format!("{:.2}", base_bpm), beat_style));
                     }
+                    let lat_str = if calibration_mode {
+                        format!("  lat:{}ms  ~ to exit", audio_latency_ms)
+                    } else {
+                        String::new()
+                    };
                     info_spans.push(Span::styled(
-                        format!("  {:+}ms  {}s  vol:{}%{}  nudge:{}{}  {}  [?]",
+                        format!("  {:+}ms  {}s  vol:{}%{}  nudge:{}{}  {}  [?]{}",
                             offset_ms, zoom_secs,
                             (volume * 100.0).round() as u32, nudge_str,
                             mode_str, tap_str,
-                            SPECTRAL_PALETTES[palette_idx].0),
+                            SPECTRAL_PALETTES[palette_idx].0, lat_str),
                         dim,
                     ));
                     Line::from(info_spans)
@@ -612,7 +701,7 @@ fn tui_loop(
             let playhead_frac = if total_duration.is_zero() {
                 0.0
             } else {
-                pos.as_secs_f64() / total_duration.as_secs_f64()
+                (display_samp / sample_rate as f64 / total_duration.as_secs_f64()).clamp(0.0, 1.0)
             };
             let playhead_col = ((playhead_frac * ow as f64) as usize).min(ow.saturating_sub(1));
 
@@ -652,7 +741,13 @@ fn tui_loop(
                         } else if c == playhead_col {
                             (Color::White, '\u{28FF}') // ⣿ solid playhead
                         } else if bar_cols.contains(&c) && (r == 0 || r + 1 == oh) {
-                            (Color::DarkGray, '\u{28FF}') // ⣿ tick at top and bottom rows only
+                            if warn_beat_on {
+                                (Color::Rgb(120, 60, 60), '\u{28FF}')
+                            } else if warning_active {
+                                (Color::Rgb(40, 20, 20), '\u{28FF}')
+                            } else {
+                                (Color::DarkGray, '\u{28FF}') // ⣿ tick at top and bottom rows only
+                            }
                         } else {
                             let r = ov_bass[c];
                             let (_, (br, bg, bb), (tr, tg, tb)) = SPECTRAL_PALETTES[palette_idx];
@@ -691,8 +786,12 @@ fn tui_loop(
             let waveform_rows = dh.saturating_sub(2);
             detail_rows.store(waveform_rows, Ordering::Relaxed);
             let buf = Arc::clone(&*detail_braille_shared.lock().unwrap());
-            let centre_col = ((dw as f64 * display_cfg.playhead_position as f64 / 100.0) as usize)
-                .clamp(0, dw.saturating_sub(1));
+            let centre_col = if calibration_mode {
+                dw / 2
+            } else {
+                ((dw as f64 * display_cfg.playhead_position as f64 / 100.0) as usize)
+                    .clamp(0, dw.saturating_sub(1))
+            };
 
             // Compute the column offset into the buffer that places the playhead at centre_col.
             // Uses smooth_display_samp (wall-clock based) to avoid audio-buffer-burst jitter.
@@ -760,6 +859,58 @@ fn tui_loop(
                 vec![]
             };
 
+            // Calibration pulse markers — same grid logic as beat ticks but at 60 BPM.
+            // Anchored to smooth_display_samp (audio position) so that increasing audio_latency_ms
+            // makes the marker appear further ahead of the playhead at click-fire time, reaching
+            // the playhead later — at the moment the click is actually heard.
+            let (calib_display, calib_pulse_on_playhead): (Vec<u8>, bool) =
+                if calibration_mode && buf.samples_per_col > 0 {
+                    let spc = buf.samples_per_col as f64;
+                    let half_spc = half_col_samp_global;
+                    let speed = (bpm / base_bpm) as f64;
+                    let calib_period_samp = CALIB_PERIOD_SECS * sample_rate as f64 * speed;
+                    let elapsed_since_pulse = last_calib_pulse
+                        .map(|t| t.elapsed().as_secs_f64())
+                        .unwrap_or(0.0);
+                    // Anchor to smooth_display_samp (audio position), NOT display_samp.
+                    // This means the marker appears audio_latency_ms ms ahead of the playhead
+                    // at click-fire time, and travels to the playhead over that many ms.
+                    let pulse_origin_samp = smooth_display_samp
+                        - elapsed_since_pulse * sample_rate as f64 * speed;
+                    let visual_centre = buf.anchor_sample as f64 + delta_half_global as f64 * half_spc;
+                    let view_start = visual_centre - centre_col as f64 * spc;
+                    let view_end = view_start + dw as f64 * spc;
+                    let n_start = ((view_start - pulse_origin_samp) / calib_period_samp).floor() as i64 - 1;
+                    let mut row = vec![0u8; dw];
+                    let mut nearest_dist_half = i64::MAX;
+                    let mut t_samp = pulse_origin_samp + n_start as f64 * calib_period_samp;
+                    while t_samp <= view_end {
+                        let disp_half = ((t_samp - view_start) / half_spc).round() as i64;
+                        if disp_half >= 0 {
+                            let col = (disp_half / 2) as usize;
+                            if col < dw {
+                                row[col] = 0xFF; // full-column double tick
+                            }
+                        }
+                        // Distance from this pulse to the playhead centre in half-columns.
+                        let centre_half = centre_col as i64 * 2;
+                        let dist = (disp_half - centre_half).abs();
+                        if dist < nearest_dist_half { nearest_dist_half = dist; }
+                        t_samp += calib_period_samp;
+                    }
+                    let flash = nearest_dist_half <= 4; // ~2 columns wide for easy visibility
+                    (row, flash)
+                } else {
+                    (vec![], false)
+                };
+
+            // Latency position indicator: anchored to screen centre so it can travel
+            // equally in both directions. ±500ms maps to ±dw/4 columns (~25ms per column),
+            // so it doesn't jump on every 10ms step.
+            let latency_col = (dw as i64 / 2
+                + (audio_latency_ms as f64 / 500.0 * (dw as f64 / 4.0)).round() as i64)
+                .clamp(0, dw as i64 - 1) as usize;
+
             let detail_lines: Vec<Line<'static>> = (0..dh)
                 .map(|r| {
                     let is_tick_row = r == 0 || r + 1 == dh;
@@ -788,6 +939,44 @@ fn tui_loop(
                         };
                     }
                     let _ = &shifted; // lifetime anchor — keeps shifted alive until row_slice is done
+                    // In calibration mode: blank waveform rows; tick rows show only pulse markers.
+                    if calibration_mode {
+                        let mut spans: Vec<Span<'static>> = Vec::new();
+                        let mut run = String::new();
+                        let mut run_color = Color::Reset;
+                        for c in 0..dw {
+                            let calib_byte = calib_display.get(c).copied().unwrap_or(0);
+                            let (color, ch) = if c == centre_col {
+                                let playhead_color = if calib_pulse_on_playhead {
+                                    Color::LightRed
+                                } else {
+                                    Color::White
+                                };
+                                (playhead_color, '\u{28FF}')
+                            } else if is_tick_row && calib_byte != 0 {
+                                (Color::Cyan, char::from_u32(0x2800 | calib_byte as u32).unwrap_or(' '))
+                            } else if c == latency_col {
+                                (Color::DarkGray, '\u{2502}') // │ thin latency position indicator
+                            } else {
+                                (Color::Reset, '\u{2800}') // blank
+                            };
+                            if color != run_color {
+                                if !run.is_empty() {
+                                    spans.push(Span::styled(
+                                        std::mem::take(&mut run),
+                                        Style::default().fg(run_color),
+                                    ));
+                                }
+                                run_color = color;
+                            }
+                            run.push(ch);
+                        }
+                        if !run.is_empty() {
+                            spans.push(Span::styled(run, Style::default().fg(run_color)));
+                        }
+                        return Line::from(spans);
+                    }
+
                     let row = match row_slice {
                         None => return Line::from(Span::raw("\u{2800}".repeat(dw))),
                         Some(s) => s,
@@ -832,7 +1021,8 @@ Space+F/V      reset tempo to detected BPM
 q/w/e/r        beat jump backward 1/4/16/64 beats
 c  /  d        nudge backward / forward (mode-dependent)
 C  /  D        toggle nudge mode: jump (10ms) / warp (±10% speed)
-+  /  -        beat phase offset ±10ms
++  /  -        beat phase offset ±10ms (or latency in calibration mode)
+~              toggle latency calibration mode
 z  /  Z        zoom out / in
 {  /  }        detail height decrease / increase
 h  /  H        BPM ½ / ×2
@@ -995,6 +1185,7 @@ Esc            quit";
                     let action = if space_held && key.code != KeyCode::Char(' ') {
                         if let Some(a) = keymap.get(&KeyBinding::SpaceChord(key.code)) {
                             space_chord_fired = true;
+                            space_held = false; // reset so subsequent keys aren't treated as chords
                             Some(a)
                         } else {
                             keymap.get(&KeyBinding::Key(key.code))
@@ -1005,12 +1196,13 @@ Esc            quit";
                     match action {
                     Some(Action::Quit) => {
                         player.stop();
+                        cache.set_latency(audio_latency_ms);
                         if let Some(ref hash) = analysis_hash {
                             if let Some(entry) = cache.get(hash.as_str()).cloned() {
                                 cache.set(hash.clone(), CacheEntry { offset_ms, ..entry });
-                                cache.save();
                             }
                         }
+                        cache.save();
                         return Ok(None);
                     }
                     Some(Action::OpenBrowser) => {
@@ -1058,6 +1250,18 @@ Esc            quit";
                         player.set_volume(volume);
                     }
                     Some(Action::Help) => { help_open = true; }
+                    Some(Action::CalibrationToggle) => {
+                        if calibration_mode {
+                            // Always allow exiting calibration.
+                            calibration_mode = false;
+                            cache.set_latency(audio_latency_ms);
+                            cache.save();
+                        } else if player.is_paused() {
+                            // Snap to nearest 10ms so +/- steps always land on multiples of 10.
+                            audio_latency_ms = (audio_latency_ms as f64 / 10.0).round() as i64 * 10;
+                            calibration_mode = true;
+                        }
+                    }
                     Some(Action::WaveformStyle) => {
                         let s = detail_style.load(Ordering::Relaxed);
                         detail_style.store(1 - s, Ordering::Relaxed);
@@ -1065,8 +1269,24 @@ Esc            quit";
                     Some(Action::PaletteCycle) => {
                         palette_idx = (palette_idx + 1) % SPECTRAL_PALETTES.len();
                     }
-                    Some(Action::OffsetIncrease) => offset_ms += 10,
-                    Some(Action::OffsetDecrease) => offset_ms -= 10,
+                    Some(Action::OffsetIncrease) => {
+                        if calibration_mode {
+                            audio_latency_ms = (audio_latency_ms + 10 + 500).rem_euclid(1000) - 500;
+                            cache.set_latency(audio_latency_ms);
+                            cache.save();
+                        } else {
+                            offset_ms += 10;
+                        }
+                    }
+                    Some(Action::OffsetDecrease) => {
+                        if calibration_mode {
+                            audio_latency_ms = (audio_latency_ms - 10 + 500).rem_euclid(1000) - 500;
+                            cache.set_latency(audio_latency_ms);
+                            cache.save();
+                        } else {
+                            offset_ms -= 10;
+                        }
+                    }
                     Some(Action::ZoomOut) => {
                         if zoom_idx > 0 { zoom_idx -= 1; }
                     }
@@ -1109,6 +1329,28 @@ Esc            quit";
                         bpm = (bpm - 0.1).max(40.0);
                         player.set_speed(bpm / base_bpm);
                     }
+                    Some(Action::BaseBpmIncrease) => {
+                        base_bpm = (base_bpm + 0.01).min(240.0);
+                        bpm = base_bpm;
+                        player.set_speed(1.0);
+                        if let Some(ref hash) = analysis_hash {
+                            if let Some(entry) = cache.get(hash.as_str()).cloned() {
+                                cache.set(hash.clone(), CacheEntry { bpm: base_bpm, offset_ms, ..entry });
+                                cache.save();
+                            }
+                        }
+                    }
+                    Some(Action::BaseBpmDecrease) => {
+                        base_bpm = (base_bpm - 0.01).max(40.0);
+                        bpm = base_bpm;
+                        player.set_speed(1.0);
+                        if let Some(ref hash) = analysis_hash {
+                            if let Some(entry) = cache.get(hash.as_str()).cloned() {
+                                cache.set(hash.clone(), CacheEntry { bpm: base_bpm, offset_ms, ..entry });
+                                cache.save();
+                            }
+                        }
+                    }
                     Some(Action::BpmRedetect) => {
                         if let Some(ref hash) = analysis_hash {
                             let hash = hash.clone();
@@ -1128,6 +1370,8 @@ Esc            quit";
                             });
                             bpm_rx = rx;
                             analysis_hash = None;
+                            tap_guided_rx = false;
+                            tap_offset_pending = None;
                         }
                     }
                     Some(Action::JumpForward1)  => do_jump(&seek_handle, &player, bpm, total_duration,  1),
@@ -1147,6 +1391,7 @@ Esc            quit";
                         if let Some(last) = last_tap_wall {
                             if now.duration_since(last).as_secs_f64() > 2.0 {
                                 tap_times.clear();
+                                tap_offset_pending = None;
                             }
                         }
                         tap_times.push(smooth_display_samp / sample_rate as f64);
@@ -1162,6 +1407,7 @@ Esc            quit";
                             bpm = (base_bpm * speed_ratio).clamp(40.0, 240.0);
                             offset_ms = tapped_offset;
                             player.set_speed(bpm / base_bpm);
+                            // Analysis is launched when the session ends (2s after last tap).
                         }
                     }
                     Some(Action::NudgeBackward) | Some(Action::NudgeForward) | Some(Action::NudgeModeToggle) => {}
@@ -1173,8 +1419,10 @@ Esc            quit";
             }
         }
 
-        if player.empty() {
-            return Ok(None);
+        if player.empty() && !player.is_paused() {
+            player.pause();
+            let total_mono_samps = seek_handle.samples.len() / seek_handle.channels as usize;
+            smooth_display_samp = total_mono_samps as f64;
         }
     }
 }
@@ -1232,8 +1480,10 @@ enum Action {
     ZoomIn, ZoomOut,
     HeightIncrease, HeightDecrease,
     VolumeUp, VolumeDown,
-    BpmHalve, BpmDouble, BpmIncrease, BpmDecrease, BpmRedetect, BpmTap,
+    BpmHalve, BpmDouble, BpmIncrease, BpmDecrease, BaseBpmIncrease, BaseBpmDecrease,
+    BpmRedetect, BpmTap,
     PaletteCycle, OpenBrowser, Help, WaveformStyle, TempoReset,
+    CalibrationToggle,
 }
 
 static ACTION_NAMES: &[(&str, Action)] = &[
@@ -1260,15 +1510,18 @@ static ACTION_NAMES: &[(&str, Action)] = &[
     ("volume_down",      Action::VolumeDown),
     ("bpm_halve",        Action::BpmHalve),
     ("bpm_double",       Action::BpmDouble),
-    ("bpm_increase",     Action::BpmIncrease),
-    ("bpm_decrease",     Action::BpmDecrease),
+    ("bpm_increase",      Action::BpmIncrease),
+    ("bpm_decrease",      Action::BpmDecrease),
+    ("base_bpm_increase", Action::BaseBpmIncrease),
+    ("base_bpm_decrease", Action::BaseBpmDecrease),
     ("bpm_redetect",     Action::BpmRedetect),
     ("bpm_tap",          Action::BpmTap),
     ("palette_cycle",    Action::PaletteCycle),
     ("open_browser",     Action::OpenBrowser),
     ("help",             Action::Help),
-    ("waveform_style",   Action::WaveformStyle),
-    ("tempo_reset",      Action::TempoReset),
+    ("waveform_style",       Action::WaveformStyle),
+    ("tempo_reset",          Action::TempoReset),
+    ("calibration_toggle",   Action::CalibrationToggle),
 ];
 
 #[derive(Hash, Eq, PartialEq)]
@@ -1305,11 +1558,12 @@ fn parse_bare_key(s: &str) -> Option<KeyCode> {
 const DEFAULT_CONFIG: &str = include_str!("../resources/config.toml");
 
 struct DisplayConfig {
-    playhead_position: u8, // 0–100, clamped
+    playhead_position: u8,      // 0–100, clamped
+    warning_threshold_secs: f32, // seconds before end to activate warning flash
 }
 
 impl Default for DisplayConfig {
-    fn default() -> Self { Self { playhead_position: 20 } }
+    fn default() -> Self { Self { playhead_position: 20, warning_threshold_secs: 30.0 } }
 }
 
 /// Finds or creates the config file and returns its text.
@@ -1353,13 +1607,18 @@ fn parse_display_config(text: &str) -> DisplayConfig {
         Ok(v) => v,
         Err(_) => return DisplayConfig::default(),
     };
-    let pos = parsed
-        .get("display")
+    let display = parsed.get("display");
+    let pos = display
         .and_then(|v| v.get("playhead_position"))
         .and_then(|v| v.as_integer())
         .unwrap_or(20)
         .clamp(0, 100) as u8;
-    DisplayConfig { playhead_position: pos }
+    let warning_threshold_secs = display
+        .and_then(|v| v.get("warning_threshold_secs"))
+        .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)))
+        .unwrap_or(30.0)
+        .max(0.0) as f32;
+    DisplayConfig { playhead_position: pos, warning_threshold_secs }
 }
 
 fn parse_keymap(text: &str, map: &mut std::collections::HashMap<KeyBinding, Action>)
@@ -1446,6 +1705,31 @@ fn scrub_audio(
         NonZero::new(channels).unwrap(),
         NonZero::new(sample_rate).unwrap(),
         snippet,
+    );
+    mixer.add(src);
+}
+
+/// Synthesise a short 1 kHz click tone and inject it into the mixer.
+fn play_click_tone(mixer: &rodio::mixer::Mixer, sample_rate: u32) {
+    use rodio::buffer::SamplesBuffer;
+    use std::num::NonZero;
+    let total = (sample_rate as usize * 20 / 1000).max(1); // 20 ms
+    let attack = (sample_rate as usize * 2 / 1000).max(1); // 2 ms
+    let samples: Vec<f32> = (0..total)
+        .map(|i| {
+            let envelope = if i < attack {
+                i as f32 / attack as f32
+            } else {
+                1.0 - (i - attack) as f32 / (total - attack).max(1) as f32
+            };
+            let phase = 2.0 * std::f32::consts::PI * 1000.0 * i as f32 / sample_rate as f32;
+            phase.sin() * envelope * 0.4
+        })
+        .collect();
+    let src = SamplesBuffer::new(
+        NonZero::new(1u16).unwrap(),
+        NonZero::new(sample_rate).unwrap(),
+        samples,
     );
     mixer.add(src);
 }
@@ -1895,12 +2179,15 @@ struct CacheFile {
     #[serde(default)]
     last_browser_path: Option<String>,
     #[serde(default)]
+    audio_latency_ms: i64,
+    #[serde(default)]
     entries: std::collections::HashMap<String, CacheEntry>,
 }
 
 struct Cache {
     path: std::path::PathBuf,
     last_browser_path: Option<std::path::PathBuf>,
+    audio_latency_ms: i64,
     entries: std::collections::HashMap<String, CacheEntry>,
 }
 
@@ -1920,6 +2207,7 @@ impl Cache {
         Self {
             path,
             last_browser_path: file.last_browser_path.map(std::path::PathBuf::from),
+            audio_latency_ms: file.audio_latency_ms,
             entries: file.entries,
         }
     }
@@ -1940,6 +2228,14 @@ impl Cache {
         self.last_browser_path = Some(p.to_path_buf());
     }
 
+    fn get_latency(&self) -> i64 {
+        self.audio_latency_ms
+    }
+
+    fn set_latency(&mut self, ms: i64) {
+        self.audio_latency_ms = ms;
+    }
+
     fn entries_snapshot(&self) -> std::collections::HashMap<String, CacheEntry> {
         self.entries.clone()
     }
@@ -1953,6 +2249,7 @@ impl Cache {
             last_browser_path: self.last_browser_path
                 .as_ref()
                 .and_then(|p| p.to_str().map(|s| s.to_string())),
+            audio_latency_ms: self.audio_latency_ms,
             entries: self.entries.clone(),
         };
         if let Ok(text) = serde_json::to_string_pretty(&file) {

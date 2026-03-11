@@ -1,0 +1,30 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = "==3.12.*"
+# ///
+
+import re
+import subprocess
+import sys
+
+def main():
+    cargo = open("Cargo.toml").read()
+    m = re.search(r'^version\s*=\s*"(\d+)\.(\d+)\.(\d+)"', cargo, re.MULTILINE)
+    if not m:
+        print("Error: could not find version in Cargo.toml")
+        sys.exit(1)
+
+    major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    new_patch = patch + 1
+    new_version = f"{major}.{minor}.{new_patch}"
+    old_version = f"{major}.{minor}.{patch}"
+
+    updated = cargo.replace(f'version = "{old_version}"', f'version = "{new_version}"', 1)
+    open("Cargo.toml", "w").write(updated)
+    print(f"Bumped {old_version} → {new_version}", flush=True)
+
+    result = subprocess.run(["cargo", "build", "--release"])
+    sys.exit(result.returncode)
+
+if __name__ == "__main__":
+    main()

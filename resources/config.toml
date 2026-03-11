@@ -13,7 +13,7 @@ jump_backward_64 = "r"
 nudge_backward   = "c"
 nudge_forward    = "d"
 nudge_mode_toggle = ["C", "D"]
-offset_increase  = "+"
+offset_increase  = ["=", "+"]
 offset_decrease  = "-"
 zoom_in          = "Z"
 zoom_out         = "z"
@@ -25,12 +25,16 @@ bpm_halve        = "h"
 bpm_double       = "H"
 bpm_increase     = "f"
 bpm_decrease     = "v"
+base_bpm_increase = "F"
+base_bpm_decrease = "V"
 bpm_redetect     = "t"
 palette_cycle    = "p"
 waveform_style   = "o"
 open_browser     = "space+a"
 bpm_tap          = "b"
+calibration_toggle = "~"
 help             = "?"
 
 [display]
-playhead_position = 20   # 0–100, percentage from left edge of detail panel
+playhead_position = 20        # 0–100, percentage from left edge of detail panel
+warning_threshold_secs = 30   # seconds before end to activate bar-marker flash warning

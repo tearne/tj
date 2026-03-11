@@ -1,5 +1,5 @@
 # Design: Tap-Guided BPM Re-detection
-**Status: Draft**
+**Status: Approved**
 
 ## Approach
 
@@ -39,8 +39,8 @@ Set `analysis_hash = None` when launching, same as `BpmRedetect`. The spinner ap
 
 ## Tasks
 
-1. **Impl**: Add `tap_offset_pending: Option<i64>` state; on `BpmTap` with 8+ taps, extract segment, build config, spawn background thread, set `analysis_hash = None` and `tap_offset_pending = Some(offset_ms)`.
-2. **Impl**: Clear `tap_offset_pending` when tap session resets.
-3. **Impl**: Update `bpm_rx` receiver to check `tap_offset_pending` — preserve tap offset if `Some`, discard result if `None`.
+1. ✓ **Impl**: Add `tap_offset_pending: Option<i64>` state; on `BpmTap` with 8+ taps, extract segment, build config, spawn background thread, set `analysis_hash = None` and `tap_offset_pending = Some(offset_ms)`.
+2. ✓ **Impl**: Clear `tap_offset_pending` when tap session resets.
+3. ✓ **Impl**: Update `bpm_rx` receiver to check `tap_offset_pending` — preserve tap offset if `Some`, discard result if `None`.
 4. **Verify**: After tapping, spinner shows; `base_bpm` updates to analyser precision; `offset_ms` remains from tap; resetting tap session before result arrives discards it.
 5. **Process**: Archive

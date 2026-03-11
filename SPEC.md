@@ -27,7 +27,8 @@ tj [path]
 |-----|--------|
 | `Space+Z` | Play / Pause |
 | `Space+F` / `Space+V` | Reset tempo to detected BPM (speed → 1×) |
-| `+` / `-` | Adjust beat phase offset (10ms steps) |
+| `+` / `-` | Adjust beat phase offset (10ms steps); adjusts `audio_latency_ms` in calibration mode |
+| `~` | Toggle latency calibration mode (only while paused) |
 | `Left` / `Right` | Seek backward / forward (small increment, e.g. 5s) |
 | `1` / `2` / `3` / `4` | Beat jump forward 1 / 4 / 16 / 64 beats |
 | `q` / `w` / `e` / `r` | Beat jump backward 1 / 4 / 16 / 64 beats |
@@ -38,6 +39,7 @@ tj [path]
 | `{` / `}` | Detail height decrease / increase |
 | `h` / `H` | BPM ½ / ×2 |
 | `f` / `v` | BPM +0.1 / −0.1 |
+| `F` / `V` | Detected BPM +0.01 / −0.01 |
 | `t` | Re-run BPM detection |
 | `?` | Toggle key binding help popup |
 | `b` | Tap BPM detection |
@@ -60,6 +62,7 @@ tj [path]
 
 ### Playback
 - Supports audio formats: FLAC, MP3, OGG Vorbis, WAV, AAC, OPUS.
+- When playback reaches the end of the track, the transport pauses and the playhead remains at the end position. The player view stays open and fully interactive.
 - Decode runs on a background thread. A loading screen displays a progress bar showing decode progress.
 - Playback begins as soon as decode completes, before BPM analysis is finished.
 - Displays track metadata: title, artist, album, duration, current position.
@@ -68,13 +71,13 @@ tj [path]
 - BPM is auto-detected from the audio on load, assuming a constant tempo throughout the track. Hash computation and BPM detection run on a background thread after decode; playback starts immediately with a 120 BPM placeholder.
 - While BPM analysis is in progress, beat markers are suppressed, the beat indicator does not flash, and the BPM line shows an animated indicator (e.g. `BPM: --- [analysing ⠋]`). Beat jump uses the 120 BPM placeholder.
 - When analysis completes, the BPM updates, beat markers appear, and beat jump uses the detected tempo.
-- The detected BPM is rounded to the nearest integer.
+- The detected BPM is displayed to two decimal places.
 - A beat phase offset (in milliseconds) can be adjusted at runtime to align the beat indicator with the audio. The offset and BPM are displayed in the UI.
 - The user can correct an inaccurate detection at runtime:
   - `h` halves the BPM; `H` doubles it. Takes effect immediately.
   - `f` increases the effective BPM by 0.1; `v` decreases it by 0.1. Adjustments affect playback speed proportionally (relative to the detected BPM) and clamp to the range 40.0–240.0.
   - `t` re-runs detection cycling through modes: `auto` (default tempogram), `fusion` (tempogram + legacy in parallel), `legacy` (autocorrelation + comb filter). Non-blocking: returns immediately, shows the animated indicator while detection runs in the background.
-  - `b` tap-detects BPM: press in time with the beat. After 8 taps a rolling median of inter-tap intervals sets `base_bpm` and derives `offset_ms` from the tap phase. Any active `f`/`v` speed ratio is preserved relative to the new `base_bpm`. The tap count is shown in the info bar (`tap:N`) while a session is active; tapping stops 2 seconds after the last tap.
+  - `b` tap-detects BPM: press in time with the beat. After 8 taps a rolling median of inter-tap intervals sets `base_bpm` and derives `offset_ms` from the tap phase. Any active `f`/`v` speed ratio is preserved relative to the new `base_bpm`. The tap count is shown in the info bar (`tap:N`) while a session is active; tapping stops 2 seconds after the last tap. When the session ends, a background re-detection pass is triggered automatically: the full track is re-analysed using legacy autocorrelation with `bpm_resolution: 0.1`, with the search window narrowed to ±5% of the tapped BPM. This achieves sub-integer precision while using the tap to resolve octave ambiguity. If re-detection returns a result, `base_bpm` is updated to the analyser's value; the tap-derived `offset_ms` is preserved. If the tap session resets before re-detection completes, the in-flight result is discarded.
   - Corrections are persisted to the cache immediately.
 - Detected BPM and phase offset are cached in `~/.local/share/tj/cache.json`, keyed by a Blake3 hash of the decoded audio samples. This makes the cache invariant of filename, tags, and container format. The cache also stores the last browser directory.
 - Each cache entry includes the filename at time of first detection as a human-readable hint to aid manual cache management.
@@ -82,7 +85,8 @@ tj [path]
 
 ### Info Bar
 - A single line at the top of the player view displays: play/pause icon (`▶`/`⏸`), BPM, phase offset, zoom level, and a `[?]` help hint. The bar wraps naturally if the terminal is too narrow.
-- When no tempo adjustment is active, the detected BPM is shown as an integer (e.g. `120`) and receives a soft amber beat-flash. When a `f`/`v` adjustment is active, the detected BPM is shown plain and the adjusted tempo is shown alongside in parentheses (e.g. `120 (124.4)`), with only the adjusted number receiving the beat-flash.
+- When no tempo adjustment is active, the detected BPM is shown to two decimal places (e.g. `120.00`) and receives a soft amber beat-flash. When a `f`/`v` adjustment is active, the detected BPM is shown plain and the adjusted tempo is shown alongside in parentheses (e.g. `120.00 (124.40)`), with only the adjusted number receiving the beat-flash.
+- `F` increases `base_bpm` by 0.01; `V` decreases it by 0.01. Both clamp to 40.0–240.0. Adjusting `base_bpm` resets any active `f`/`v` playback offset (`bpm` is set equal to the new `base_bpm`, speed returns to 1×) and is persisted to the cache immediately.
 - Pressing `?` opens a modal key binding reference overlay; any key dismisses it.
 - During BPM analysis the BPM field shows an animated spinner.
 
@@ -95,6 +99,7 @@ tj [path]
 - Zoom level for the Detail view is adjustable by the user.
 - The Overview waveform is coloured by spectral content: each column blends between an orange/warm colour (bass-heavy) and a cyan/cool colour (treble-heavy), based on the ratio of low-frequency to high-frequency energy in that section. The frequency crossover is ~250 Hz. Several colour palettes are available and cycle with `p`; the active palette name is shown in the info bar.
 - The Overview displays bar markers as full-height lines drawn beneath the waveform, visible only in the gaps. The marker interval starts at every 4 bars and doubles if there are fewer than two characters between any pair of adjacent markers, repeating until all pairs have at least two characters between them. A legend in the top-right corner of the Overview shows the current interval (e.g. `4 bars`, `8 bars`).
+- When the remaining playback time falls below a configurable threshold (default 30 seconds), the overview bar markers flash in time with the BPM: the marker colour alternates each beat (one beat on, one beat off) using a muted reddish-grey. The warning is active only during playback. The threshold is configurable via `warning_threshold_secs` in the `[display]` section of `config.toml`.
 - The detail view displays a beat marker at each beat position as a full-height line drawn beneath the waveform, visible only in the gaps.
 - Buffer columns representing sample positions before the start of the track render as silence (zero amplitude), not as a mirror of position 0.
 - Both sets of markers shift immediately when the phase offset is adjusted.
@@ -122,6 +127,23 @@ The render frame period adapts to the current zoom level and detail panel width,
 
 ### Needle Drop
 - A left mouse click anywhere on the Overview waveform seeks the transport to the start of the nearest bar marker at or to the left of the click position. Playback state is preserved — if playing, playback continues from the new position; if paused, the transport remains paused. The Detail view recentres on the new position immediately.
+
+### Audio Latency Calibration
+- An `audio_latency_ms` value shifts all visual rendering backward by a fixed number of milliseconds, compensating for audio output latency. The effective display position is `smooth_display_samp − audio_latency_ms × sample_rate / 1000`. This affects the waveform viewport, beat markers, beat flash, and overview playhead.
+- `~` toggles calibration mode. Calibration mode may only be entered while playback is paused. Pressing `~` again exits and persists the value immediately.
+- While calibration mode is active:
+  - The detail waveform and normal beat tick marks are hidden.
+  - The playhead moves to the horizontal centre of the detail panel.
+  - A synthetic click tone fires at 60 BPM (every 1 second), injected directly into the mixer.
+  - A calibration pulse marker (cyan, double-width tick) travels through the detail panel toward the playhead at the same 60 BPM tempo, arriving at the playhead at the moment the audio latency elapses after each click fires.
+  - When a pulse marker coincides with the playhead, the playhead flashes bright red.
+  - `+` / `-` adjust `audio_latency_ms` in 10ms steps (wrapping at ±500ms). On entry to calibration mode, the value is rounded to the nearest 10ms.
+  - A dim vertical indicator line shows the current `audio_latency_ms` position: screen centre = 0ms, screen edges = ±500ms. The indicator moves approximately every 25ms of latency change.
+  - The info bar shows `lat:Nms  ~ to exit` while calibration is active.
+  - All other controls continue to function normally.
+  - The user adjusts until the playhead flash coincides with the heard click.
+- `audio_latency_ms` is stored as a single global value in the cache (alongside per-track entries). It is loaded on startup and saved on each change and on quit.
+- The `[?]` help overlay lists `~` as the calibration key.
 
 ### Volume Control
 - The playback volume is adjustable at runtime using `↑` (increase) and `↓` (decrease) in 5% steps, from 0% to 100%. The current volume is displayed in the info bar. Changes take effect immediately without interrupting playback. Volume is not persisted between sessions.
@@ -201,7 +223,7 @@ The smooth display position rounded to the nearest half-column boundary. Both th
 - Key bindings are loaded from `config.toml` at startup — first from the same directory as the binary, then from `~/.config/tj/config.toml`. If neither file is found, the embedded default config is written to `~/.config/tj/config.toml` and loaded automatically.
 - Bindings are declared under a `[keys]` table as `function_name = "key_string"` or `function_name = ["key1", "key2"]` for multiple keys per function.
 - Key strings: printable characters as-is (`q`, `+`, `H`); special keys as lowercase names (`space`, `esc`, `up`, `down`, `left`, `right`, `enter`, `backspace`); `space+<key>` for Space-modifier chords (e.g. `space+z`).
-- `Space` acts as a modifier key: holding it and pressing another key fires a chord action. `Space` released alone has no effect.
+- `Space` acts as a modifier key: holding it and pressing another key fires a chord action. `Space` released alone has no effect. The Space-held state resets when a chord action fires, ensuring regular key bindings work correctly on terminals that do not send key-release events.
 - Ctrl-C always quits unconditionally and is not configurable.
 - Display parameters are declared under a `[display]` table. Missing `[display]` keys fall back to their defaults; existing config files are never modified automatically.
 
