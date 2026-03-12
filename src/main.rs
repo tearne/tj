@@ -312,6 +312,7 @@ fn tui_loop(
     let mut detail_height: usize = 8;
     let mut overview_rect = ratatui::layout::Rect::default();
     let mut last_bar_cols: Vec<usize> = Vec::new();
+    let mut last_bar_times: Vec<f64> = Vec::new();
     let mut nudge: i8 = 0; // -1 = backward, 0 = none, +1 = forward
     let mut nudge_mode = NudgeMode::Jump;
     let mut space_held = false;
@@ -642,7 +643,7 @@ fn tui_loop(
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(1), // info bar
-                    Constraint::Length(5), // overview waveform
+                    Constraint::Length(4), // overview waveform
                     Constraint::Min(0),    // detail waveform + blank space
                 ])
                 .split(inner);
@@ -747,22 +748,32 @@ fn tui_loop(
             } else {
                 (display_samp / sample_rate as f64 / total_duration.as_secs_f64()).clamp(0.0, 1.0)
             };
-            let playhead_col = ((playhead_frac * ow as f64) as usize).min(ow.saturating_sub(1));
+            let playhead_col = ((playhead_frac * ow as f64).round() as usize).min(ow.saturating_sub(1));
 
-            let (ov_peaks, ov_bass): (Vec<(f32, f32)>, Vec<f32>) = (0..ow)
+            // Sample at double width for half-column braille resolution.
+            let (ov_peaks_hires, ov_bass_hires): (Vec<(f32, f32)>, Vec<f32>) = (0..ow * 2)
                 .map(|col| {
-                    let idx = (col * total_peaks / ow.max(1)).min(total_peaks.saturating_sub(1));
+                    let idx = (col * total_peaks / (ow * 2).max(1)).min(total_peaks.saturating_sub(1));
                     (waveform.peaks[idx], waveform.bass_ratio[idx])
                 })
                 .unzip();
-            let ov_braille = render_braille(&ov_peaks, oh, ow, false);
-            let (bar_cols, bars_per_tick): (Vec<usize>, u32) = if !analysing {
+            let hires_buf = render_braille(&ov_peaks_hires, oh, ow * 2, false);
+            // Pack pairs: left dot column from even half-col, right from odd half-col.
+            // 0x47 = left dot bits (0,1,2,6); 0xB8 = right dot bits (3,4,5,7).
+            let ov_braille: Vec<Vec<u8>> = hires_buf.iter()
+                .map(|row| (0..ow).map(|c| (row[c * 2] & 0x47) | (row[c * 2 + 1] & 0xB8)).collect())
+                .collect();
+            let ov_bass: Vec<f32> = (0..ow)
+                .map(|c| (ov_bass_hires[c * 2] + ov_bass_hires[c * 2 + 1]) / 2.0)
+                .collect();
+            let (bar_cols, bar_times, bars_per_tick): (Vec<usize>, Vec<f64>, u32) = if !analysing {
                 bar_tick_cols(base_bpm as f64, offset_ms, total_duration.as_secs_f64(), ow)
             } else {
-                (Vec::new(), 4)
+                (Vec::new(), Vec::new(), 4)
             };
             overview_rect = chunks[1];
             last_bar_cols = bar_cols.clone();
+            last_bar_times = bar_times;
             let legend: String = if !analysing {
                 format!("{} bars", bars_per_tick)
             } else {
@@ -784,13 +795,13 @@ fn tui_loop(
                             (Color::DarkGray, lch)
                         } else if c == playhead_col {
                             (Color::White, '\u{28FF}') // ⣿ solid playhead
-                        } else if bar_cols.contains(&c) && (r == 0 || r + 1 == oh) {
+                        } else if bar_cols.contains(&c) {
                             if warn_beat_on {
-                                (Color::Rgb(120, 60, 60), '\u{28FF}')
+                                (Color::Rgb(120, 60, 60), '│')
                             } else if warning_active {
-                                (Color::Rgb(40, 20, 20), '\u{28FF}')
+                                (Color::Rgb(40, 20, 20), '│')
                             } else {
-                                (Color::DarkGray, '\u{28FF}') // ⣿ tick at top and bottom rows only
+                                (Color::DarkGray, '│')
                             }
                         } else {
                             let r = ov_bass[c];
@@ -1121,11 +1132,11 @@ Esc            quit";
                     {
                         let ow = rect.width as usize;
                         let click_col = col - rect.x as usize;
-                        let target_col = last_bar_cols.iter().copied().filter(|&c| c <= click_col).last();
-                        let target_secs = match target_col {
-                            Some(c) => c as f64 / ow as f64 * total_duration.as_secs_f64(),
-                            None => 0.0,
-                        };
+                        let target_secs = last_bar_cols.iter().zip(last_bar_times.iter())
+                            .filter(|(c, _)| **c <= click_col)
+                            .last()
+                            .map(|(_, t)| *t)
+                            .unwrap_or(0.0);
                         if player.is_paused() {
                             seek_handle.seek_direct(target_secs);
                         } else {
@@ -1945,9 +1956,9 @@ fn render_braille(peaks: &[(f32, f32)], rows: usize, cols: usize, outline: bool)
 ///
 /// Starts at 4 bars and doubles until all adjacent ticks are at least 2 columns apart
 /// (leaving at least 1 blank character gap between every pair of markers).
-fn bar_tick_cols(bpm: f64, offset_ms: i64, total_secs: f64, cols: usize) -> (Vec<usize>, u32) {
+fn bar_tick_cols(bpm: f64, offset_ms: i64, total_secs: f64, cols: usize) -> (Vec<usize>, Vec<f64>, u32) {
     if bpm <= 0.0 || total_secs <= 0.0 || cols == 0 {
-        return (Vec::new(), 4);
+        return (Vec::new(), Vec::new(), 4);
     }
     let beat_secs = 60.0 / bpm;
     let offset_secs = offset_ms as f64 / 1000.0;
@@ -1955,21 +1966,23 @@ fn bar_tick_cols(bpm: f64, offset_ms: i64, total_secs: f64, cols: usize) -> (Vec
     loop {
         let bar_period = bars as f64 * 4.0 * beat_secs; // bars × 4 beats/bar × secs/beat
         let n_start = (-offset_secs / bar_period).ceil() as i64;
-        let mut result = Vec::new();
+        let mut result: Vec<(usize, f64)> = Vec::new();
         let mut t = offset_secs + n_start as f64 * bar_period;
         while t <= total_secs {
             let col = ((t / total_secs) * cols as f64).round() as usize;
             if col < cols {
-                result.push(col);
+                result.push((col, t.max(0.0)));
             }
             t += bar_period;
         }
         let min_gap = result.windows(2)
-            .map(|w| w[1].saturating_sub(w[0]))
+            .map(|w| w[1].0.saturating_sub(w[0].0))
             .min()
             .unwrap_or(usize::MAX);
-        if min_gap >= 2 || bars >= 512 {
-            return (result, bars);
+        if min_gap >= 4 || bars >= 512 {
+            let cols_vec = result.iter().map(|&(c, _)| c).collect();
+            let times_vec = result.iter().map(|&(_, t)| t).collect();
+            return (cols_vec, times_vec, bars);
         }
         bars *= 2;
     }
