@@ -41,7 +41,6 @@ const ZOOM_LEVELS: &[f32] = &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
 const DEFAULT_ZOOM_IDX: usize = 2; // 4 seconds
 const FADE_SAMPLES: i64 = 256;       // ~5.8ms at 44100 Hz — fade-out then fade-in around each seek
 const MICRO_FADE_SAMPLES: i64 = 8;  // ~0.2ms — used for micro-jumps (c/d keys)
-const DETECT_MODES: &[&str] = &["auto", "fusion", "legacy"];
 /// Spectral colour palettes: (name, bass_rgb, treble_rgb).
 const SPECTRAL_PALETTES: &[(&str, (u8,u8,u8), (u8,u8,u8))] = &[
     ("amber/cyan", (255, 140,   0), (  0, 200, 200)),
@@ -309,7 +308,6 @@ fn tui_loop(
     let mut last_viewport_start: usize = 0;
     const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let mut zoom_idx: usize = DEFAULT_ZOOM_IDX;
-    let mut detect_mode: usize = 0;
     let mut detail_height: usize = 8;
     let mut overview_rect = ratatui::layout::Rect::default();
     let mut last_bar_cols: Vec<usize> = Vec::new();
@@ -321,10 +319,12 @@ fn tui_loop(
     let mut volume: f32 = 1.0;
     let mut help_open = false;
     let mut palette_idx: usize = 0;
-    let mut audio_latency_ms: i64 = (cache.get_latency() as f64 / 10.0).round() as i64 * 10;
+    let mut audio_latency_ms: i64 = ((cache.get_latency() as f64 / 10.0).round() as i64 * 10).clamp(0, 250);
     let mut calibration_mode = false;
     // Wall-clock time of the last calibration pulse fired (used for travelling marker and next-pulse scheduling).
     let mut last_calib_pulse: Option<Instant> = None;
+    let mut metronome_mode = false;
+    let mut last_metro_beat: Option<i128> = None;
     const CALIB_PERIOD_SECS: f64 = 1.0; // 60 BPM = 1 s period
 
     // Filter state.
@@ -581,6 +581,16 @@ fn tui_loop(
             last_calib_pulse = None;
         }
 
+        // Metronome: fire a click tone on each new beat_index while playing.
+        if metronome_mode && !calibration_mode && !player.is_paused() {
+            if last_metro_beat != Some(beat_index) {
+                play_click_tone(mixer, sample_rate);
+                last_metro_beat = Some(beat_index);
+            }
+        } else {
+            last_metro_beat = None;
+        }
+
         // Detect tap session end: active last frame, now timed out.
         let tap_active_now = !tap_times.is_empty()
             && last_tap_wall.map_or(false, |t| t.elapsed().as_secs_f64() < 2.0);
@@ -714,28 +724,32 @@ fn tui_loop(
                     let adjusted = (bpm - base_bpm).abs() >= 0.05;
 
                     // --- Left group ---
-                    let mut left_spans: Vec<Span<'static>> = vec![
-                        Span::styled(format!("{play_icon}  "), dim),
-                    ];
-                    if adjusted {
-                        left_spans.push(Span::styled(format!("{:.2} ", base_bpm), dim));
-                        left_spans.push(Span::styled("(", dim));
-                        left_spans.push(Span::styled(format!("{:.2}", bpm), beat_style));
-                        left_spans.push(Span::styled(")", dim));
+                    let mut left_spans: Vec<Span<'static>> = if calibration_mode {
+                        vec![Span::styled(
+                            format!("lat:{}ms  d/c adjust  ~ exit", audio_latency_ms), dim)]
                     } else {
-                        left_spans.push(Span::styled(format!("{:.2}", base_bpm), beat_style));
-                    }
-                    left_spans.push(Span::styled(format!("  {:+}ms", offset_ms), dim));
-                    if !tap_str.is_empty() {
-                        left_spans.push(Span::styled(tap_str.clone(), dim));
-                    }
-                    if calibration_mode {
-                        left_spans.push(Span::styled(
-                            format!("  lat:{}ms  ~ to exit", audio_latency_ms), dim));
-                    }
+                        let mut spans = vec![Span::styled(format!("{play_icon}  "), dim)];
+                        if adjusted {
+                            spans.push(Span::styled(format!("{:.2} ", base_bpm), dim));
+                            spans.push(Span::styled("(", dim));
+                            spans.push(Span::styled(format!("{:.2}", bpm), beat_style));
+                            spans.push(Span::styled(")", dim));
+                        } else {
+                            spans.push(Span::styled(format!("{:.2}", base_bpm), beat_style));
+                        }
+                        if metronome_mode {
+                            spans.push(Span::styled("\u{266A}", Style::default().fg(Color::Red)));
+                        }
+                        spans.push(Span::styled(format!("  {:+}ms", offset_ms), dim));
+                        if !tap_str.is_empty() {
+                            spans.push(Span::styled(tap_str.clone(), dim));
+                        }
+                        spans
+                    };
 
                     // --- Right group ---
                     let mut right_spans: Vec<Span<'static>> = Vec::new();
+                    if !calibration_mode {
                     if !nudge_str.is_empty() {
                         right_spans.push(Span::styled(nudge_str.to_string(), dim));
                     }
@@ -746,9 +760,9 @@ fn tui_loop(
                     let bracket_style = Style::default().fg(Color::Rgb(140, 140, 140));
                     right_spans.push(Span::styled(format!("  zoom:{zoom_secs}s  level:"), dim));
                     right_spans.push(Span::styled("\u{2595}", bracket_style));
-                    right_spans.push(Span::styled(level_char.to_string(), dim));
+                    right_spans.push(Span::styled(level_char.to_string(), Style::default().fg(Color::Rgb(120, 100, 0))));
                     right_spans.push(Span::styled("\u{258F}", bracket_style));
-                    if !calibration_mode {
+                    {
                         // Compute per-character filter shading: which chars are in the stopband.
                         // The 32 bins are log-spaced; cutoff_char is the first char fully in the stopband.
                         let stopband: Option<(bool, usize)> = if filter_offset != 0 {
@@ -784,6 +798,7 @@ fn tui_loop(
                         }
                         right_spans.push(Span::styled("\u{258F}".to_string(), dim));
                     }
+                    } // end !calibration_mode
 
                     // Spacer: fill gap between left and right groups.
                     let bar_w = chunks[0].width as usize;
@@ -900,12 +915,8 @@ fn tui_loop(
             let waveform_rows = dh.saturating_sub(2);
             detail_rows.store(waveform_rows, Ordering::Relaxed);
             let buf = Arc::clone(&*detail_braille_shared.lock().unwrap());
-            let centre_col = if calibration_mode {
-                dw / 2
-            } else {
-                ((dw as f64 * display_cfg.playhead_position as f64 / 100.0) as usize)
-                    .clamp(0, dw.saturating_sub(1))
-            };
+            let centre_col = ((dw as f64 * display_cfg.playhead_position as f64 / 100.0) as usize)
+                .clamp(0, dw.saturating_sub(1));
 
             // Compute the column offset into the buffer that places the playhead at centre_col.
             // Uses smooth_display_samp (wall-clock based) to avoid audio-buffer-burst jitter.
@@ -1018,12 +1029,11 @@ fn tui_loop(
                     (vec![], false)
                 };
 
-            // Latency position indicator: anchored to screen centre so it can travel
-            // equally in both directions. ±500ms maps to ±dw/4 columns (~25ms per column),
-            // so it doesn't jump on every 10ms step.
-            let latency_col = (dw as i64 / 2
-                + (audio_latency_ms as f64 / 500.0 * (dw as f64 / 4.0)).round() as i64)
-                .clamp(0, dw as i64 - 1) as usize;
+            // Latency position indicator: 0ms at playhead, 250ms at right edge.
+            let latency_col = (centre_col as f64
+                + audio_latency_ms as f64 / 250.0 * (dw - centre_col) as f64)
+                .round() as usize;
+            let latency_col = latency_col.min(dw.saturating_sub(1));
 
             let detail_lines: Vec<Line<'static>> = (0..dh)
                 .map(|r| {
@@ -1130,25 +1140,27 @@ fn tui_loop(
             if help_open {
                 const HELP: &str = "\
 Space+Z        play / pause
-Space+F/V      reset tempo to detected BPM
+Space+F/V      reset playback speed to 1×  (cancel f/v adjustment)
 1/2/3/4        beat jump forward 1/4/16/64 beats
 q/w/e/r        beat jump backward 1/4/16/64 beats
 c  /  d        nudge backward / forward (mode-dependent)
 C  /  D        toggle nudge mode: jump (10ms) / warp (±10% speed)
-+  /  -        beat phase offset ±10ms (or latency in calibration mode)
-~              toggle latency calibration mode
-z  /  Z        zoom out / in
++  /  _        beat phase offset ±10ms
+~              toggle latency calibration mode  (d/c adjust latency)
+-  /  =        zoom in / out
 {  /  }        detail height decrease / increase
 f  /  v        BPM +0.1 / -0.1
 b              tap in time to set BPM + phase
-t              re-run BPM detection
-↑  /  ↓        volume up / down (5% steps)
+'              toggle metronome
+j  /  m        level up / down
+Space+J        level 100%   Space+M  level 0%
 p              cycle spectral colour palette
 o              toggle waveform fill / outline
-Space+A        open file browser
+z              open file browser
+`              refresh terminal
 ?              toggle this help
 Esc            quit";
-                let popup_w = 48u16;
+                let popup_w = 75u16;
                 let popup_h = HELP.lines().count() as u16 + 2;
                 let px = area.x + area.width.saturating_sub(popup_w) / 2;
                 let py = area.y + area.height.saturating_sub(popup_h) / 2;
@@ -1238,40 +1250,52 @@ Esc            quit";
                     KeyEventKind::Press | KeyEventKind::Repeat
                         if keymap.get(&KeyBinding::Key(key.code)) == Some(&Action::NudgeBackward) =>
                     {
-                        match nudge_mode {
-                            NudgeMode::Jump => {
-                                let current = seek_handle.current_pos().as_secs_f64();
-                                let target = (current - 0.010).max(0.0);
-                                seek_handle.set_position(target);
-                                smooth_display_samp += (target - current) * sample_rate as f64;
-                                if player.is_paused() {
-                                    scrub_audio(mixer, &seek_handle.samples, seek_handle.channels as u16,
-                                                sample_rate, smooth_display_samp as usize, scrub_spc);
+                        if calibration_mode {
+                            audio_latency_ms = (audio_latency_ms - 10).max(0);
+                            cache.set_latency(audio_latency_ms);
+                            cache.save();
+                        } else {
+                            match nudge_mode {
+                                NudgeMode::Jump => {
+                                    let current = seek_handle.current_pos().as_secs_f64();
+                                    let target = (current - 0.010).max(0.0);
+                                    seek_handle.set_position(target);
+                                    smooth_display_samp += (target - current) * sample_rate as f64;
+                                    if player.is_paused() {
+                                        scrub_audio(mixer, &seek_handle.samples, seek_handle.channels as u16,
+                                                    sample_rate, smooth_display_samp as usize, scrub_spc);
+                                    }
                                 }
-                            }
-                            NudgeMode::Warp => {
-                                nudge = -1;
-                                player.set_speed(bpm / base_bpm * 0.9);
+                                NudgeMode::Warp => {
+                                    nudge = -1;
+                                    player.set_speed(bpm / base_bpm * 0.9);
+                                }
                             }
                         }
                     }
                     KeyEventKind::Press | KeyEventKind::Repeat
                         if keymap.get(&KeyBinding::Key(key.code)) == Some(&Action::NudgeForward) =>
                     {
-                        match nudge_mode {
-                            NudgeMode::Jump => {
-                                let current = seek_handle.current_pos().as_secs_f64();
-                                let target = (current + 0.010).min(total_duration.as_secs_f64());
-                                seek_handle.set_position(target);
-                                smooth_display_samp += (target - current) * sample_rate as f64;
-                                if player.is_paused() {
-                                    scrub_audio(mixer, &seek_handle.samples, seek_handle.channels as u16,
-                                                sample_rate, smooth_display_samp as usize, scrub_spc);
+                        if calibration_mode {
+                            audio_latency_ms = (audio_latency_ms + 10).min(250);
+                            cache.set_latency(audio_latency_ms);
+                            cache.save();
+                        } else {
+                            match nudge_mode {
+                                NudgeMode::Jump => {
+                                    let current = seek_handle.current_pos().as_secs_f64();
+                                    let target = (current + 0.010).min(total_duration.as_secs_f64());
+                                    seek_handle.set_position(target);
+                                    smooth_display_samp += (target - current) * sample_rate as f64;
+                                    if player.is_paused() {
+                                        scrub_audio(mixer, &seek_handle.samples, seek_handle.channels as u16,
+                                                    sample_rate, smooth_display_samp as usize, scrub_spc);
+                                    }
                                 }
-                            }
-                            NudgeMode::Warp => {
-                                nudge = 1;
-                                player.set_speed(bpm / base_bpm * 1.1);
+                                NudgeMode::Warp => {
+                                    nudge = 1;
+                                    player.set_speed(bpm / base_bpm * 1.1);
+                                }
                             }
                         }
                     }
@@ -1362,6 +1386,21 @@ Esc            quit";
                         volume = (volume - 0.05).max(0.0);
                         player.set_volume(volume);
                     }
+                    Some(Action::LevelMax) => {
+                        volume = 1.0;
+                        player.set_volume(volume);
+                    }
+                    Some(Action::LevelMin) => {
+                        volume = 0.0;
+                        player.set_volume(volume);
+                    }
+                    Some(Action::TerminalRefresh) => {
+                        let _ = terminal.clear();
+                    }
+                    Some(Action::MetronomeToggle) => {
+                        metronome_mode = !metronome_mode;
+                        if !metronome_mode { last_metro_beat = None; }
+                    }
                     Some(Action::Help) => { help_open = true; }
                     Some(Action::CalibrationToggle) => {
                         if calibration_mode {
@@ -1371,7 +1410,7 @@ Esc            quit";
                             cache.save();
                         } else if player.is_paused() {
                             // Snap to nearest 10ms so +/- steps always land on multiples of 10.
-                            audio_latency_ms = (audio_latency_ms as f64 / 10.0).round() as i64 * 10;
+                            audio_latency_ms = ((audio_latency_ms as f64 / 10.0).round() as i64 * 10).clamp(0, 250);
                             calibration_mode = true;
                         }
                     }
@@ -1394,24 +1433,9 @@ Esc            quit";
                     Some(Action::PaletteCycle) => {
                         palette_idx = (palette_idx + 1) % SPECTRAL_PALETTES.len();
                     }
-                    Some(Action::OffsetIncrease) => {
-                        if calibration_mode {
-                            audio_latency_ms = (audio_latency_ms + 10 + 500).rem_euclid(1000) - 500;
-                            cache.set_latency(audio_latency_ms);
-                            cache.save();
-                        } else {
-                            offset_ms += 10;
-                        }
-                    }
-                    Some(Action::OffsetDecrease) => {
-                        if calibration_mode {
-                            audio_latency_ms = (audio_latency_ms - 10 + 500).rem_euclid(1000) - 500;
-                            cache.set_latency(audio_latency_ms);
-                            cache.save();
-                        } else {
-                            offset_ms -= 10;
-                        }
-                    }
+                    Some(Action::OffsetIncrease) => { offset_ms += 10; }
+                    Some(Action::OffsetDecrease) => { offset_ms -= 10; }
+
                     Some(Action::ZoomOut) => {
                         if zoom_idx > 0 { zoom_idx -= 1; }
                     }
@@ -1452,29 +1476,6 @@ Esc            quit";
                                 cache.set(hash.clone(), CacheEntry { bpm: base_bpm, offset_ms, ..entry });
                                 cache.save();
                             }
-                        }
-                    }
-                    Some(Action::BpmRedetect) => {
-                        if let Some(ref hash) = analysis_hash {
-                            let hash = hash.clone();
-                            detect_mode = (detect_mode + 1) % DETECT_MODES.len();
-                            let config = match detect_mode {
-                                1 => AnalysisConfig { enable_bpm_fusion: true, ..AnalysisConfig::default() },
-                                2 => AnalysisConfig { force_legacy_bpm: true, ..AnalysisConfig::default() },
-                                _ => AnalysisConfig::default(),
-                            };
-                            let mono_bg = Arc::clone(mono);
-                            let offset_snap = offset_ms;
-                            let (tx, rx) = mpsc::channel::<(String, f32, i64)>();
-                            thread::spawn(move || {
-                                if let Ok(result) = analyze_audio(&mono_bg, sample_rate, config) {
-                                    let _ = tx.send((hash, result.bpm.round(), offset_snap));
-                                }
-                            });
-                            bpm_rx = rx;
-                            analysis_hash = None;
-                            tap_guided_rx = false;
-                            tap_offset_pending = None;
                         }
                     }
                     Some(Action::JumpForward1)  => do_jump(&seek_handle, &player, bpm, total_duration,  1),
@@ -1585,12 +1586,14 @@ enum Action {
     OffsetIncrease, OffsetDecrease,
     ZoomIn, ZoomOut,
     HeightIncrease, HeightDecrease,
-    LevelUp, LevelDown,
+    LevelUp, LevelDown, LevelMax, LevelMin,
     BpmIncrease, BpmDecrease, BaseBpmIncrease, BaseBpmDecrease,
-    BpmRedetect, BpmTap,
+    BpmTap,
     PaletteCycle, OpenBrowser, Help, WaveformStyle, TempoReset,
     CalibrationToggle,
     FilterIncrease, FilterDecrease, FilterReset,
+    TerminalRefresh,
+    MetronomeToggle,
 }
 
 static ACTION_NAMES: &[(&str, Action)] = &[
@@ -1615,11 +1618,14 @@ static ACTION_NAMES: &[(&str, Action)] = &[
     ("height_decrease",  Action::HeightDecrease),
     ("level_up",         Action::LevelUp),
     ("level_down",       Action::LevelDown),
+    ("level_max",        Action::LevelMax),
+    ("level_min",        Action::LevelMin),
     ("bpm_increase",      Action::BpmIncrease),
     ("bpm_decrease",      Action::BpmDecrease),
     ("base_bpm_increase", Action::BaseBpmIncrease),
     ("base_bpm_decrease", Action::BaseBpmDecrease),
-    ("bpm_redetect",     Action::BpmRedetect),
+    ("terminal_refresh",  Action::TerminalRefresh),
+    ("metronome_toggle", Action::MetronomeToggle),
     ("bpm_tap",          Action::BpmTap),
     ("palette_cycle",    Action::PaletteCycle),
     ("open_browser",     Action::OpenBrowser),
@@ -1704,7 +1710,8 @@ fn resolve_config() -> String {
 
 fn load_config() -> (std::collections::HashMap<KeyBinding, Action>, DisplayConfig) {
     let text = resolve_config();
-    let mut map = std::collections::HashMap::new();
+    // Seed with defaults so any keys absent from the user config still work.
+    let mut map = parse_keymap(DEFAULT_CONFIG, &mut std::collections::HashMap::new());
     let keymap = parse_keymap(&text, &mut map);
     let display = parse_display_config(&text);
     (keymap, display)
@@ -2752,6 +2759,7 @@ fn run_browser(
                         }
                     }
                     KeyCode::Char('q') => return Ok((BrowserResult::Quit, state.cwd)),
+                    KeyCode::Char('z') => return Ok((BrowserResult::ReturnToPlayer, state.cwd)),
                     KeyCode::Esc => return Ok((BrowserResult::ReturnToPlayer, state.cwd)),
                     _ => {}
                 }
