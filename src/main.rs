@@ -331,7 +331,10 @@ fn tui_loop(
 
     // Spectrum analyser state.
     let mut spectrum_chars: [char; 8] = ['\u{2800}'; 8];
+    let mut spectrum_bg: [bool; 8] = [false; 8];
+    let mut spectrum_bg_accum: [bool; 8] = [false; 8];
     let mut last_spectrum_update: Option<Instant> = None;
+    let mut last_bg_update: Option<Instant> = None;
 
     // Shared state for the background detail-braille thread.
     let detail_cols = Arc::new(AtomicUsize::new(0));
@@ -609,17 +612,31 @@ fn tui_loop(
         }
         was_tap_active = tap_active_now;
 
-        // Spectrum analyser: recompute every half beat period (500ms fallback during analysis).
+        // Spectrum analyser: chars every half beat, background glow every bar (4 beats).
         if !calibration_mode {
             let half_period = if analysing {
                 Duration::from_millis(500)
             } else {
                 beat_period / 2
             };
-            let due = last_spectrum_update.map_or(true, |t| t.elapsed() >= half_period);
-            if due {
-                spectrum_chars = compute_spectrum(mono, display_pos_samp, sample_rate, filter_offset);
-                last_spectrum_update = Some(Instant::now());
+            let bar_period = beat_period * 8;
+            let chars_due = last_spectrum_update.map_or(true, |t| t.elapsed() >= half_period);
+            let bg_due = last_bg_update.map_or(true, |t| t.elapsed() >= bar_period);
+            if chars_due || bg_due {
+                let (new_chars, new_bg) = compute_spectrum(mono, display_pos_samp, sample_rate, filter_offset);
+                if chars_due {
+                    spectrum_chars = new_chars;
+                    // Accumulate bg activity; background reflects running accum so it lights
+                    // up immediately and can only go dark when the window resets.
+                    for i in 0..8 { spectrum_bg_accum[i] |= new_bg[i]; }
+                    spectrum_bg = spectrum_bg_accum;
+                    last_spectrum_update = Some(Instant::now());
+                }
+                if bg_due {
+                    // Reset accumulator for the next 2-bar window.
+                    spectrum_bg_accum = [false; 8];
+                    last_bg_update = Some(Instant::now());
+                }
             }
         }
 
@@ -693,28 +710,38 @@ fn tui_loop(
                         dim
                     };
                     let adjusted = (bpm - base_bpm).abs() >= 0.05;
-                    let mut info_spans = vec![
+
+                    // --- Left group ---
+                    let mut left_spans: Vec<Span<'static>> = vec![
                         Span::styled(format!("{play_icon}  "), dim),
                     ];
                     if adjusted {
-                        info_spans.push(Span::styled(format!("{:.2} ", base_bpm), dim));
-                        info_spans.push(Span::styled("(", dim));
-                        info_spans.push(Span::styled(format!("{:.2}", bpm), beat_style));
-                        info_spans.push(Span::styled(")", dim));
+                        left_spans.push(Span::styled(format!("{:.2} ", base_bpm), dim));
+                        left_spans.push(Span::styled("(", dim));
+                        left_spans.push(Span::styled(format!("{:.2}", bpm), beat_style));
+                        left_spans.push(Span::styled(")", dim));
                     } else {
-                        info_spans.push(Span::styled(format!("{:.2}", base_bpm), beat_style));
+                        left_spans.push(Span::styled(format!("{:.2}", base_bpm), beat_style));
                     }
-                    let lat_str = if calibration_mode {
-                        format!("  lat:{}ms  ~ to exit", audio_latency_ms)
-                    } else {
-                        String::new()
-                    };
-                    info_spans.push(Span::styled(
-                        format!("  {:+}ms  {}s  vol:{}%{}  nudge:{}{}  {}  [?]{}",
-                            offset_ms, zoom_secs,
-                            (volume * 100.0).round() as u32, nudge_str,
-                            mode_str, tap_str,
-                            SPECTRAL_PALETTES[palette_idx].0, lat_str),
+                    left_spans.push(Span::styled(format!("  {:+}ms", offset_ms), dim));
+                    if !tap_str.is_empty() {
+                        left_spans.push(Span::styled(tap_str.clone(), dim));
+                    }
+                    if calibration_mode {
+                        left_spans.push(Span::styled(
+                            format!("  lat:{}ms  ~ to exit", audio_latency_ms), dim));
+                    }
+
+                    // --- Right group ---
+                    let mut right_spans: Vec<Span<'static>> = Vec::new();
+                    if !nudge_str.is_empty() {
+                        right_spans.push(Span::styled(nudge_str.to_string(), dim));
+                    }
+                    right_spans.push(Span::styled(
+                        format!("  nudge:{}", mode_str), dim));
+                    right_spans.push(Span::styled(
+                        format!("  zoom:{zoom_secs}s  level:{}%",
+                            (volume * 100.0).round() as u32),
                         dim,
                     ));
                     if !calibration_mode {
@@ -724,16 +751,31 @@ fn tui_loop(
                             } else {
                                 format!("  hpf:{}", filter_offset)
                             };
-                            info_spans.push(Span::styled(filter_str, Style::default().fg(Color::Cyan)));
+                            right_spans.push(Span::styled(filter_str, Style::default().fg(Color::Cyan)));
                         }
-                        let spec_str: String = spectrum_chars.iter().collect();
-                        info_spans.push(Span::styled("  \u{2595}".to_string(), dim)); // ▕ left bound
-                        info_spans.push(Span::styled(
-                            spec_str,
-                            Style::default().fg(Color::Green),
-                        ));
-                        info_spans.push(Span::styled("\u{258F}".to_string(), dim)); // ▏ right bound
+                        right_spans.push(Span::styled("  \u{2595}".to_string(), dim));
+                        for i in 0..8 {
+                            let ch = spectrum_chars[i].to_string();
+                            let style = if ch != "\u{2800}" {
+                                Style::default().fg(Color::Yellow).bg(Color::Rgb(40, 33, 0))
+                            } else if spectrum_bg[i] {
+                                Style::default().bg(Color::Rgb(40, 33, 0))
+                            } else {
+                                Style::default()
+                            };
+                            right_spans.push(Span::styled(ch, style));
+                        }
+                        right_spans.push(Span::styled("\u{258F}".to_string(), dim));
                     }
+
+                    // Spacer: fill gap between left and right groups.
+                    let bar_w = chunks[0].width as usize;
+                    let left_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+                    let right_w: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
+                    let spacer_w = bar_w.saturating_sub(left_w + right_w).max(1);
+                    let mut info_spans = left_spans;
+                    info_spans.push(Span::raw(" ".repeat(spacer_w)));
+                    info_spans.extend(right_spans);
                     Line::from(info_spans)
                 };
                 frame.render_widget(Paragraph::new(info_line), chunks[0]);
@@ -1296,11 +1338,11 @@ Esc            quit";
                     Some(Action::PlayPause) => {
                         if player.is_paused() { player.play(); } else { player.pause(); }
                     }
-                    Some(Action::VolumeUp) => {
+                    Some(Action::LevelUp) => {
                         volume = (volume + 0.05).min(1.0);
                         player.set_volume(volume);
                     }
-                    Some(Action::VolumeDown) => {
+                    Some(Action::LevelDown) => {
                         volume = (volume - 0.05).max(0.0);
                         player.set_volume(volume);
                     }
@@ -1486,10 +1528,12 @@ Esc            quit";
             }
         }
 
-        if player.empty() && !player.is_paused() {
+        let total_mono_samps = seek_handle.samples.len() / seek_handle.channels as usize;
+        let at_end = seek_handle.position.load(Ordering::Relaxed) >= seek_handle.samples.len();
+        if at_end && !player.is_paused() {
             player.pause();
-            let total_mono_samps = seek_handle.samples.len() / seek_handle.channels as usize;
-            smooth_display_samp = total_mono_samps as f64;
+            seek_handle.seek_direct(0.0);
+            smooth_display_samp = 0.0;
         }
     }
 }
@@ -1546,7 +1590,7 @@ enum Action {
     OffsetIncrease, OffsetDecrease,
     ZoomIn, ZoomOut,
     HeightIncrease, HeightDecrease,
-    VolumeUp, VolumeDown,
+    LevelUp, LevelDown,
     BpmHalve, BpmDouble, BpmIncrease, BpmDecrease, BaseBpmIncrease, BaseBpmDecrease,
     BpmRedetect, BpmTap,
     PaletteCycle, OpenBrowser, Help, WaveformStyle, TempoReset,
@@ -1574,8 +1618,8 @@ static ACTION_NAMES: &[(&str, Action)] = &[
     ("zoom_out",         Action::ZoomOut),
     ("height_increase",  Action::HeightIncrease),
     ("height_decrease",  Action::HeightDecrease),
-    ("volume_up",        Action::VolumeUp),
-    ("volume_down",      Action::VolumeDown),
+    ("level_up",         Action::LevelUp),
+    ("level_down",       Action::LevelDown),
     ("bpm_halve",        Action::BpmHalve),
     ("bpm_double",       Action::BpmDouble),
     ("bpm_increase",      Action::BpmIncrease),
@@ -1807,7 +1851,7 @@ fn play_click_tone(mixer: &rodio::mixer::Mixer, sample_rate: u32) {
 
 /// Compute 8 braille spectrum characters from mono samples at `pos`.
 /// Uses the Goertzel algorithm on 16 log-spaced bins, 20 Hz – 20 kHz.
-fn compute_spectrum(mono: &[f32], pos: usize, sample_rate: u32, filter_offset: i32) -> [char; 8] {
+fn compute_spectrum(mono: &[f32], pos: usize, sample_rate: u32, filter_offset: i32) -> ([char; 8], [bool; 8]) {
     const N: usize = 4096;
     const LEFT_MASKS:  [u8; 5] = [0x00, 0x40, 0x44, 0x46, 0x47];
     const RIGHT_MASKS: [u8; 5] = [0x00, 0x80, 0xA0, 0xB0, 0xB8];
@@ -1841,6 +1885,7 @@ fn compute_spectrum(mono: &[f32], pos: usize, sample_rate: u32, filter_offset: i
 
     let sr = sample_rate as f64;
     let mut heights = [0usize; 16];
+    let mut raw_heights = [0.0f32; 16];
 
     for (k, &f) in freqs.iter().enumerate() {
         let coeff = 2.0 * (2.0 * std::f64::consts::PI * f / sr).cos();
@@ -1863,14 +1908,22 @@ fn compute_spectrum(mono: &[f32], pos: usize, sample_rate: u32, filter_offset: i
         // making treble bins as visible as bass bins with equal perceptual loudness.
         // 20 Hz → 0 dB boost; 20 kHz → +30 dB boost (~10 octaves × 3 dB).
         let tilt_db = (f / 20.0).log2() * 3.0;
-        heights[k] = ((db + tilt_db - 10.0) / 12.5).round().clamp(0.0, 4.0) as usize;
+        let raw = (db + tilt_db - 10.0) / 12.5;
+        heights[k] = raw.round().clamp(0.0, 4.0) as usize;
+        raw_heights[k] = raw as f32;
     }
 
-    std::array::from_fn(|c| {
+    // Background active when raw energy exceeds 1/4 of the single-dot threshold (0.5).
+    const BG_THRESH: f32 = 0.5 / 4.0;
+    let chars = std::array::from_fn(|c| {
         let l = heights[c * 2];
         let r = heights[c * 2 + 1];
         char::from_u32(0x2800 | LEFT_MASKS[l] as u32 | RIGHT_MASKS[r] as u32).unwrap_or(' ')
-    })
+    });
+    let has_bg = std::array::from_fn(|c| {
+        raw_heights[c * 2] > BG_THRESH || raw_heights[c * 2 + 1] > BG_THRESH
+    });
+    (chars, has_bg)
 }
 
 /// Beat-jump helper. Positive `beats` = forward, negative = backward.
@@ -2084,9 +2137,10 @@ impl Iterator for TrackingSource {
             self.fade_remaining.fetch_sub(1, Ordering::Relaxed);
             Some(raw * t)
         } else {
-            // Normal playback.
+            // Normal playback. Return silence past end so the source stays alive in the
+            // player queue — allows seeking and replaying after end-of-track.
             let pos = self.position.fetch_add(1, Ordering::Relaxed);
-            self.samples.get(pos).copied()
+            Some(self.samples.get(pos).copied().unwrap_or(0.0))
         }
     }
 }

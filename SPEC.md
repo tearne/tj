@@ -34,7 +34,7 @@ tj [path]
 | `Left` / `Right` | Seek backward / forward (small increment, e.g. 5s) |
 | `1` / `2` / `3` / `4` | Beat jump forward 1 / 4 / 16 / 64 beats |
 | `q` / `w` / `e` / `r` | Beat jump backward 1 / 4 / 16 / 64 beats |
-| `↑` / `↓` | Volume up / down (5% steps) |
+| `↑` / `↓` | Level up / down (5% steps) |
 | `c` / `d` | Nudge backward / forward (mode-dependent) |
 | `C` / `D` | Toggle nudge mode: `jump` (10ms seek) / `warp` (±10% speed) |
 | `z` / `Z` | Zoom out / in |
@@ -64,7 +64,7 @@ tj [path]
 
 ### Playback
 - Supports audio formats: FLAC, MP3, OGG Vorbis, WAV, AAC, OPUS.
-- When playback reaches the end of the track, the transport pauses and the playhead remains at the end position. The player view stays open and fully interactive.
+- When playback reaches the end of the track, the transport pauses and the playhead returns to the start. The player view stays open and fully interactive.
 - Decode runs on a background thread. A loading screen displays a progress bar showing decode progress.
 - Playback begins as soon as decode completes, before BPM analysis is finished.
 - Displays track metadata: title, artist, album, duration, current position.
@@ -86,7 +86,10 @@ tj [path]
 - On quit, the current phase offset is persisted to the cache.
 
 ### Info Bar
-- A single line at the top of the player view displays: play/pause icon (`▶`/`⏸`), BPM, phase offset, zoom level, and a `[?]` help hint. The bar wraps naturally if the terminal is too narrow.
+- A single line at the top of the player view. Content is split into two groups separated by a variable-width spacer that fills remaining width, keeping the right group pinned to the right edge regardless of transient field changes:
+  - **Left group**: play/pause icon (`▶`/`⏸`), BPM, phase offset. Tap count (`tap:N`) appended transiently while a tap session is active. Calibration text (`lat:Nms  ~ to exit`) appended in calibration mode.
+  - **Right group**: nudge mode (`nudge:jump` / `nudge:warp`, fixed width), zoom indicator (`zoom:Ns`), level (`level:N%`), filter indicator (`lpf:N` / `hpf:N`, transient), spectrum strip.
+- The nudge mode field is always present and fixed-width so toggling between `jump` and `warp` does not shift anything to its right.
 - When no tempo adjustment is active, the detected BPM is shown to two decimal places (e.g. `120.00`) and receives a soft amber beat-flash. When a `f`/`v` adjustment is active, the detected BPM is shown plain and the adjusted tempo is shown alongside in parentheses (e.g. `120.00 (124.40)`), with only the adjusted number receiving the beat-flash.
 - `F` increases `base_bpm` by 0.01; `V` decreases it by 0.01. Both clamp to 40.0–240.0. Adjusting `base_bpm` resets any active `f`/`v` playback offset (`bpm` is set equal to the new `base_bpm`, speed returns to 1×) and is persisted to the cache immediately.
 - Pressing `?` opens a modal key binding reference overlay; any key dismisses it.
@@ -145,7 +148,7 @@ The render frame period adapts to the current zoom level and detail panel width,
 
 ### Spectrum Analyser
 - A compact spectrum analyser strip is displayed in the info bar, always active while a track is loaded. It is hidden during calibration mode.
-- The strip is 8 braille characters wide (16 frequency bins) and 1 braille row tall (4 dot rows). Each character encodes two adjacent bins as a bottom-up bar chart. Thin `▕` / `▏` block characters flank the strip as bounds indicators. The bars are rendered in green.
+- The strip is 8 braille characters wide (16 frequency bins) and 1 braille row tall (4 dot rows). Each character encodes two adjacent bins as a bottom-up bar chart. Thin `▕` / `▏` block characters flank the strip as bounds indicators. The bars are rendered in amber (yellow foreground on a dark amber background). When sub-threshold activity is detected in a bin (energy exceeds ¼ of the single-dot threshold), the character cell background is lit even if no dots are drawn, giving a background glow effect. The glow resets on a 2-bar accumulation window: it lights on any activity within the window and can only go dark at window boundaries.
 - Bins are logarithmically spaced from 20 Hz to 20 kHz. Amplitude is mapped on a dB scale (floor ~10 dB, ceiling ~60 dB, ~12.5 dB per dot row) using the Goertzel algorithm over a 4096-sample Hann-windowed window at the current playback position.
 - The spectrum updates twice per beat period (every half beat). During BPM analysis the update interval falls back to 500 ms. The display holds its last value between updates.
 
@@ -166,8 +169,8 @@ The render frame period adapts to the current zoom level and detail panel width,
 - `audio_latency_ms` is stored as a single global value in the cache (alongside per-track entries). It is loaded on startup and saved on each change and on quit.
 - The `[?]` help overlay lists `~` as the calibration key.
 
-### Volume Control
-- The playback volume is adjustable at runtime using `↑` (increase) and `↓` (decrease) in 5% steps, from 0% to 100%. The current volume is displayed in the info bar. Changes take effect immediately without interrupting playback. Volume is not persisted between sessions.
+### Level Control
+- The playback level is adjustable at runtime using `↑` (increase) and `↓` (decrease) in 5% steps, from 0% to 100%. The current level is displayed in the info bar as `level:N%`. Changes take effect immediately without interrupting playback. Level is not persisted between sessions.
 
 ### Nudge
 - `c`/`d` nudge the transport backward/forward. Behaviour depends on the active nudge mode, toggled with `C`/`D`:
