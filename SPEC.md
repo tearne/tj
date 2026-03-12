@@ -88,7 +88,7 @@ tj [path]
 ### Info Bar
 - A single line at the top of the player view. Content is split into two groups separated by a variable-width spacer that fills remaining width, keeping the right group pinned to the right edge regardless of transient field changes:
   - **Left group**: play/pause icon (`▶`/`⏸`), BPM, phase offset. Tap count (`tap:N`) appended transiently while a tap session is active. Calibration text (`lat:Nms  ~ to exit`) appended in calibration mode.
-  - **Right group**: nudge mode (`nudge:jump` / `nudge:warp`, fixed width), zoom indicator (`zoom:Ns`), level (`level:N%`), filter indicator (`lpf:N` / `hpf:N`, transient), spectrum strip.
+  - **Right group**: nudge mode (`nudge:jump` / `nudge:warp`, fixed width), zoom indicator (`zoom:Ns`), level (`level:▕N▏` — single eighth-block character in a bracketed indicator), spectrum strip.
 - The nudge mode field is always present and fixed-width so toggling between `jump` and `warp` does not shift anything to its right.
 - When no tempo adjustment is active, the detected BPM is shown to two decimal places (e.g. `120.00`) and receives a soft amber beat-flash. When a `f`/`v` adjustment is active, the detected BPM is shown plain and the adjusted tempo is shown alongside in parentheses (e.g. `120.00 (124.40)`), with only the adjusted number receiving the beat-flash.
 - `F` increases `base_bpm` by 0.01; `V` decreases it by 0.01. Both clamp to 40.0–240.0. Adjusting `base_bpm` resets any active `f`/`v` playback offset (`bpm` is set equal to the new `base_bpm`, speed returns to 1×) and is persisted to the cache immediately.
@@ -135,20 +135,21 @@ The render frame period adapts to the current zoom level and detail panel width,
 - A left mouse click anywhere on the Overview waveform seeks the transport to the start of the nearest bar marker at or to the left of the click position. Playback state is preserved — if playing, playback continues from the new position; if paused, the transport remains paused. The Detail view recentres on the new position immediately.
 
 ### HPF / LPF Filter
-- A single `filter_offset` parameter (range −10 to +10, default 0) controls a real-time second-order Butterworth IIR filter on the playback output:
+- A single `filter_offset` parameter (range −16 to +16, default 0) controls a real-time second-order Butterworth IIR filter on the playback output:
   - `0` — flat (filter bypassed).
-  - `−1` to `−10` — low-pass filter; more negative = lower cutoff frequency.
-  - `+1` to `+10` — high-pass filter; more positive = higher cutoff frequency.
-- `[` decreases `filter_offset` by 1 (clamped at −10); `]` increases it by 1 (clamped at +10).
+  - `−1` to `−16` — low-pass filter; more negative = lower cutoff frequency.
+  - `+1` to `+16` — high-pass filter; more positive = higher cutoff frequency.
+- `[` decreases `filter_offset` by 1 (clamped at −16); `]` increases it by 1 (clamped at +16).
 - `Space+[` or `Space+]` snaps `filter_offset` to 0 (flat) immediately.
-- Cutoff frequencies are logarithmically spaced from ~40 Hz to ~18 kHz across the ±1–±10 range.
-- The info bar shows `lpf:N` or `hpf:N` (in cyan) when the filter is active.
+- Cutoff frequencies are logarithmically spaced from ~40 Hz to ~18 kHz across the ±1–±16 range. Each step corresponds to exactly one character of the spectrum strip.
+- Filter state is visible in the spectrum strip (grey shading on attenuated bins) and not shown as separate text.
 - The spectrum analyser reflects the filtered output.
 - Filter state is not persisted between sessions; it always initialises to flat.
 
 ### Spectrum Analyser
 - A compact spectrum analyser strip is displayed in the info bar, always active while a track is loaded. It is hidden during calibration mode.
-- The strip is 8 braille characters wide (16 frequency bins) and 1 braille row tall (4 dot rows). Each character encodes two adjacent bins as a bottom-up bar chart. Thin `▕` / `▏` block characters flank the strip as bounds indicators. The bars are rendered in amber (yellow foreground on a dark amber background). When sub-threshold activity is detected in a bin (energy exceeds ¼ of the single-dot threshold), the character cell background is lit even if no dots are drawn, giving a background glow effect. The glow resets on a 2-bar accumulation window: it lights on any activity within the window and can only go dark at window boundaries.
+- The strip is 16 braille characters wide (32 frequency bins) and 1 braille row tall (4 dot rows). Each character encodes two adjacent bins as a bottom-up bar chart. Thin `▕` / `▏` block characters flank the strip as bounds indicators. The bars are rendered in amber (yellow foreground on a dark amber background). When sub-threshold activity is detected in a bin (energy exceeds ¼ of the single-dot threshold), the character cell background is lit even if no dots are drawn, giving a background glow effect. The glow resets on a 2-bar accumulation window: it lights on any activity within the window and can only go dark at window boundaries.
+- When a filter is active, the attenuated region of the spectrum is shaded with a grey background: LPF shades from the right, HPF from the left. Each of the 16 filter steps corresponds to exactly one spectrum character. At flat (offset 0) no shading is applied.
 - Bins are logarithmically spaced from 20 Hz to 20 kHz. Amplitude is mapped on a dB scale (floor ~10 dB, ceiling ~60 dB, ~12.5 dB per dot row) using the Goertzel algorithm over a 4096-sample Hann-windowed window at the current playback position.
 - The spectrum updates twice per beat period (every half beat). During BPM analysis the update interval falls back to 500 ms. The display holds its last value between updates.
 

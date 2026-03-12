@@ -330,9 +330,9 @@ fn tui_loop(
     let mut filter_offset: i32 = 0;
 
     // Spectrum analyser state.
-    let mut spectrum_chars: [char; 8] = ['\u{2800}'; 8];
-    let mut spectrum_bg: [bool; 8] = [false; 8];
-    let mut spectrum_bg_accum: [bool; 8] = [false; 8];
+    let mut spectrum_chars: [char; 16] = ['\u{2800}'; 16];
+    let mut spectrum_bg: [bool; 16] = [false; 16];
+    let mut spectrum_bg_accum: [bool; 16] = [false; 16];
     let mut last_spectrum_update: Option<Instant> = None;
     let mut last_bg_update: Option<Instant> = None;
 
@@ -628,13 +628,13 @@ fn tui_loop(
                     spectrum_chars = new_chars;
                     // Accumulate bg activity; background reflects running accum so it lights
                     // up immediately and can only go dark when the window resets.
-                    for i in 0..8 { spectrum_bg_accum[i] |= new_bg[i]; }
+                    for i in 0..16 { spectrum_bg_accum[i] |= new_bg[i]; }
                     spectrum_bg = spectrum_bg_accum;
                     last_spectrum_update = Some(Instant::now());
                 }
                 if bg_due {
                     // Reset accumulator for the next 2-bar window.
-                    spectrum_bg_accum = [false; 8];
+                    spectrum_bg_accum = [false; 16];
                     last_bg_update = Some(Instant::now());
                 }
             }
@@ -739,24 +739,38 @@ fn tui_loop(
                     }
                     right_spans.push(Span::styled(
                         format!("  nudge:{}", mode_str), dim));
+                    const LEVEL_BARS: [char; 8] = ['▁','▂','▃','▄','▅','▆','▇','█'];
+                    let level_char = LEVEL_BARS[((volume * 7.0).round() as usize).min(7)];
                     right_spans.push(Span::styled(
-                        format!("  zoom:{zoom_secs}s  level:{}%",
-                            (volume * 100.0).round() as u32),
+                        format!("  zoom:{zoom_secs}s  level:\u{2595}{level_char}\u{258F}"),
                         dim,
                     ));
                     if !calibration_mode {
-                        if filter_offset != 0 {
-                            let filter_str = if filter_offset < 0 {
-                                format!("  lpf:{}", -filter_offset)
-                            } else {
-                                format!("  hpf:{}", filter_offset)
-                            };
-                            right_spans.push(Span::styled(filter_str, Style::default().fg(Color::Cyan)));
-                        }
+                        // Compute per-character filter shading: which chars are in the stopband.
+                        // The 32 bins are log-spaced; cutoff_char is the first char fully in the stopband.
+                        let stopband: Option<(bool, usize)> = if filter_offset != 0 {
+                            let n = filter_offset.unsigned_abs() as usize; // 1..16
+                            let is_lpf = filter_offset < 0;
+                            // 1 step = 1 char: LPF shades from the right, HPF from the left.
+                            let cutoff_char = if is_lpf { 16 - n } else { n };
+                            Some((is_lpf, cutoff_char))
+                        } else {
+                            None
+                        };
+
                         right_spans.push(Span::styled("  \u{2595}".to_string(), dim));
-                        for i in 0..8 {
+                        for i in 0..16 {
                             let ch = spectrum_chars[i].to_string();
-                            let style = if ch != "\u{2800}" {
+                            let in_stopband = stopband.map_or(false, |(is_lpf, cutoff_char)| {
+                                if is_lpf { i >= cutoff_char } else { i < cutoff_char }
+                            });
+                            let style = if in_stopband {
+                                if ch != "\u{2800}" {
+                                    Style::default().fg(Color::Rgb(120, 100, 0)).bg(Color::Rgb(50, 50, 50))
+                                } else {
+                                    Style::default().bg(Color::Rgb(50, 50, 50))
+                                }
+                            } else if ch != "\u{2800}" {
                                 Style::default().fg(Color::Yellow).bg(Color::Rgb(40, 33, 0))
                             } else if spectrum_bg[i] {
                                 Style::default().bg(Color::Rgb(40, 33, 0))
@@ -1360,11 +1374,11 @@ Esc            quit";
                         }
                     }
                     Some(Action::FilterIncrease) => {
-                        filter_offset = (filter_offset + 1).min(10);
+                        filter_offset = (filter_offset + 1).min(16);
                         filter_offset_shared.store(filter_offset, Ordering::Relaxed);
                     }
                     Some(Action::FilterDecrease) => {
-                        filter_offset = (filter_offset - 1).max(-10);
+                        filter_offset = (filter_offset - 1).max(-16);
                         filter_offset_shared.store(filter_offset, Ordering::Relaxed);
                     }
                     Some(Action::FilterReset) => {
@@ -1849,16 +1863,16 @@ fn play_click_tone(mixer: &rodio::mixer::Mixer, sample_rate: u32) {
     mixer.add(src);
 }
 
-/// Compute 8 braille spectrum characters from mono samples at `pos`.
-/// Uses the Goertzel algorithm on 16 log-spaced bins, 20 Hz – 20 kHz.
-fn compute_spectrum(mono: &[f32], pos: usize, sample_rate: u32, filter_offset: i32) -> ([char; 8], [bool; 8]) {
+/// Compute 16 braille spectrum characters from mono samples at `pos`.
+/// Uses the Goertzel algorithm on 32 log-spaced bins, 20 Hz – 20 kHz.
+fn compute_spectrum(mono: &[f32], pos: usize, sample_rate: u32, filter_offset: i32) -> ([char; 16], [bool; 16]) {
     const N: usize = 4096;
     const LEFT_MASKS:  [u8; 5] = [0x00, 0x40, 0x44, 0x46, 0x47];
     const RIGHT_MASKS: [u8; 5] = [0x00, 0x80, 0xA0, 0xB0, 0xB8];
 
-    // 16 log-spaced centre frequencies: 20 Hz … 20 kHz.
-    let freqs: [f64; 16] = std::array::from_fn(|i| {
-        20.0 * (1000.0_f64).powf(i as f64 / 15.0)
+    // 32 log-spaced centre frequencies: 20 Hz … 20 kHz.
+    let freqs: [f64; 32] = std::array::from_fn(|i| {
+        20.0 * (1000.0_f64).powf(i as f64 / 31.0)
     });
 
     // Hann window coefficients.
@@ -1868,9 +1882,9 @@ fn compute_spectrum(mono: &[f32], pos: usize, sample_rate: u32, filter_offset: i
 
     // Pre-filter the window if a filter is active.
     let filtered: Vec<f32> = if filter_offset != 0 {
-        let idx = (filter_offset.unsigned_abs() as usize - 1).min(9);
+        let idx = (filter_offset.unsigned_abs() as usize - 1).min(15);
         let is_lpf = filter_offset < 0;
-        let fc = if is_lpf { FILTER_CUTOFFS_HZ[idx] } else { FILTER_CUTOFFS_HZ[9 - idx] };
+        let fc = if is_lpf { FILTER_CUTOFFS_HZ[idx] } else { FILTER_CUTOFFS_HZ[15 - idx] };
         let (b0, b1, b2, a1, a2) = butterworth_biquad(fc, sample_rate, is_lpf);
         let (mut x1, mut x2, mut y1, mut y2) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
         (0..N).map(|i| {
@@ -1884,8 +1898,8 @@ fn compute_spectrum(mono: &[f32], pos: usize, sample_rate: u32, filter_offset: i
     };
 
     let sr = sample_rate as f64;
-    let mut heights = [0usize; 16];
-    let mut raw_heights = [0.0f32; 16];
+    let mut heights = [0usize; 32];
+    let mut raw_heights = [0.0f32; 32];
 
     for (k, &f) in freqs.iter().enumerate() {
         let coeff = 2.0 * (2.0 * std::f64::consts::PI * f / sr).cos();
@@ -1915,12 +1929,12 @@ fn compute_spectrum(mono: &[f32], pos: usize, sample_rate: u32, filter_offset: i
 
     // Background active when raw energy exceeds 1/4 of the single-dot threshold (0.5).
     const BG_THRESH: f32 = 0.5 / 4.0;
-    let chars = std::array::from_fn(|c| {
+    let chars: [char; 16] = std::array::from_fn(|c| {
         let l = heights[c * 2];
         let r = heights[c * 2 + 1];
         char::from_u32(0x2800 | LEFT_MASKS[l] as u32 | RIGHT_MASKS[r] as u32).unwrap_or(' ')
     });
-    let has_bg = std::array::from_fn(|c| {
+    let has_bg: [bool; 16] = std::array::from_fn(|c| {
         raw_heights[c * 2] > BG_THRESH || raw_heights[c * 2 + 1] > BG_THRESH
     });
     (chars, has_bg)
@@ -2164,11 +2178,13 @@ impl Source for TrackingSource {
 // Filter source — second-order Butterworth IIR biquad (LPF or HPF)
 // ---------------------------------------------------------------------------
 
-/// Log-spaced cutoff frequencies for filter offsets ±1..±10.
-/// Index 0 = offset ±1 (near-flat), index 9 = offset ±10 (fully cut).
-const FILTER_CUTOFFS_HZ: [f64; 10] = [
-    18_000.0, 12_000.0, 8_000.0, 5_000.0, 3_000.0,
-     1_500.0,    700.0,   300.0,   100.0,    40.0,
+/// Log-spaced cutoff frequencies for filter offsets ±1..±16.
+/// Index 0 = offset ±1 (near-flat), index 15 = offset ±16 (fully cut).
+const FILTER_CUTOFFS_HZ: [f64; 16] = [
+    18_000.0, 12_000.0,  8_000.0, 5_300.0,
+     3_500.0,  2_350.0,  1_560.0, 1_040.0,
+       690.0,    460.0,    306.0,   204.0,
+       136.0,     90.0,     60.0,    40.0,
 ];
 
 /// Compute normalised Butterworth biquad coefficients for a LPF or HPF.
@@ -2229,12 +2245,12 @@ impl<S: Source<Item = f32>> FilterSource<S> {
 
     fn recompute_coefficients(&mut self, offset: i32) {
         if offset == 0 { return; }
-        let idx = (offset.unsigned_abs() as usize - 1).min(9);
+        let idx = (offset.unsigned_abs() as usize - 1).min(15);
         let is_lpf = offset < 0;
         let fc = if is_lpf {
             FILTER_CUTOFFS_HZ[idx]
         } else {
-            FILTER_CUTOFFS_HZ[9 - idx]
+            FILTER_CUTOFFS_HZ[15 - idx]
         };
         let (b0, b1, b2, a1, a2) = butterworth_biquad(fc, self.sample_rate, is_lpf);
         self.b0 = b0; self.b1 = b1; self.b2 = b2;
