@@ -39,7 +39,6 @@ tj [path]
 | `C` / `D` | Toggle nudge mode: `jump` (10ms seek) / `warp` (±10% speed) |
 | `z` / `Z` | Zoom out / in |
 | `{` / `}` | Detail height decrease / increase |
-| `h` / `H` | BPM ½ / ×2 |
 | `f` / `v` | BPM +0.1 / −0.1 |
 | `F` / `V` | Detected BPM +0.01 / −0.01 |
 | `t` | Re-run BPM detection |
@@ -77,7 +76,6 @@ tj [path]
 - A beat phase offset (in milliseconds) can be adjusted at runtime to align the beat indicator with the audio. The offset and BPM are displayed in the UI.
 - `offset_ms` is snapped to the nearest 10 ms boundary on load from the cache, ensuring `+`/`-` steps always land on multiples of 10 ms and 0 ms is always reachable.
 - The user can correct an inaccurate detection at runtime:
-  - `h` halves the BPM; `H` doubles it. Takes effect immediately.
   - `f` increases the effective BPM by 0.1; `v` decreases it by 0.1. Adjustments affect playback speed proportionally (relative to the detected BPM) and clamp to the range 40.0–240.0.
   - `t` re-runs detection cycling through modes: `auto` (default tempogram), `fusion` (tempogram + legacy in parallel), `legacy` (autocorrelation + comb filter). Non-blocking: returns immediately, shows the animated indicator while detection runs in the background.
   - `b` tap-detects BPM: press in time with the beat. After 8 taps a rolling median of inter-tap intervals sets `base_bpm` and derives `offset_ms` from the tap phase. Any active `f`/`v` speed ratio is preserved relative to the new `base_bpm`. The tap count is shown in the info bar (`tap:N`) while a session is active; tapping stops 2 seconds after the last tap. When the session ends, a background re-detection pass is triggered automatically: the full track is re-analysed using legacy autocorrelation with `bpm_resolution: 0.1`, with the search window narrowed to ±5% of the tapped BPM. This achieves sub-integer precision while using the tap to resolve octave ambiguity. If re-detection returns a result, `base_bpm` is updated to the analyser's value; the tap-derived `offset_ms` is preserved. If the tap session resets before re-detection completes, the in-flight result is discarded.

@@ -1139,7 +1139,6 @@ C  /  D        toggle nudge mode: jump (10ms) / warp (±10% speed)
 ~              toggle latency calibration mode
 z  /  Z        zoom out / in
 {  /  }        detail height decrease / increase
-h  /  H        BPM ½ / ×2
 f  /  v        BPM +0.1 / -0.1
 b              tap in time to set BPM + phase
 t              re-run BPM detection
@@ -1425,28 +1424,6 @@ Esc            quit";
                     Some(Action::HeightIncrease) => {
                         detail_height += 1;
                     }
-                    Some(Action::BpmHalve) => {
-                        bpm = (bpm * 0.5).max(40.0);
-                        base_bpm = bpm;
-                        player.set_speed(1.0);
-                        if let Some(ref hash) = analysis_hash {
-                            if let Some(entry) = cache.get(hash.as_str()).cloned() {
-                                cache.set(hash.clone(), CacheEntry { bpm, offset_ms, ..entry });
-                                cache.save();
-                            }
-                        }
-                    }
-                    Some(Action::BpmDouble) => {
-                        bpm = (bpm * 2.0).min(240.0);
-                        base_bpm = bpm;
-                        player.set_speed(1.0);
-                        if let Some(ref hash) = analysis_hash {
-                            if let Some(entry) = cache.get(hash.as_str()).cloned() {
-                                cache.set(hash.clone(), CacheEntry { bpm, offset_ms, ..entry });
-                                cache.save();
-                            }
-                        }
-                    }
                     Some(Action::BpmIncrease) => {
                         bpm = (bpm + 0.1).min(240.0);
                         player.set_speed(bpm / base_bpm);
@@ -1609,7 +1586,7 @@ enum Action {
     ZoomIn, ZoomOut,
     HeightIncrease, HeightDecrease,
     LevelUp, LevelDown,
-    BpmHalve, BpmDouble, BpmIncrease, BpmDecrease, BaseBpmIncrease, BaseBpmDecrease,
+    BpmIncrease, BpmDecrease, BaseBpmIncrease, BaseBpmDecrease,
     BpmRedetect, BpmTap,
     PaletteCycle, OpenBrowser, Help, WaveformStyle, TempoReset,
     CalibrationToggle,
@@ -1638,8 +1615,6 @@ static ACTION_NAMES: &[(&str, Action)] = &[
     ("height_decrease",  Action::HeightDecrease),
     ("level_up",         Action::LevelUp),
     ("level_down",       Action::LevelDown),
-    ("bpm_halve",        Action::BpmHalve),
-    ("bpm_double",       Action::BpmDouble),
     ("bpm_increase",      Action::BpmIncrease),
     ("bpm_decrease",      Action::BpmDecrease),
     ("base_bpm_increase", Action::BaseBpmIncrease),
