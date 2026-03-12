@@ -29,8 +29,8 @@ tj [path]
 | `Space+F` / `Space+V` | Reset tempo to detected BPM (speed → 1×) |
 | `+` / `-` | Adjust beat phase offset (10ms steps); adjusts `audio_latency_ms` in calibration mode |
 | `~` | Toggle latency calibration mode (only while paused) |
-| `[` / `]` | Filter sweep: `[` toward LPF (lower cutoff), `]` toward HPF (higher cutoff) |
-| `Space+[` / `Space+]` | Snap filter to flat (bypass) |
+| `,` / `.` | Filter sweep: `,` toward LPF (lower cutoff), `.` toward HPF (higher cutoff) |
+| `Space+,` / `Space+.` | Snap filter to flat (bypass) |
 | `Left` / `Right` | Seek backward / forward (small increment, e.g. 5s) |
 | `1` / `2` / `3` / `4` | Beat jump forward 1 / 4 / 16 / 64 beats |
 | `q` / `w` / `e` / `r` | Beat jump backward 1 / 4 / 16 / 64 beats |
@@ -75,6 +75,7 @@ tj [path]
 - When analysis completes, the BPM updates, beat markers appear, and beat jump uses the detected tempo.
 - The detected BPM is displayed to two decimal places.
 - A beat phase offset (in milliseconds) can be adjusted at runtime to align the beat indicator with the audio. The offset and BPM are displayed in the UI.
+- `offset_ms` is snapped to the nearest 10 ms boundary on load from the cache, ensuring `+`/`-` steps always land on multiples of 10 ms and 0 ms is always reachable.
 - The user can correct an inaccurate detection at runtime:
   - `h` halves the BPM; `H` doubles it. Takes effect immediately.
   - `f` increases the effective BPM by 0.1; `v` decreases it by 0.1. Adjustments affect playback speed proportionally (relative to the detected BPM) and clamp to the range 40.0–240.0.
@@ -88,7 +89,7 @@ tj [path]
 ### Info Bar
 - A single line at the top of the player view. Content is split into two groups separated by a variable-width spacer that fills remaining width, keeping the right group pinned to the right edge regardless of transient field changes:
   - **Left group**: play/pause icon (`▶`/`⏸`), BPM, phase offset. Tap count (`tap:N`) appended transiently while a tap session is active. Calibration text (`lat:Nms  ~ to exit`) appended in calibration mode.
-  - **Right group**: nudge mode (`nudge:jump` / `nudge:warp`, fixed width), zoom indicator (`zoom:Ns`), level (`level:▕N▏` — single eighth-block character in a bracketed indicator), spectrum strip.
+  - **Right group**: nudge mode (`nudge:jump` / `nudge:warp`, fixed width), zoom indicator (`zoom:Ns`), level (`level:▕N▏` — single eighth-block character in a bracketed indicator with mid-grey brackets), spectrum strip.
 - The nudge mode field is always present and fixed-width so toggling between `jump` and `warp` does not shift anything to its right.
 - When no tempo adjustment is active, the detected BPM is shown to two decimal places (e.g. `120.00`) and receives a soft amber beat-flash. When a `f`/`v` adjustment is active, the detected BPM is shown plain and the adjusted tempo is shown alongside in parentheses (e.g. `120.00 (124.40)`), with only the adjusted number receiving the beat-flash.
 - `F` increases `base_bpm` by 0.01; `V` decreases it by 0.01. Both clamp to 40.0–240.0. Adjusting `base_bpm` resets any active `f`/`v` playback offset (`bpm` is set equal to the new `base_bpm`, speed returns to 1×) and is persisted to the cache immediately.
@@ -139,8 +140,8 @@ The render frame period adapts to the current zoom level and detail panel width,
   - `0` — flat (filter bypassed).
   - `−1` to `−16` — low-pass filter; more negative = lower cutoff frequency.
   - `+1` to `+16` — high-pass filter; more positive = higher cutoff frequency.
-- `[` decreases `filter_offset` by 1 (clamped at −16); `]` increases it by 1 (clamped at +16).
-- `Space+[` or `Space+]` snaps `filter_offset` to 0 (flat) immediately.
+- `,` decreases `filter_offset` by 1 (clamped at −16); `.` increases it by 1 (clamped at +16).
+- `Space+,` or `Space+.` snaps `filter_offset` to 0 (flat) immediately.
 - Cutoff frequencies are logarithmically spaced from ~40 Hz to ~18 kHz across the ±1–±16 range. Each step corresponds to exactly one character of the spectrum strip.
 - Filter state is visible in the spectrum strip (grey shading on attenuated bins) and not shown as separate text.
 - The spectrum analyser reflects the filtered output.
@@ -162,7 +163,7 @@ The render frame period adapts to the current zoom level and detail panel width,
   - A synthetic click tone fires at 60 BPM (every 1 second), injected directly into the mixer.
   - A calibration pulse marker (cyan, double-width tick) travels through the detail panel toward the playhead at the same 60 BPM tempo, arriving at the playhead at the moment the audio latency elapses after each click fires.
   - When a pulse marker coincides with the playhead, the playhead flashes bright red.
-  - `+` / `-` adjust `audio_latency_ms` in 10ms steps (wrapping at ±500ms). On entry to calibration mode, the value is rounded to the nearest 10ms.
+  - `+` / `-` adjust `audio_latency_ms` in 10ms steps (wrapping at ±500ms). The value is snapped to the nearest 10ms on load and on calibration entry.
   - A dim vertical indicator line shows the current `audio_latency_ms` position: screen centre = 0ms, screen edges = ±500ms. The indicator moves approximately every 25ms of latency change.
   - The info bar shows `lat:Nms  ~ to exit` while calibration is active.
   - All other controls continue to function normally.

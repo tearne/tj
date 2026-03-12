@@ -33,9 +33,9 @@ waveform_style   = "o"
 open_browser     = "space+a"
 bpm_tap          = "b"
 calibration_toggle = "~"
-filter_increase  = "]"
-filter_decrease  = "["
-filter_reset     = ["space+[", "space+]"]
+filter_increase  = "."
+filter_decrease  = ","
+filter_reset     = ["space+,", "space+."]
 help             = "?"
 
 [display]

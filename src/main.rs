@@ -234,7 +234,8 @@ fn main() {
             thread::spawn(move || {
                 let hash = hash_mono(&mono_bg);
                 let (bpm, offset_ms) = if let Some(entry) = entries.get(&hash) {
-                    (entry.bpm, entry.offset_ms)
+                    let snapped = (entry.offset_ms as f64 / 10.0).round() as i64 * 10;
+                    (entry.bpm, snapped)
                 } else {
                     let bpm = detect_bpm(&mono_bg, sample_rate).map(|b| b.round()).unwrap_or(120.0);
                     (bpm, 0i64)
@@ -320,7 +321,7 @@ fn tui_loop(
     let mut volume: f32 = 1.0;
     let mut help_open = false;
     let mut palette_idx: usize = 0;
-    let mut audio_latency_ms: i64 = cache.get_latency();
+    let mut audio_latency_ms: i64 = (cache.get_latency() as f64 / 10.0).round() as i64 * 10;
     let mut calibration_mode = false;
     // Wall-clock time of the last calibration pulse fired (used for travelling marker and next-pulse scheduling).
     let mut last_calib_pulse: Option<Instant> = None;
@@ -473,7 +474,7 @@ fn tui_loop(
             } else {
                 bpm = new_bpm;
                 base_bpm = new_bpm;
-                offset_ms = new_offset;
+                offset_ms = (new_offset as f64 / 10.0).round() as i64 * 10;
                 cache.set(hash.clone(), CacheEntry { bpm, offset_ms, name: filename.to_string() });
                 cache.save();
                 analysis_hash = Some(hash);
@@ -585,7 +586,8 @@ fn tui_loop(
             && last_tap_wall.map_or(false, |t| t.elapsed().as_secs_f64() < 2.0);
         if was_tap_active && !tap_active_now && tap_times.len() >= 8 {
             if let Some(ref hash) = analysis_hash {
-                let (tapped_bpm, tapped_offset) = compute_tap_bpm_offset(&tap_times);
+                let (tapped_bpm, tapped_offset_raw) = compute_tap_bpm_offset(&tap_times);
+                let tapped_offset = (tapped_offset_raw as f64 / 10.0).round() as i64 * 10;
                 let config = AnalysisConfig {
                     force_legacy_bpm: true,
                     bpm_resolution: 0.1,
@@ -741,10 +743,11 @@ fn tui_loop(
                         format!("  nudge:{}", mode_str), dim));
                     const LEVEL_BARS: [char; 8] = ['▁','▂','▃','▄','▅','▆','▇','█'];
                     let level_char = LEVEL_BARS[((volume * 7.0).round() as usize).min(7)];
-                    right_spans.push(Span::styled(
-                        format!("  zoom:{zoom_secs}s  level:\u{2595}{level_char}\u{258F}"),
-                        dim,
-                    ));
+                    let bracket_style = Style::default().fg(Color::Rgb(140, 140, 140));
+                    right_spans.push(Span::styled(format!("  zoom:{zoom_secs}s  level:"), dim));
+                    right_spans.push(Span::styled("\u{2595}", bracket_style));
+                    right_spans.push(Span::styled(level_char.to_string(), dim));
+                    right_spans.push(Span::styled("\u{258F}", bracket_style));
                     if !calibration_mode {
                         // Compute per-character filter shading: which chars are in the stopband.
                         // The 32 bins are log-spaced; cutoff_char is the first char fully in the stopband.
@@ -1520,7 +1523,8 @@ Esc            quit";
                         tap_times.push(display_samp / sample_rate as f64);
                         last_tap_wall = Some(now);
                         if tap_times.len() >= 8 {
-                            let (tapped_bpm, tapped_offset) = compute_tap_bpm_offset(&tap_times);
+                            let (tapped_bpm, tapped_offset_raw) = compute_tap_bpm_offset(&tap_times);
+                            let tapped_offset = (tapped_offset_raw as f64 / 10.0).round() as i64 * 10;
                             // Preserve any f/v speed ratio across the base_bpm correction.
                             // Without this, bpm stays at the old detected value (e.g. 117)
                             // while base_bpm changes (e.g. to 120), making playback 97.5% speed
@@ -2255,10 +2259,8 @@ impl<S: Source<Item = f32>> FilterSource<S> {
         let (b0, b1, b2, a1, a2) = butterworth_biquad(fc, self.sample_rate, is_lpf);
         self.b0 = b0; self.b1 = b1; self.b2 = b2;
         self.a1 = a1; self.a2 = a2;
-        // Reset state to avoid transient
-        let n = self.channels as usize;
-        self.x1 = vec![0.0; n]; self.x2 = vec![0.0; n];
-        self.y1 = vec![0.0; n]; self.y2 = vec![0.0; n];
+        // State (x1, x2, y1, y2) is intentionally preserved so the filter
+        // continues smoothly from its current history — zeroing it causes a click.
     }
 }
 
