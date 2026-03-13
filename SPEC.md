@@ -28,7 +28,7 @@ tj [path]
 | `Space+Z` | Play / Pause |
 | `Space+F` / `Space+V` | Reset tempo to detected BPM (speed → 1×) |
 | `+` / `_` | Adjust beat phase offset (10ms steps) |
-| `~` | Toggle latency calibration mode (only while paused); `d` / `c` adjust latency while active |
+| `[` / `]` | Latency ±10ms (live adjustment; also compensates `offset_ms` to keep ticks anchored) |
 | `u` / `7` | Filter sweep: `u` toward LPF (lower cutoff), `7` toward HPF (higher cutoff) |
 | `Space+u` / `Space+7` | Snap filter to flat (bypass) |
 | `Left` / `Right` | Seek backward / forward (small increment, e.g. 5s) |
@@ -159,24 +159,11 @@ The render frame period adapts to the current zoom level and detail panel width,
 
 ### Audio Latency Calibration
 - An `audio_latency_ms` value shifts all visual rendering backward by a fixed number of milliseconds, compensating for audio output latency. The effective display position is `smooth_display_samp − audio_latency_ms × sample_rate / 1000`. This affects the waveform viewport, beat markers, beat flash, and overview playhead.
-- `~` toggles calibration mode. Calibration mode may only be entered while playback is paused. Pressing `~` again exits and persists the value immediately.
-- While calibration mode is active (playback must be paused to enter):
-  - The detail waveform and normal beat tick marks are hidden.
-  - The playhead remains at its normal configured position.
-  - A synthetic click tone fires at 60 BPM (every 1 second), injected directly into the mixer.
-  - A calibration pulse marker (cyan, double-width tick) travels through the detail panel toward the playhead at the same 60 BPM tempo, arriving at the playhead at the moment the audio latency elapses after each click fires.
-  - When a pulse marker coincides with the playhead, the playhead flashes bright red.
-  - `d` / `c` adjust `audio_latency_ms` in 10ms steps (clamped 0–250ms). The value is snapped to the nearest 10ms on load and on calibration entry.
-  - A vertical indicator line (`⣿`, U+28FF, dim steel blue `Rgb(80,100,140)`) shows the current `audio_latency_ms` position: playhead column = 0ms, right edge = 250ms.
-  - Zoom in/out (`-`/`=`) is disabled while calibration mode is active. On entry the zoom resets to the default level (4s); on exit the previous zoom level is restored.
-  - The info bar shows `lat:Nms  d/c adjust  ~ exit`; all other info bar content is hidden.
-  - All other controls continue to function normally.
-  - The user adjusts until the playhead flash coincides with the heard click.
+- `[` / `]` adjust `audio_latency_ms` in 10ms steps (clamped 0–250ms) during normal playback. Each adjustment simultaneously compensates `offset_ms` by the opposite amount (then wrapped), keeping tick markers anchored to their heard position while the waveform display shifts. The recommended workflow: tap BPM with `b` until ticks are locked to the heard beat, then nudge `[`/`]` until ticks align with the waveform peaks.
 - `audio_latency_ms` is stored as a single global value in the cache (alongside per-track entries). It is loaded on startup and saved on each change and on quit.
-- The `[?]` help overlay lists `~` as the calibration key.
 
 ### Metronome
-- `'` toggles metronome mode. While active, a click tone fires on every beat in sync with the current BPM and `offset_ms`. Only fires during playback; silent while paused or in calibration mode. No click fires on the beat coinciding with activation; clicks begin from the following beat.
+- `'` toggles metronome mode. While active, a click tone fires on every beat in sync with the current BPM and `offset_ms`. Only fires during playback; silent while paused. No click fires on the beat coinciding with activation; clicks begin from the following beat.
 - The metronome fires based on the audio buffer write position (ahead of the speaker by `audio_latency_ms`), so the click arrives at the speaker on the beat when latency is correctly calibrated.
 - The click tone reuses the calibration click sound.
 - A `♪` (U+266A) symbol in red is shown in the info bar immediately after the BPM value while metronome is active.

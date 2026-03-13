@@ -1158,6 +1158,7 @@ c  /  d        nudge backward / forward (mode-dependent)
 C  /  D        toggle nudge mode: jump (10ms) / warp (±10% speed)
 +  /  _        beat phase offset ±10ms
 ~              toggle latency calibration mode  (d/c adjust latency)
+[  /  ]        latency ±10ms (live, outside calibration mode)
 -  /  =        zoom in / out
 {  /  }        detail height decrease / increase
 f  /  v        BPM +0.1 / -0.1
@@ -1481,6 +1482,34 @@ Esc            quit";
                             calibration_mode = true;
                         }
                     }
+                    Some(Action::LatencyDecrease) => {
+                        if !calibration_mode {
+                            audio_latency_ms = (audio_latency_ms - 10).max(0);
+                            let period = (60_000.0 / base_bpm as f64 / 10.0).round() as i64 * 10;
+                            offset_ms = (offset_ms + 10).rem_euclid(period);
+                            cache.set_latency(audio_latency_ms);
+                            if let Some(ref hash) = analysis_hash {
+                                if let Some(entry) = cache.get(hash.as_str()).cloned() {
+                                    cache.set(hash.clone(), CacheEntry { offset_ms, ..entry });
+                                }
+                            }
+                            cache.save();
+                        }
+                    }
+                    Some(Action::LatencyIncrease) => {
+                        if !calibration_mode {
+                            audio_latency_ms = (audio_latency_ms + 10).min(250);
+                            let period = (60_000.0 / base_bpm as f64 / 10.0).round() as i64 * 10;
+                            offset_ms = (offset_ms - 10).rem_euclid(period);
+                            cache.set_latency(audio_latency_ms);
+                            if let Some(ref hash) = analysis_hash {
+                                if let Some(entry) = cache.get(hash.as_str()).cloned() {
+                                    cache.set(hash.clone(), CacheEntry { offset_ms, ..entry });
+                                }
+                            }
+                            cache.save();
+                        }
+                    }
                     Some(Action::FilterIncrease) => {
                         filter_offset = (filter_offset + 1).min(16);
                         filter_offset_shared.store(filter_offset, Ordering::Relaxed);
@@ -1673,6 +1702,8 @@ enum Action {
     TerminalRefresh,
     MetronomeToggle,
     RedetectBpm,
+    LatencyDecrease,
+    LatencyIncrease,
 }
 
 static ACTION_NAMES: &[(&str, Action)] = &[
@@ -1706,6 +1737,8 @@ static ACTION_NAMES: &[(&str, Action)] = &[
     ("terminal_refresh",  Action::TerminalRefresh),
     ("metronome_toggle", Action::MetronomeToggle),
     ("redetect_bpm",     Action::RedetectBpm),
+    ("latency_decrease", Action::LatencyDecrease),
+    ("latency_increase", Action::LatencyIncrease),
     ("bpm_tap",          Action::BpmTap),
     ("palette_cycle",    Action::PaletteCycle),
     ("open_browser",     Action::OpenBrowser),
