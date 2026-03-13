@@ -35,7 +35,6 @@ metronome_toggle = "'"
 redetect_bpm     = "@"
 latency_decrease = "["
 latency_increase = "]"
-calibration_toggle = "~"
 filter_increase  = "7"
 filter_decrease  = "u"
 filter_reset     = ["space+7", "space+u"]

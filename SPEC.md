@@ -38,7 +38,7 @@ tj [path]
 | `Space+J` / `Space+M` | Level 100% / 0% |
 | `c` / `d` | Nudge backward / forward (mode-dependent) |
 | `C` / `D` | Toggle nudge mode: `jump` (10ms seek) / `warp` (±10% speed) |
-| `-` / `=` | Zoom in / out (disabled in calibration mode) |
+| `-` / `=` | Zoom in / out |
 | `{` / `}` | Detail height decrease / increase |
 | `f` / `v` | BPM +0.1 / −0.1 |
 | `F` / `V` | Detected BPM +0.01 / −0.01 |
@@ -69,7 +69,8 @@ tj [path]
 - When playback reaches the end of the track, the transport pauses and the playhead returns to the start. The player view stays open and fully interactive.
 - Decode runs on a background thread. A loading screen displays a progress bar showing decode progress.
 - Playback begins as soon as decode completes, before BPM analysis is finished.
-- Displays track metadata: title, artist, album, duration, current position.
+- Displays track metadata: title, artist, album, duration, current position. The track name (artist – title, or filename) is shown in the track name bar above the info bar.
+- The TUI frame border title shows `tj vX.Y.Z` only.
 
 ### Beat Detection
 - BPM is auto-detected from the audio on load, assuming a constant tempo throughout the track. Hash computation and BPM detection run on a background thread after decode; playback starts immediately with a 120 BPM placeholder.
@@ -88,9 +89,13 @@ tj [path]
 - Each cache entry includes the filename at time of first detection as a human-readable hint to aid manual cache management.
 - On quit, the current phase offset is persisted to the cache.
 
+### Track Name Bar
+- A single line displayed above the info bar, showing the track name derived from embedded metadata: `Artist – Title` if both are present, `Title` if only a title is available, or the filename as a fallback. Shown only when a track is loaded.
+- If no config file is found on first launch, the track name bar briefly displays the path at which the default config was created, then reverts to the track name.
+
 ### Info Bar
-- A single line at the top of the player view. Content is split into two groups separated by a variable-width spacer that fills remaining width, keeping the right group pinned to the right edge regardless of transient field changes:
-  - **Left group**: play/pause icon (`▶`/`⏸`), BPM, `♪` in red when metronome is active, phase offset. Tap count (`tap:N`) appended transiently while a tap session is active. In calibration mode the entire info bar is replaced with `lat:Nms  d/c adjust  ~ exit`.
+- A single line below the track name bar. Content is split into two groups separated by a variable-width spacer that fills remaining width, keeping the right group pinned to the right edge regardless of transient field changes:
+  - **Left group**: play/pause icon (`▶`/`⏸`), BPM, `♪` in red when metronome is active, phase offset. Tap count (`tap:N`) appended transiently while a tap session is active.
   - **Right group**: nudge mode (`nudge:jump` / `nudge:warp`, fixed width), zoom indicator (`zoom:Ns`), level (`level:▕N▏` — single eighth-block character in dark yellow, in a bracketed indicator with mid-grey brackets), `lat:Xms` (shown only when `audio_latency_ms > 0`), spectrum strip.
 - The nudge mode field is always present and fixed-width so toggling between `jump` and `warp` does not shift anything to its right.
 - When no tempo adjustment is active, the detected BPM is shown to two decimal places (e.g. `120.00`) and receives a soft amber beat-flash. When a `f`/`v` adjustment is active, the detected BPM is shown plain and the adjusted tempo is shown alongside in parentheses (e.g. `120.00 (124.40)`), with only the adjusted number receiving the beat-flash.
@@ -151,7 +156,7 @@ The render frame period adapts to the current zoom level and detail panel width,
 - Filter state is not persisted between sessions; it always initialises to flat.
 
 ### Spectrum Analyser
-- A compact spectrum analyser strip is displayed in the info bar, always active while a track is loaded. It is hidden during calibration mode.
+- A compact spectrum analyser strip is displayed in the info bar, always active while a track is loaded.
 - The strip is 16 braille characters wide (32 frequency bins) and 1 braille row tall (4 dot rows). Each character encodes two adjacent bins as a bottom-up bar chart. Thin `▕` / `▏` block characters flank the strip as bounds indicators. The bars are rendered in amber (yellow foreground on a dark amber background). When sub-threshold activity is detected in a bin (energy exceeds ¼ of the single-dot threshold), the character cell background is lit even if no dots are drawn, giving a background glow effect. The glow resets on a 2-bar accumulation window: it lights on any activity within the window and can only go dark at window boundaries.
 - When a filter is active, the attenuated region of the spectrum is shaded with a grey background: LPF shades from the right, HPF from the left. Each of the 16 filter steps corresponds to exactly one spectrum character. At flat (offset 0) no shading is applied.
 - Bins are logarithmically spaced from 20 Hz to 20 kHz. Amplitude is mapped on a dB scale (floor ~10 dB, ceiling ~60 dB, ~12.5 dB per dot row) using the Goertzel algorithm over a 4096-sample Hann-windowed window at the current playback position.
@@ -159,13 +164,13 @@ The render frame period adapts to the current zoom level and detail panel width,
 
 ### Audio Latency Calibration
 - An `audio_latency_ms` value shifts all visual rendering backward by a fixed number of milliseconds, compensating for audio output latency. The effective display position is `smooth_display_samp − audio_latency_ms × sample_rate / 1000`. This affects the waveform viewport, beat markers, beat flash, and overview playhead.
-- `[` / `]` adjust `audio_latency_ms` in 10ms steps (clamped 0–250ms) during normal playback. Each adjustment simultaneously compensates `offset_ms` by the opposite amount (then wrapped), keeping tick markers anchored to their heard position while the waveform display shifts. The recommended workflow: tap BPM with `b` until ticks are locked to the heard beat, then nudge `[`/`]` until ticks align with the waveform peaks.
+- `[` / `]` adjust `audio_latency_ms` in 10ms steps (clamped 0–250ms) at any time. Each adjustment simultaneously compensates `offset_ms` by the opposite amount (then wrapped), keeping tick markers anchored to their heard position while the waveform display shifts. The recommended workflow: tap BPM with `b` until ticks are locked to the heard beat, then nudge `[`/`]` until ticks align with the waveform peaks.
 - `audio_latency_ms` is stored as a single global value in the cache (alongside per-track entries). It is loaded on startup and saved on each change and on quit.
 
 ### Metronome
 - `'` toggles metronome mode. While active, a click tone fires on every beat in sync with the current BPM and `offset_ms`. Only fires during playback; silent while paused. No click fires on the beat coinciding with activation; clicks begin from the following beat.
 - The metronome fires based on the audio buffer write position (ahead of the speaker by `audio_latency_ms`), so the click arrives at the speaker on the beat when latency is correctly calibrated.
-- The click tone reuses the calibration click sound.
+- The click tone reuses the latency calibration click sound.
 - A `♪` (U+266A) symbol in red is shown in the info bar immediately after the BPM value while metronome is active.
 - Metronome mode resets to off on each new track load.
 

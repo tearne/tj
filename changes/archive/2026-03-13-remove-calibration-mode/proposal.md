@@ -1,5 +1,5 @@
 # Proposal: Remove Calibration Mode
-**Status: Draft**
+**Status: Approved**
 
 ## Intent
 

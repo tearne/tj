@@ -100,4 +100,4 @@ It takes `filter_offset: i32` and re-runs the biquad to match `FilterSource`'s o
 4. **Impl**: Fix U3 — `cache_path` uses `home_dir()`
 5. **Impl**: Fix P1 — `hash_mono` bulk hashing
 6. **Impl**: Fix P2 — Hann window as `OnceLock` static
-7. **Process**: Archive code review; draft `multi-deck` proposal incorporating structural findings S1–S4 as design constraints
+7. **Process**: Archive code review; the `multi-deck` proposal (`changes/open/multi-deck/proposal.md`) already exists and incorporates S1–S4 as prerequisites. Verify it is complete before archiving.
