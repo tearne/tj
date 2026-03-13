@@ -38,7 +38,7 @@ tj [path]
 | `Space+J` / `Space+M` | Level 100% / 0% |
 | `c` / `d` | Nudge backward / forward (mode-dependent) |
 | `C` / `D` | Toggle nudge mode: `jump` (10ms seek) / `warp` (±10% speed) |
-| `-` / `=` | Zoom in / out |
+| `-` / `=` | Zoom in / out (disabled in calibration mode) |
 | `{` / `}` | Detail height decrease / increase |
 | `f` / `v` | BPM +0.1 / −0.1 |
 | `F` / `V` | Detected BPM +0.01 / −0.01 |
@@ -76,7 +76,7 @@ tj [path]
 - When analysis completes, the BPM updates, beat markers appear, and beat jump uses the detected tempo.
 - The detected BPM is displayed to two decimal places.
 - A beat phase offset (in milliseconds) can be adjusted at runtime to align the beat indicator with the audio. The offset and BPM are displayed in the UI.
-- `offset_ms` is snapped to the nearest 10 ms boundary on load from the cache, ensuring `+`/`-` steps always land on multiples of 10 ms and 0 ms is always reachable.
+- `offset_ms` is snapped to the nearest 10 ms boundary on load from the cache, ensuring `+`/`-` steps always land on multiples of 10 ms and 0 ms is always reachable. After each adjustment and on cache load, `offset_ms` is wrapped into `[0, beat_period_ms)` using `rem_euclid`, where `beat_period_ms` is derived from `base_bpm` rounded to the nearest 10 ms, ensuring the offset always remains on the 10 ms grid.
 - The user can correct an inaccurate detection at runtime:
   - `f` increases the effective BPM by 0.1; `v` decreases it by 0.1. Adjustments affect playback speed proportionally (relative to the detected BPM) and clamp to the range 40.0–240.0.
   - `b` tap-detects BPM: press in time with the beat. After 8 taps a rolling median of inter-tap intervals sets `base_bpm` and derives `offset_ms` from the tap phase. Any active `f`/`v` speed ratio is preserved relative to the new `base_bpm`. The tap count is shown in the info bar (`tap:N`) while a session is active; tapping stops 2 seconds after the last tap. When the session ends, a background re-detection pass is triggered automatically: the full track is re-analysed using legacy autocorrelation with `bpm_resolution: 0.1`, with the search window narrowed to ±5% of the tapped BPM. This achieves sub-integer precision while using the tap to resolve octave ambiguity. If re-detection returns a result, `base_bpm` is updated to the analyser's value; the tap-derived `offset_ms` is preserved. If the tap session resets before re-detection completes, the in-flight result is discarded.
@@ -88,7 +88,7 @@ tj [path]
 ### Info Bar
 - A single line at the top of the player view. Content is split into two groups separated by a variable-width spacer that fills remaining width, keeping the right group pinned to the right edge regardless of transient field changes:
   - **Left group**: play/pause icon (`▶`/`⏸`), BPM, `♪` in red when metronome is active, phase offset. Tap count (`tap:N`) appended transiently while a tap session is active. In calibration mode the entire info bar is replaced with `lat:Nms  d/c adjust  ~ exit`.
-  - **Right group**: nudge mode (`nudge:jump` / `nudge:warp`, fixed width), zoom indicator (`zoom:Ns`), level (`level:▕N▏` — single eighth-block character in dark yellow, in a bracketed indicator with mid-grey brackets), spectrum strip.
+  - **Right group**: nudge mode (`nudge:jump` / `nudge:warp`, fixed width), zoom indicator (`zoom:Ns`), level (`level:▕N▏` — single eighth-block character in dark yellow, in a bracketed indicator with mid-grey brackets), `lat:Xms` (shown only when `audio_latency_ms > 0`), spectrum strip.
 - The nudge mode field is always present and fixed-width so toggling between `jump` and `warp` does not shift anything to its right.
 - When no tempo adjustment is active, the detected BPM is shown to two decimal places (e.g. `120.00`) and receives a soft amber beat-flash. When a `f`/`v` adjustment is active, the detected BPM is shown plain and the adjusted tempo is shown alongside in parentheses (e.g. `120.00 (124.40)`), with only the adjusted number receiving the beat-flash.
 - `F` increases `base_bpm` by 0.01; `V` decreases it by 0.01. Both clamp to 40.0–240.0. Adjusting `base_bpm` resets any active `f`/`v` playback offset (`bpm` is set equal to the new `base_bpm`, speed returns to 1×) and is persisted to the cache immediately.
@@ -163,7 +163,8 @@ The render frame period adapts to the current zoom level and detail panel width,
   - A calibration pulse marker (cyan, double-width tick) travels through the detail panel toward the playhead at the same 60 BPM tempo, arriving at the playhead at the moment the audio latency elapses after each click fires.
   - When a pulse marker coincides with the playhead, the playhead flashes bright red.
   - `d` / `c` adjust `audio_latency_ms` in 10ms steps (clamped 0–250ms). The value is snapped to the nearest 10ms on load and on calibration entry.
-  - A dim vertical indicator line shows the current `audio_latency_ms` position: playhead column = 0ms, right edge = 250ms.
+  - A vertical indicator line (`⣿`, U+28FF, dim steel blue `Rgb(80,100,140)`) shows the current `audio_latency_ms` position: playhead column = 0ms, right edge = 250ms.
+  - Zoom in/out (`-`/`=`) is disabled while calibration mode is active. On entry the zoom resets to the default level (4s); on exit the previous zoom level is restored.
   - The info bar shows `lat:Nms  d/c adjust  ~ exit`; all other info bar content is hidden.
   - All other controls continue to function normally.
   - The user adjusts until the playhead flash coincides with the heard click.
@@ -171,7 +172,8 @@ The render frame period adapts to the current zoom level and detail panel width,
 - The `[?]` help overlay lists `~` as the calibration key.
 
 ### Metronome
-- `'` toggles metronome mode. While active, a click tone fires on every beat in sync with the current BPM and `offset_ms`. Only fires during playback; silent while paused or in calibration mode.
+- `'` toggles metronome mode. While active, a click tone fires on every beat in sync with the current BPM and `offset_ms`. Only fires during playback; silent while paused or in calibration mode. No click fires on the beat coinciding with activation; clicks begin from the following beat.
+- The metronome fires based on the audio buffer write position (ahead of the speaker by `audio_latency_ms`), so the click arrives at the speaker on the beat when latency is correctly calibrated.
 - The click tone reuses the calibration click sound.
 - A `♪` (U+266A) symbol in red is shown in the info bar immediately after the BPM value while metronome is active.
 - Metronome mode resets to off on each new track load.

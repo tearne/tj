@@ -234,6 +234,8 @@ fn main() {
                 let hash = hash_mono(&mono_bg);
                 let (bpm, offset_ms) = if let Some(entry) = entries.get(&hash) {
                     let snapped = (entry.offset_ms as f64 / 10.0).round() as i64 * 10;
+                    let period = (60_000.0 / entry.bpm as f64 / 10.0).round() as i64 * 10;
+                    let snapped = snapped.rem_euclid(period);
                     (entry.bpm, snapped)
                 } else {
                     let bpm = detect_bpm(&mono_bg, sample_rate).map(|b| b.round()).unwrap_or(120.0);
@@ -308,6 +310,7 @@ fn tui_loop(
     let mut last_viewport_start: usize = 0;
     const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let mut zoom_idx: usize = DEFAULT_ZOOM_IDX;
+    let mut pre_calibration_zoom_idx: usize = DEFAULT_ZOOM_IDX;
     let mut detail_height: usize = 8;
     let mut overview_rect = ratatui::layout::Rect::default();
     let mut last_bar_cols: Vec<usize> = Vec::new();
@@ -565,6 +568,16 @@ fn tui_loop(
         let beat_index = smooth_pos_ns.div_euclid(beat_period.as_nanos() as i128);
         let warn_beat_on = warning_active && (beat_index % 2 == 0);
 
+        // Metronome beat index: derived from smooth_display_samp (buffer write position), not
+        // display_samp. When this crosses a beat boundary, the speaker is audio_latency_ms before
+        // the beat — so the injected click arrives at the speaker exactly on the beat.
+        // Using display_samp (the speaker position) would fire the click one full latency period late.
+        let metro_beat_index = {
+            let ns = (smooth_display_samp / sample_rate as f64 * 1_000_000_000.0) as i128
+                - offset_ms as i128 * 1_000_000;
+            ns.div_euclid(beat_period.as_nanos() as i128)
+        };
+
         let analysing = analysis_hash.is_none();
 
         // Calibration pulse: fire a click tone at 120 BPM (every 0.5 s) while calibration_mode active.
@@ -581,11 +594,11 @@ fn tui_loop(
             last_calib_pulse = None;
         }
 
-        // Metronome: fire a click tone on each new beat_index while playing.
+        // Metronome: fire a click tone on each new metro_beat_index while playing.
         if metronome_mode && !calibration_mode && !player.is_paused() {
-            if last_metro_beat != Some(beat_index) {
+            if last_metro_beat != Some(metro_beat_index) {
                 play_click_tone(mixer, sample_rate);
-                last_metro_beat = Some(beat_index);
+                last_metro_beat = Some(metro_beat_index);
             }
         } else {
             last_metro_beat = None;
@@ -755,6 +768,9 @@ fn tui_loop(
                     }
                     right_spans.push(Span::styled(
                         format!("  nudge:{}", mode_str), dim));
+                    if audio_latency_ms > 0 {
+                        right_spans.push(Span::styled(format!("  lat:{}ms", audio_latency_ms), dim));
+                    }
                     const LEVEL_BARS: [char; 8] = ['▁','▂','▃','▄','▅','▆','▇','█'];
                     let level_char = LEVEL_BARS[((volume * 7.0).round() as usize).min(7)];
                     let bracket_style = Style::default().fg(Color::Rgb(140, 140, 140));
@@ -1080,7 +1096,7 @@ fn tui_loop(
                             } else if is_tick_row && calib_byte != 0 {
                                 (Color::Cyan, char::from_u32(0x2800 | calib_byte as u32).unwrap_or(' '))
                             } else if c == latency_col {
-                                (Color::DarkGray, '\u{2502}') // │ thin latency position indicator
+                                (Color::Rgb(80, 100, 140), '\u{28FF}') // ⣿ latency position indicator
                             } else {
                                 (Color::Reset, '\u{2800}') // blank
                             };
@@ -1399,18 +1415,25 @@ Esc            quit";
                     }
                     Some(Action::MetronomeToggle) => {
                         metronome_mode = !metronome_mode;
-                        if !metronome_mode { last_metro_beat = None; }
+                        if metronome_mode {
+                            last_metro_beat = Some(metro_beat_index); // suppress click on activation beat
+                        } else {
+                            last_metro_beat = None;
+                        }
                     }
                     Some(Action::Help) => { help_open = true; }
                     Some(Action::CalibrationToggle) => {
                         if calibration_mode {
                             // Always allow exiting calibration.
                             calibration_mode = false;
+                            zoom_idx = pre_calibration_zoom_idx;
                             cache.set_latency(audio_latency_ms);
                             cache.save();
                         } else if player.is_paused() {
                             // Snap to nearest 10ms so +/- steps always land on multiples of 10.
                             audio_latency_ms = ((audio_latency_ms as f64 / 10.0).round() as i64 * 10).clamp(0, 250);
+                            pre_calibration_zoom_idx = zoom_idx;
+                            zoom_idx = DEFAULT_ZOOM_IDX;
                             calibration_mode = true;
                         }
                     }
@@ -1433,14 +1456,22 @@ Esc            quit";
                     Some(Action::PaletteCycle) => {
                         palette_idx = (palette_idx + 1) % SPECTRAL_PALETTES.len();
                     }
-                    Some(Action::OffsetIncrease) => { offset_ms += 10; }
-                    Some(Action::OffsetDecrease) => { offset_ms -= 10; }
+                    Some(Action::OffsetIncrease) => {
+                        offset_ms += 10;
+                        let period = (60_000.0 / base_bpm as f64 / 10.0).round() as i64 * 10;
+                        offset_ms = offset_ms.rem_euclid(period);
+                    }
+                    Some(Action::OffsetDecrease) => {
+                        offset_ms -= 10;
+                        let period = (60_000.0 / base_bpm as f64 / 10.0).round() as i64 * 10;
+                        offset_ms = offset_ms.rem_euclid(period);
+                    }
 
                     Some(Action::ZoomOut) => {
-                        if zoom_idx > 0 { zoom_idx -= 1; }
+                        if !calibration_mode && zoom_idx > 0 { zoom_idx -= 1; }
                     }
                     Some(Action::ZoomIn) => {
-                        if zoom_idx + 1 < ZOOM_LEVELS.len() { zoom_idx += 1; }
+                        if !calibration_mode && zoom_idx + 1 < ZOOM_LEVELS.len() { zoom_idx += 1; }
                     }
                     Some(Action::HeightDecrease) => {
                         if detail_height > 1 { detail_height -= 1; }
