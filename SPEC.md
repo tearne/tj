@@ -45,6 +45,7 @@ tj [path]
 | `?` | Toggle key binding help popup |
 | `b` | Tap BPM detection |
 | `'` | Toggle metronome |
+| `@` | Trigger manual BPM re-detection |
 | `z` | Open / close file browser |
 | `` ` `` | Refresh terminal (clear display glitches) |
 | `Esc` / `Ctrl-C` | Quit |
@@ -73,13 +74,15 @@ tj [path]
 ### Beat Detection
 - BPM is auto-detected from the audio on load, assuming a constant tempo throughout the track. Hash computation and BPM detection run on a background thread after decode; playback starts immediately with a 120 BPM placeholder.
 - While BPM analysis is in progress, beat markers are suppressed, the beat indicator does not flash, and the BPM line shows an animated indicator (e.g. `BPM: --- [analysing ⠋]`). Beat jump uses the 120 BPM placeholder.
-- When analysis completes, the BPM updates, beat markers appear, and beat jump uses the detected tempo.
+- When analysis completes and no BPM is yet established (fresh load, no cache, no tap or manual adjustment), the BPM is applied immediately. If a BPM is already established, the result is held as a pending confirmation.
+- While a confirmation is pending, the info bar right group is replaced with a red prompt showing the detected BPM and a countdown (e.g. `BPM detected: 124.40  [y] accept  [n] reject  (14s)`). Pressing `y` or `Enter` applies the result; any other key rejects it. After 15 seconds the result is auto-rejected and the pre-existing BPM and offset are preserved.
+- `@` triggers a manual re-detection pass at any time. The result always goes through the confirmation step. Pressing `@` while analysis is in progress hides the spinner (the thread continues silently); pressing `@` again reconnects to the same thread rather than spawning a new one.
 - The detected BPM is displayed to two decimal places.
 - A beat phase offset (in milliseconds) can be adjusted at runtime to align the beat indicator with the audio. The offset and BPM are displayed in the UI.
 - `offset_ms` is snapped to the nearest 10 ms boundary on load from the cache, ensuring `+`/`-` steps always land on multiples of 10 ms and 0 ms is always reachable. After each adjustment and on cache load, `offset_ms` is wrapped into `[0, beat_period_ms)` using `rem_euclid`, where `beat_period_ms` is derived from `base_bpm` rounded to the nearest 10 ms, ensuring the offset always remains on the 10 ms grid.
 - The user can correct an inaccurate detection at runtime:
   - `f` increases the effective BPM by 0.1; `v` decreases it by 0.1. Adjustments affect playback speed proportionally (relative to the detected BPM) and clamp to the range 40.0–240.0.
-  - `b` tap-detects BPM: press in time with the beat. After 8 taps a rolling median of inter-tap intervals sets `base_bpm` and derives `offset_ms` from the tap phase. Any active `f`/`v` speed ratio is preserved relative to the new `base_bpm`. The tap count is shown in the info bar (`tap:N`) while a session is active; tapping stops 2 seconds after the last tap. When the session ends, a background re-detection pass is triggered automatically: the full track is re-analysed using legacy autocorrelation with `bpm_resolution: 0.1`, with the search window narrowed to ±5% of the tapped BPM. This achieves sub-integer precision while using the tap to resolve octave ambiguity. If re-detection returns a result, `base_bpm` is updated to the analyser's value; the tap-derived `offset_ms` is preserved. If the tap session resets before re-detection completes, the in-flight result is discarded.
+  - `b` tap-detects BPM: press in time with the beat. After 8 taps, `base_bpm` and `offset_ms` are set from the tap session. BPM is derived via linear regression of tap index against tap time (slope = beat period), which converges and stabilises as more taps are added. Taps with a residual exceeding half a beat period are treated as outliers and excluded before the final regression. Any active `f`/`v` speed ratio is preserved relative to the new `base_bpm`. The tap count is shown in the info bar (`tap:N`) while a session is active; tapping stops 2 seconds after the last tap.
   - Corrections are persisted to the cache immediately.
 - Detected BPM and phase offset are cached in `~/.local/share/tj/cache.json`, keyed by a Blake3 hash of the decoded audio samples. This makes the cache invariant of filename, tags, and container format. The cache also stores the last browser directory.
 - Each cache entry includes the filename at time of first detection as a human-readable hint to aid manual cache management.
@@ -93,7 +96,8 @@ tj [path]
 - When no tempo adjustment is active, the detected BPM is shown to two decimal places (e.g. `120.00`) and receives a soft amber beat-flash. When a `f`/`v` adjustment is active, the detected BPM is shown plain and the adjusted tempo is shown alongside in parentheses (e.g. `120.00 (124.40)`), with only the adjusted number receiving the beat-flash.
 - `F` increases `base_bpm` by 0.01; `V` decreases it by 0.01. Both clamp to 40.0–240.0. Adjusting `base_bpm` resets any active `f`/`v` playback offset (`bpm` is set equal to the new `base_bpm`, speed returns to 1×) and is persisted to the cache immediately.
 - Pressing `?` opens a modal key binding reference overlay; any key dismisses it.
-- During BPM analysis the BPM field shows an animated spinner.
+- During BPM analysis the BPM field shows an animated spinner. When a confirmation is pending, the right group is replaced with a red prompt (see Beat Detection).
+- A BPM is considered "established" once it has been loaded from cache, set by tap, or adjusted with `f`/`v`/`F`/`V`. Only established BPM triggers confirmation on new detection.
 
 ### Waveform Visualisation
 - Two waveform views are displayed simultaneously:

@@ -226,22 +226,22 @@ fn main() {
             Arc::clone(&filter_offset_shared),
         ));
 
-        let (bpm_tx, bpm_rx) = mpsc::channel::<(String, f32, i64)>();
+        let (bpm_tx, bpm_rx) = mpsc::channel::<(String, f32, i64, bool)>();
         {
             let mono_bg = Arc::clone(&mono);
             let entries = cache.entries_snapshot();
             thread::spawn(move || {
                 let hash = hash_mono(&mono_bg);
-                let (bpm, offset_ms) = if let Some(entry) = entries.get(&hash) {
+                let (bpm, offset_ms, is_fresh) = if let Some(entry) = entries.get(&hash) {
                     let snapped = (entry.offset_ms as f64 / 10.0).round() as i64 * 10;
                     let period = (60_000.0 / entry.bpm as f64 / 10.0).round() as i64 * 10;
                     let snapped = snapped.rem_euclid(period);
-                    (entry.bpm, snapped)
+                    (entry.bpm, snapped, false)
                 } else {
                     let bpm = detect_bpm(&mono_bg, sample_rate).map(|b| b.round()).unwrap_or(120.0);
-                    (bpm, 0i64)
+                    (bpm, 0i64, true)
                 };
-                let _ = bpm_tx.send((hash, bpm, offset_ms));
+                let _ = bpm_tx.send((hash, bpm, offset_ms, is_fresh));
             });
         }
 
@@ -280,7 +280,7 @@ fn tui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     filename: &str,
     file_dir: &std::path::Path,
-    mut bpm_rx: mpsc::Receiver<(String, f32, i64)>,
+    mut bpm_rx: mpsc::Receiver<(String, f32, i64, bool)>,
     total_duration: Duration,
     waveform: Arc<WaveformData>,
     player: &Player,
@@ -297,12 +297,15 @@ fn tui_loop(
     let mut base_bpm: f32 = 120.0; // detected BPM; speed factor = bpm / base_bpm
     let mut offset_ms: i64 = 0;
     let mut analysis_hash: Option<String> = None;
+    let mut bpm_established: bool = false; // true once BPM is set from cache, tap, or f/v
+    let mut pending_bpm: Option<(String, f32, i64, Instant)> = None; // fresh detection awaiting confirmation
+    let mut redetecting: bool = false; // true while a manual @ re-detection thread is visible
+    let mut redetect_saved_hash: Option<String> = None; // analysis_hash saved before redetection spinner
+    let mut background_rx: Option<mpsc::Receiver<(String, f32, i64, bool)>> = None; // hidden in-flight analysis
     let mut frame_count: usize = 0;
     let mut last_scrub_samp: f64 = -1.0; // tracks position of last warp scrub for throttling
     let mut tap_times: Vec<f64> = Vec::new();
     let mut last_tap_wall: Option<Instant> = None;
-    let mut tap_offset_pending: Option<i64> = None; // Some = tap-guided detection in flight
-    let mut tap_guided_rx: bool = false;             // current bpm_rx is from a tap-guided spawn
     let mut was_tap_active: bool = false;
     // Smooth display position: advances via wall clock to avoid audio-buffer-burst jitter.
     let mut smooth_display_samp: f64 = 0.0;
@@ -453,34 +456,32 @@ fn tui_loop(
 
     loop {
         frame_count += 1;
-        if let Ok((hash, new_bpm, new_offset)) = bpm_rx.try_recv() {
-            if tap_guided_rx {
-                tap_guided_rx = false;
-                match tap_offset_pending.take() {
-                    Some(tap_offset) => {
-                        // Tap-guided result arrived before tap reset: use analyser BPM, preserve tap phase.
-                        let speed_ratio = bpm / base_bpm;
-                        base_bpm = new_bpm;
-                        bpm = (base_bpm * speed_ratio).clamp(40.0, 240.0);
-                        offset_ms = tap_offset;
-                        player.set_speed(bpm / base_bpm);
-                        cache.set(hash.clone(), CacheEntry { bpm: base_bpm, offset_ms, name: filename.to_string() });
-                        cache.save();
-                        analysis_hash = Some(hash);
-                    }
-                    None => {
-                        // Tap session reset before result arrived — discard entirely.
-                        // Restore analysis_hash so the UI stops showing the spinner.
-                        analysis_hash = Some(hash);
-                    }
-                }
-            } else {
+        // Auto-reject pending BPM confirmation after 15 seconds.
+        if let Some((_, _, _, received_at)) = &pending_bpm {
+            if received_at.elapsed().as_secs() >= 15 {
+                pending_bpm = None;
+            }
+        }
+        if let Ok((hash, new_bpm, new_offset, is_fresh)) = bpm_rx.try_recv() {
+            if !is_fresh || !bpm_established {
+                // Cache hit or no BPM established yet: apply immediately.
                 bpm = new_bpm;
                 base_bpm = new_bpm;
                 offset_ms = (new_offset as f64 / 10.0).round() as i64 * 10;
                 cache.set(hash.clone(), CacheEntry { bpm, offset_ms, name: filename.to_string() });
                 cache.save();
                 analysis_hash = Some(hash);
+                redetecting = false;
+                redetect_saved_hash = None;
+                background_rx = None;
+                if !is_fresh { bpm_established = true; }
+            } else {
+                // Fresh detection with BPM already established: queue for confirmation.
+                analysis_hash = Some(hash.clone()); // stop the analysing spinner
+                redetecting = false;
+                redetect_saved_hash = None;
+                background_rx = None;
+                pending_bpm = Some((hash, new_bpm, new_offset, Instant::now()));
             }
         }
 
@@ -608,31 +609,18 @@ fn tui_loop(
         let tap_active_now = !tap_times.is_empty()
             && last_tap_wall.map_or(false, |t| t.elapsed().as_secs_f64() < 2.0);
         if was_tap_active && !tap_active_now && tap_times.len() >= 8 {
+            // TEST: re-detection disabled — BPM and offset come from taps only.
+            let (tapped_bpm, tapped_offset_raw) = compute_tap_bpm_offset(&tap_times);
+            let tapped_offset = (tapped_offset_raw as f64 / 10.0).round() as i64 * 10;
+            let speed_ratio = bpm / base_bpm;
+            base_bpm = tapped_bpm;
+            bpm = (base_bpm * speed_ratio).clamp(40.0, 240.0);
+            offset_ms = tapped_offset;
+            bpm_established = true;
+            player.set_speed(bpm / base_bpm);
             if let Some(ref hash) = analysis_hash {
-                let (tapped_bpm, tapped_offset_raw) = compute_tap_bpm_offset(&tap_times);
-                let tapped_offset = (tapped_offset_raw as f64 / 10.0).round() as i64 * 10;
-                let config = AnalysisConfig {
-                    force_legacy_bpm: true,
-                    bpm_resolution: 0.1,
-                    min_bpm: tapped_bpm * 0.95,
-                    max_bpm: tapped_bpm * 1.05,
-                    legacy_bpm_preferred_min: tapped_bpm * 0.95,
-                    legacy_bpm_preferred_max: tapped_bpm * 1.05,
-                    ..AnalysisConfig::default()
-                };
-                let hash = hash.clone();
-                let mono_bg = Arc::clone(mono);
-                let (tx, rx) = mpsc::channel::<(String, f32, i64)>();
-                let offset_snap = tapped_offset;
-                thread::spawn(move || {
-                    if let Ok(result) = analyze_audio(&mono_bg, sample_rate, config) {
-                        let _ = tx.send((hash, result.bpm, offset_snap));
-                    }
-                });
-                bpm_rx = rx;
-                analysis_hash = None;
-                tap_offset_pending = Some(tapped_offset);
-                tap_guided_rx = true;
+                cache.set(hash.clone(), CacheEntry { bpm: base_bpm, offset_ms, name: filename.to_string() });
+                cache.save();
             }
         }
         was_tap_active = tap_active_now;
@@ -762,7 +750,14 @@ fn tui_loop(
 
                     // --- Right group ---
                     let mut right_spans: Vec<Span<'static>> = Vec::new();
-                    if !calibration_mode {
+                    if let Some((_, p_bpm, _, received_at)) = &pending_bpm {
+                        let secs_left = 15u64.saturating_sub(received_at.elapsed().as_secs());
+                        let red = Style::default().fg(Color::Red);
+                        right_spans.push(Span::styled(
+                            format!("BPM detected: {:.2}  [y] accept  [n] reject  ({}s)", p_bpm, secs_left),
+                            red,
+                        ));
+                    } else if !calibration_mode {
                     if !nudge_str.is_empty() {
                         right_spans.push(Span::styled(nudge_str.to_string(), dim));
                     }
@@ -814,7 +809,7 @@ fn tui_loop(
                         }
                         right_spans.push(Span::styled("\u{258F}".to_string(), dim));
                     }
-                    } // end !calibration_mode
+                    } // end !calibration_mode / pending_bpm
 
                     // Spacer: fill gap between left and right groups.
                     let bar_w = chunks[0].width as usize;
@@ -1335,6 +1330,23 @@ Esc            quit";
                 }
                 // All other actions fire on Press only.
                 if key.kind == KeyEventKind::Press {
+                    // BPM confirmation intercept — y/Enter accept, n/Esc reject.
+                    if let Some((hash, p_bpm, p_offset, _)) = pending_bpm.take() {
+                        match key.code {
+                            KeyCode::Char('y') | KeyCode::Enter => {
+                                bpm = p_bpm;
+                                base_bpm = p_bpm;
+                                offset_ms = (p_offset as f64 / 10.0).round() as i64 * 10;
+                                bpm_established = true;
+                                player.set_speed(1.0);
+                                cache.set(hash.clone(), CacheEntry { bpm, offset_ms, name: filename.to_string() });
+                                cache.save();
+                                analysis_hash = Some(hash);
+                            }
+                            _ => { /* reject — pending_bpm already taken/cleared */ }
+                        }
+                        continue;
+                    }
                     let action = if space_held && key.code != KeyCode::Char(' ') {
                         if let Some(a) = keymap.get(&KeyBinding::SpaceChord(key.code)) {
                             space_chord_fired = true;
@@ -1421,6 +1433,38 @@ Esc            quit";
                             last_metro_beat = None;
                         }
                     }
+                    Some(Action::RedetectBpm) => {
+                        if pending_bpm.is_some() {
+                            // Press while confirmation showing: reject.
+                            pending_bpm = None;
+                        } else if redetecting {
+                            // Press while spinner showing: hide the analysis (keep thread alive).
+                            let (_, dead_rx) = mpsc::channel::<(String, f32, i64, bool)>();
+                            background_rx = Some(std::mem::replace(&mut bpm_rx, dead_rx));
+                            redetecting = false;
+                            analysis_hash = redetect_saved_hash.take();
+                        } else if analysis_hash.is_some() {
+                            if let Some(bg_rx) = background_rx.take() {
+                                // Reconnect to already-running hidden analysis.
+                                redetect_saved_hash = analysis_hash.take();
+                                bpm_rx = bg_rx;
+                                redetecting = true;
+                            } else {
+                                // Idle, no hidden analysis: spawn fresh.
+                                let mono_bg = Arc::clone(mono);
+                                let (tx, rx) = mpsc::channel::<(String, f32, i64, bool)>();
+                                let hash_bg = analysis_hash.clone().unwrap_or_default();
+                                thread::spawn(move || {
+                                    if let Ok(bpm) = detect_bpm(&mono_bg, sample_rate) {
+                                        let _ = tx.send((hash_bg, bpm, 0, true));
+                                    }
+                                });
+                                bpm_rx = rx;
+                                redetect_saved_hash = analysis_hash.take();
+                                redetecting = true;
+                            }
+                        }
+                    }
                     Some(Action::Help) => { help_open = true; }
                     Some(Action::CalibrationToggle) => {
                         if calibration_mode {
@@ -1481,15 +1525,18 @@ Esc            quit";
                     }
                     Some(Action::BpmIncrease) => {
                         bpm = (bpm + 0.1).min(240.0);
+                        bpm_established = true;
                         player.set_speed(bpm / base_bpm);
                     }
                     Some(Action::BpmDecrease) => {
                         bpm = (bpm - 0.1).max(40.0);
+                        bpm_established = true;
                         player.set_speed(bpm / base_bpm);
                     }
                     Some(Action::BaseBpmIncrease) => {
                         base_bpm = (base_bpm + 0.01).min(240.0);
                         bpm = base_bpm;
+                        bpm_established = true;
                         player.set_speed(1.0);
                         if let Some(ref hash) = analysis_hash {
                             if let Some(entry) = cache.get(hash.as_str()).cloned() {
@@ -1501,6 +1548,7 @@ Esc            quit";
                     Some(Action::BaseBpmDecrease) => {
                         base_bpm = (base_bpm - 0.01).max(40.0);
                         bpm = base_bpm;
+                        bpm_established = true;
                         player.set_speed(1.0);
                         if let Some(ref hash) = analysis_hash {
                             if let Some(entry) = cache.get(hash.as_str()).cloned() {
@@ -1526,7 +1574,6 @@ Esc            quit";
                         if let Some(last) = last_tap_wall {
                             if now.duration_since(last).as_secs_f64() > 2.0 {
                                 tap_times.clear();
-                                tap_offset_pending = None;
                             }
                         }
                         tap_times.push(display_samp / sample_rate as f64);
@@ -1625,6 +1672,7 @@ enum Action {
     FilterIncrease, FilterDecrease, FilterReset,
     TerminalRefresh,
     MetronomeToggle,
+    RedetectBpm,
 }
 
 static ACTION_NAMES: &[(&str, Action)] = &[
@@ -1657,6 +1705,7 @@ static ACTION_NAMES: &[(&str, Action)] = &[
     ("base_bpm_decrease", Action::BaseBpmDecrease),
     ("terminal_refresh",  Action::TerminalRefresh),
     ("metronome_toggle", Action::MetronomeToggle),
+    ("redetect_bpm",     Action::RedetectBpm),
     ("bpm_tap",          Action::BpmTap),
     ("palette_cycle",    Action::PaletteCycle),
     ("open_browser",     Action::OpenBrowser),
@@ -1805,30 +1854,56 @@ fn home_dir() -> Option<std::path::PathBuf> {
 }
 
 /// Compute BPM and phase offset from a list of tap times (track position in seconds).
-/// BPM = 60 / median inter-tap interval.
+/// BPM = linear regression slope across all taps (beat index vs time), which converges
+/// as taps accumulate — later taps add leverage and reduce variance.
+/// Outlier taps (residual > half a beat period) are dropped before the final regression.
 /// Offset = mean residual anchored to the first tap, avoiding phase drift from imprecise period.
 fn compute_tap_bpm_offset(tap_times: &[f64]) -> (f32, i64) {
-    let intervals: Vec<f64> = tap_times.windows(2).map(|w| w[1] - w[0]).collect();
-    let mut sorted = intervals.clone();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let n = sorted.len();
-    let beat_period = if n % 2 == 0 {
-        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
-    } else {
-        sorted[n / 2]
-    };
+    let n = tap_times.len();
+    if n < 2 { return (120.0, 0); }
+
+    // First pass: regression over all taps to get a rough period for outlier detection.
+    let beat_period = linear_regression_period(tap_times);
+    if beat_period <= 0.0 { return (120.0, 0); }
+
+    // Drop taps whose residual from the regression line exceeds half a beat period.
+    let t0 = tap_times[0];
+    let filtered: Vec<f64> = tap_times.iter().enumerate()
+        .filter(|&(i, &t)| {
+            let expected = t0 + i as f64 * beat_period;
+            (t - expected).abs() < beat_period / 2.0
+        })
+        .map(|(_, &t)| t)
+        .collect();
+    let taps = if filtered.len() >= 2 { &filtered[..] } else { tap_times };
+
+    // Second pass: refined regression on filtered taps.
+    let beat_period = linear_regression_period(taps);
     if beat_period <= 0.0 { return (120.0, 0); }
     let bpm = (60.0 / beat_period) as f32;
+
     // Anchor residuals to the first tap so deltas are small.
     // Computing t % beat_period on large absolute positions causes phase drift when
     // beat_period is even slightly imprecise — error accumulates with distance from zero.
-    let t0 = tap_times[0];
-    let mean_residual = tap_times.iter()
+    let t0 = taps[0];
+    let mean_residual = taps.iter()
         .map(|&t| { let d = t - t0; d - (d / beat_period).round() * beat_period })
-        .sum::<f64>() / tap_times.len() as f64;
+        .sum::<f64>() / taps.len() as f64;
     let offset_secs = (t0 + mean_residual).rem_euclid(beat_period);
     let offset_ms = (offset_secs * 1000.0).round() as i64;
     (bpm.clamp(40.0, 240.0), offset_ms)
+}
+
+fn linear_regression_period(tap_times: &[f64]) -> f64 {
+    let n = tap_times.len();
+    let x_mean = (n - 1) as f64 / 2.0;
+    let y_mean = tap_times.iter().sum::<f64>() / n as f64;
+    let num: f64 = tap_times.iter().enumerate()
+        .map(|(i, &y)| (i as f64 - x_mean) * (y - y_mean))
+        .sum();
+    let den: f64 = (0..n).map(|i| (i as f64 - x_mean).powi(2)).sum();
+    if den <= 0.0 { return 0.0; }
+    num / den
 }
 
 /// Play a one-shot scrub snippet from the interleaved sample buffer at the given mono position.
