@@ -49,6 +49,11 @@ const SPECTRAL_PALETTES: &[(&str, (u8,u8,u8), (u8,u8,u8))] = &[
     ("green",      (120, 200,  60), ( 60, 200, 170)),
 ];
 
+fn cleanup_terminal() {
+    let _ = disable_raw_mode();
+    let _ = io::stdout().execute(PopKeyboardEnhancementFlags).and_then(|s| s.execute(DisableMouseCapture)).and_then(|s| s.execute(LeaveAlternateScreen));
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -104,13 +109,11 @@ fn main() {
                 p
             }
             Ok((BrowserResult::ReturnToPlayer, _)) | Ok((BrowserResult::Quit, _)) => {
-                let _ = disable_raw_mode();
-                let _ = io::stdout().execute(PopKeyboardEnhancementFlags).and_then(|s| s.execute(DisableMouseCapture)).and_then(|s| s.execute(LeaveAlternateScreen));
+                cleanup_terminal();
                 return;
             }
             Err(e) => {
-                let _ = disable_raw_mode();
-                let _ = io::stdout().execute(PopKeyboardEnhancementFlags).and_then(|s| s.execute(DisableMouseCapture)).and_then(|s| s.execute(LeaveAlternateScreen));
+                cleanup_terminal();
                 eprintln!("Browser error: {e}");
                 std::process::exit(1);
             }
@@ -120,8 +123,7 @@ fn main() {
     let handle = match DeviceSinkBuilder::open_default_sink() {
         Ok(h) => h,
         Err(e) => {
-            let _ = disable_raw_mode();
-            let _ = io::stdout().execute(PopKeyboardEnhancementFlags).and_then(|s| s.execute(DisableMouseCapture)).and_then(|s| s.execute(LeaveAlternateScreen));
+            cleanup_terminal();
             eprintln!("Audio output error: {e}");
             std::process::exit(1);
         }
@@ -174,8 +176,7 @@ fn main() {
             if event::poll(Duration::from_millis(30)).unwrap_or(false) {
                 if let Ok(Event::Key(key)) = event::read() {
                     if key.code == KeyCode::Char('q') {
-                        let _ = disable_raw_mode();
-                        let _ = io::stdout().execute(PopKeyboardEnhancementFlags).and_then(|s| s.execute(DisableMouseCapture)).and_then(|s| s.execute(LeaveAlternateScreen));
+                        cleanup_terminal();
                         return;
                     }
                 }
@@ -185,8 +186,7 @@ fn main() {
         let (mono, stereo, sample_rate, channels) = match decode_result {
             Ok(v) => v,
             Err(e) => {
-                let _ = disable_raw_mode();
-                let _ = io::stdout().execute(PopKeyboardEnhancementFlags).and_then(|s| s.execute(DisableMouseCapture)).and_then(|s| s.execute(LeaveAlternateScreen));
+                cleanup_terminal();
                 eprintln!("Decode error: {e}");
                 std::process::exit(1);
             }
@@ -266,16 +266,14 @@ fn main() {
             Ok(Some(path)) => { next_path = path; }
             Ok(None) => break,
             Err(e) => {
-                let _ = disable_raw_mode();
-                let _ = io::stdout().execute(PopKeyboardEnhancementFlags).and_then(|s| s.execute(DisableMouseCapture)).and_then(|s| s.execute(LeaveAlternateScreen));
+                cleanup_terminal();
                 eprintln!("TUI error: {e}");
                 std::process::exit(1);
             }
         }
     }
 
-    let _ = disable_raw_mode();
-    let _ = io::stdout().execute(PopKeyboardEnhancementFlags).and_then(|s| s.execute(DisableMouseCapture)).and_then(|s| s.execute(LeaveAlternateScreen));
+    cleanup_terminal();
 }
 
 fn tui_loop(
@@ -1516,12 +1514,6 @@ Esc            quit";
 }
 
 // ---------------------------------------------------------------------------
-// Beat marker helpers
-// ---------------------------------------------------------------------------
-
-
-
-// ---------------------------------------------------------------------------
 // Braille rendering helpers
 // ---------------------------------------------------------------------------
 
@@ -1550,7 +1542,6 @@ impl BrailleBuffer {
 ///
 /// `peaks` — one (min, max) pair per column, values in [-1, 1].
 /// Mapping: y = +1 → top dot row 0; y = −1 → bottom dot row (rows×4 − 1).
-/// Combine two adjacent braille bytes into a half-column-shifted result.
 #[derive(Clone, Copy, PartialEq)]
 enum NudgeMode { Jump, Warp }
 
@@ -1874,10 +1865,13 @@ fn compute_spectrum(mono: &[f32], pos: usize, sample_rate: u32, filter_offset: i
         20.0 * (1000.0_f64).powf(i as f64 / 31.0)
     });
 
-    // Hann window coefficients.
-    let hann: Vec<f32> = (0..N)
-        .map(|n| 0.5 * (1.0 - (2.0 * std::f64::consts::PI * n as f64 / (N - 1) as f64).cos()) as f32)
-        .collect();
+    // Hann window coefficients — computed once and reused across all calls.
+    static HANN: std::sync::OnceLock<Vec<f32>> = std::sync::OnceLock::new();
+    let hann = HANN.get_or_init(|| {
+        (0..N)
+            .map(|n| 0.5 * (1.0 - (2.0 * std::f64::consts::PI * n as f64 / (N - 1) as f64).cos()) as f32)
+            .collect()
+    });
 
     // Pre-filter the window if a filter is active.
     let filtered: Vec<f32> = if filter_offset != 0 {
@@ -2308,17 +2302,15 @@ impl SeekHandle {
 
     /// Seek to `target_secs`. Triggers a fade-out on the audio thread, which then
     /// atomically jumps to the target and fades back in — no gap, no click.
-    fn seek_to(&self, target_secs: f64) {
+    /// Find the quietest frame within ±10ms of `target_secs`, to minimise the fade-in transient.
+    fn find_quiet_frame(&self, target_secs: f64) -> usize {
         let frame_len = self.channels as usize;
         let total_frames = self.samples.len() / frame_len;
         let target_frame = (target_secs * self.sample_rate as f64).round() as i64;
         let window = self.sample_rate as i64 / 100; // 10ms in frames
-
         let search_start = (target_frame - window).max(0) as usize;
         let search_end = (target_frame + window).min(total_frames as i64) as usize;
-
-        // Find the quietest frame near the target — minimises the fade-in transient.
-        let best_frame = (search_start..=search_end)
+        (search_start..=search_end)
             .min_by_key(|&f| {
                 let base = f * frame_len;
                 let amp: f32 = (0..frame_len)
@@ -2326,8 +2318,12 @@ impl SeekHandle {
                     .sum();
                 (amp * 1_000_000.0) as u64
             })
-            .unwrap_or(target_frame.max(0) as usize);
+            .unwrap_or(target_frame.max(0) as usize)
+    }
 
+    fn seek_to(&self, target_secs: f64) {
+        let frame_len = self.channels as usize;
+        let best_frame = self.find_quiet_frame(target_secs);
         let target_sample = (best_frame * frame_len).min(self.samples.len());
 
         // Store the target, then trigger fade-out. The audio thread applies the seek
@@ -2337,41 +2333,12 @@ impl SeekHandle {
         self.fade_remaining.store(-FADE_SAMPLES, Ordering::SeqCst);
     }
 
-    /// Seek to `target_secs` with a short ~0.2ms fade — for micro-jumps where a full
-    /// 6ms fade would be longer than the jump itself.
-    fn seek_micro_fade(&self, target_secs: f64) {
-        let frame_len = self.channels as usize;
-        let total_frames = self.samples.len() / frame_len;
-        let target_frame = (target_secs * self.sample_rate as f64).round() as usize;
-        let target_sample = (target_frame * frame_len).min(self.samples.len());
-        self.fade_len.store(MICRO_FADE_SAMPLES, Ordering::SeqCst);
-        self.pending_target.store(target_sample, Ordering::SeqCst);
-        self.fade_remaining.store(-MICRO_FADE_SAMPLES, Ordering::SeqCst);
-        let _ = total_frames; // used implicitly via clamp above
-    }
-
     /// Seek to `target_secs` directly, without a fade. Used when paused — the audio
     /// thread is not calling next(), so the fade-based seek would never execute.
 
     fn seek_direct(&self, target_secs: f64) {
         let frame_len = self.channels as usize;
-        let total_frames = self.samples.len() / frame_len;
-        let target_frame = (target_secs * self.sample_rate as f64).round() as i64;
-        let window = self.sample_rate as i64 / 100;
-
-        let search_start = (target_frame - window).max(0) as usize;
-        let search_end = (target_frame + window).min(total_frames as i64) as usize;
-
-        let best_frame = (search_start..=search_end)
-            .min_by_key(|&f| {
-                let base = f * frame_len;
-                let amp: f32 = (0..frame_len)
-                    .map(|c| self.samples.get(base + c).copied().unwrap_or(0.0).abs())
-                    .sum();
-                (amp * 1_000_000.0) as u64
-            })
-            .unwrap_or(target_frame.max(0) as usize);
-
+        let best_frame = self.find_quiet_frame(target_secs);
         let target_sample = (best_frame * frame_len).min(self.samples.len());
 
         // Write position directly and clear any in-progress fade.
@@ -2514,18 +2481,16 @@ fn read_track_name(path: &str) -> String {
 // ---------------------------------------------------------------------------
 
 fn hash_mono(samples: &[f32]) -> String {
-    let mut hasher = blake3::Hasher::new();
-    for s in samples {
-        hasher.update(&s.to_le_bytes());
-    }
-    hasher.finalize().to_hex().to_string()
+    let bytes = unsafe {
+        std::slice::from_raw_parts(samples.as_ptr() as *const u8, samples.len() * 4)
+    };
+    blake3::Hasher::new().update(bytes).finalize().to_hex().to_string()
 }
 
 fn cache_path() -> std::path::PathBuf {
-    let base = std::env::var("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("."));
-    base.join(".local/share/tj/cache.json")
+    home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".local/share/tj/cache.json")
 }
 
 #[derive(Serialize, Deserialize, Clone)]

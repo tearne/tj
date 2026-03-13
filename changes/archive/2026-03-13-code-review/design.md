@@ -65,10 +65,10 @@ Both methods implement an identical search for the lowest-amplitude frame within
 These are not immediate tasks — they are documented here to inform the multi-deck proposal.
 
 **S1 — `tui_loop` is a ~1260-line monolith** (`277–1535`)
-Violates P1 and P2. It contains: the detail braille background thread spawn, per-frame state updates (smooth position, beat flash, calibration pulse, metronome, spectrum), the full draw closure (~500 lines), adaptive frame rate logic, the event loop, and all action dispatch. A reader cannot understand the high-level flow without reading the entire function.
+Violates P1 and P2. It contains: the detail braille background thread spawn, per-frame state updates (smooth position, beat flash, metronome, spectrum), the full draw closure (~500 lines), adaptive frame rate logic, the event loop, and all action dispatch. A reader cannot understand the high-level flow without reading the entire function.
 
 Natural decomposition for multi-deck:
-- `PlayerState` struct — `bpm`, `base_bpm`, `offset_ms`, `volume`, `nudge`, `nudge_mode`, `filter_offset`, `calibration_mode`, `audio_latency_ms`, `metronome_mode`
+- `PlayerState` struct — `bpm`, `base_bpm`, `offset_ms`, `volume`, `nudge`, `nudge_mode`, `filter_offset`, `audio_latency_ms`, `metronome_mode`
 - `DisplayState` struct — `spectrum_chars`, `spectrum_bg`, `spectrum_bg_accum`, `last_*` timers, `zoom_idx`, `detail_height`, `palette_idx`, `smooth_display_samp`
 - `fn update_display_position(...)` — smooth position + latency compensation
 - `fn update_spectrum(...)` — spectrum timing + compute
@@ -94,10 +94,10 @@ It takes `filter_offset: i32` and re-runs the biquad to match `FilterSource`'s o
 
 ## Tasks
 
-1. **Impl**: Fix D1, D2, D3, D4 — remove dead code
-2. **Impl**: Fix U1 — extract `cleanup_terminal()`
-3. **Impl**: Fix U2 — extract `SeekHandle::find_quiet_frame()`
-4. **Impl**: Fix U3 — `cache_path` uses `home_dir()`
-5. **Impl**: Fix P1 — `hash_mono` bulk hashing
-6. **Impl**: Fix P2 — Hann window as `OnceLock` static
-7. **Process**: Archive code review; the `multi-deck` proposal (`changes/open/multi-deck/proposal.md`) already exists and incorporates S1–S4 as prerequisites. Verify it is complete before archiving.
+1. ✓ **Impl**: Fix D1, D2, D3, D4 — remove dead code
+2. ✓ **Impl**: Fix U1 — extract `cleanup_terminal()`
+3. ✓ **Impl**: Fix U2 — extract `SeekHandle::find_quiet_frame()`
+4. ✓ **Impl**: Fix U3 — `cache_path` uses `home_dir()`
+5. ✓ **Impl**: Fix P1 — `hash_mono` bulk hashing
+6. ✓ **Impl**: Fix P2 — Hann window as `OnceLock` static
+7. ✓ **Process**: Multi-deck proposal verified complete. S1 updated (calibration_mode removed). Ready to archive.
