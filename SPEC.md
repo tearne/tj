@@ -69,14 +69,14 @@ tj [path]
 - When playback reaches the end of the track, the transport pauses and the playhead returns to the start. The player view stays open and fully interactive.
 - Decode runs on a background thread. A loading screen displays a progress bar showing decode progress.
 - Playback begins as soon as decode completes, before BPM analysis is finished.
-- Displays track metadata: title, artist, album, duration, current position. The track name (artist – title, or filename) is shown in the track name bar above the info bar.
+- Displays track metadata: title, artist, album, duration, current position. The track name (artist – title, or filename) is shown in the notification bar above the info bar.
 - The TUI frame border title shows `tj vX.Y.Z` only.
 
 ### Beat Detection
 - BPM is auto-detected from the audio on load, assuming a constant tempo throughout the track. Hash computation and BPM detection run on a background thread after decode; playback starts immediately with a 120 BPM placeholder.
 - While BPM analysis is in progress, beat markers are suppressed, the beat indicator does not flash, and the BPM line shows an animated indicator (e.g. `BPM: --- [analysing ⠋]`). Beat jump uses the 120 BPM placeholder.
 - When analysis completes and no BPM is yet established (fresh load, no cache, no tap or manual adjustment), the BPM is applied immediately. If a BPM is already established, the result is held as a pending confirmation.
-- While a confirmation is pending, the info bar right group is replaced with a red prompt showing the detected BPM and a countdown (e.g. `BPM detected: 124.40  [y] accept  [n] reject  (14s)`). Pressing `y` or `Enter` applies the result; any other key rejects it. After 15 seconds the result is auto-rejected and the pre-existing BPM and offset are preserved.
+- While a confirmation is pending, the notification bar shows a yellow prompt with the detected BPM and a countdown (e.g. `BPM detected: 124.40  [y] accept  [n] reject  (14s)`); the countdown number turns red when ≤ 5 s remain. The info bar right group is unaffected. Pressing `y` or `Enter` applies the result; any other key rejects it. After 15 seconds the result is auto-rejected and the pre-existing BPM and offset are preserved.
 - `@` triggers a manual re-detection pass at any time. The result always goes through the confirmation step. Pressing `@` while analysis is in progress hides the spinner (the thread continues silently); pressing `@` again reconnects to the same thread rather than spawning a new one.
 - The detected BPM is displayed to two decimal places.
 - A beat phase offset (in milliseconds) can be adjusted at runtime to align the beat indicator with the audio. The offset and BPM are displayed in the UI.
@@ -89,9 +89,12 @@ tj [path]
 - Each cache entry includes the filename at time of first detection as a human-readable hint to aid manual cache management.
 - On quit, the current phase offset is persisted to the cache.
 
-### Track Name Bar
-- A single line displayed above the info bar, showing the track name derived from embedded metadata: `Artist – Title` if both are present, `Title` if only a title is available, or the filename as a fallback. Shown only when a track is loaded.
-- If no config file is found on first launch, the track name bar briefly displays the path at which the default config was created, then reverts to the track name.
+### Notification Bar
+- A single line displayed above the info bar. By default it shows the track name derived from embedded metadata: `Artist – Title` if both are present, `Title` if only a title is available, or the filename as a fallback. Shown only when a track is loaded.
+- When a notification is active it temporarily replaces the track name. Notifications carry a message, a style (`Info` / `Warning` / `Error`), and an expiry; the most recent notification takes precedence. Notifications expire automatically after their timeout; no explicit dismissal is required.
+- The track name is rendered in a muted form of the active palette's treble colour, distinguishing it visually from notification text.
+- The BPM confirmation prompt (see Beat Detection) is displayed as a `Warning`-style notification.
+- If no config file is found on first launch, an `Info` notification briefly displays the path at which the default config was created, then the bar reverts to the track name.
 
 ### Info Bar
 - A single line below the track name bar. Content is split into two groups separated by a variable-width spacer that fills remaining width, keeping the right group pinned to the right edge regardless of transient field changes:
@@ -101,7 +104,7 @@ tj [path]
 - When no tempo adjustment is active, the detected BPM is shown to two decimal places (e.g. `120.00`) and receives a soft amber beat-flash. When a `f`/`v` adjustment is active, the detected BPM is shown plain and the adjusted tempo is shown alongside in parentheses (e.g. `120.00 (124.40)`), with only the adjusted number receiving the beat-flash.
 - `F` increases `base_bpm` by 0.01; `V` decreases it by 0.01. Both clamp to 40.0–240.0. Adjusting `base_bpm` resets any active `f`/`v` playback offset (`bpm` is set equal to the new `base_bpm`, speed returns to 1×) and is persisted to the cache immediately.
 - Pressing `?` opens a modal key binding reference overlay; any key dismisses it.
-- During BPM analysis the BPM field shows an animated spinner. When a confirmation is pending, the right group is replaced with a red prompt (see Beat Detection).
+- During BPM analysis the BPM field shows an animated spinner. When a confirmation is pending, the prompt appears in the notification bar (see Beat Detection); the right group is always rendered normally.
 - A BPM is considered "established" once it has been loaded from cache, set by tap, or adjusted with `f`/`v`/`F`/`V`. Only established BPM triggers confirmation on new detection.
 
 ### Waveform Visualisation

@@ -1,5 +1,5 @@
 # Proposal: Notification Bar
-**Status: Draft**
+**Status: Approved**
 
 ## Intent
 
@@ -19,7 +19,8 @@ Repurpose the track name bar as a dual-purpose notification area. When a notific
 
 - A notification has a message string, an optional style (default: dim; could be red for warnings), and an expiry. When multiple notifications are queued, the most recent takes precedence.
 
-## Unresolved
+## Notes
 
-- Should the countdown timer for BPM confirmation remain visible, or is the prompt alone sufficient?
-- Are there other existing messages that should migrate to the notification bar?
+- BPM confirmation countdown remains visible; the countdown number is highlighted (e.g. red) when low.
+- Track load errors are routed through the notification bar.
+- Latency and metronome are persistent status indicators already in the info bar — not notifications.

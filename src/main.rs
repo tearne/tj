@@ -41,7 +41,6 @@ const OVERVIEW_RESOLUTION: usize = 4000;
 const ZOOM_LEVELS: &[f32] = &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
 const DEFAULT_ZOOM_IDX: usize = 2; // 4 seconds
 const FADE_SAMPLES: i64 = 256;       // ~5.8ms at 44100 Hz — fade-out then fade-in around each seek
-const MICRO_FADE_SAMPLES: i64 = 8;  // ~0.2ms — used for micro-jumps (c/d keys)
 /// Spectral colour palettes: (name, bass_rgb, treble_rgb).
 const SPECTRAL_PALETTES: &[(&str, (u8,u8,u8), (u8,u8,u8))] = &[
     ("amber/cyan", (255, 140,   0), (  0, 200, 200)),
@@ -135,10 +134,6 @@ fn main() {
 
     loop {
         let path_str = next_path.to_string_lossy().to_string();
-        let file_dir = next_path.parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-
         let decoded_samples = Arc::new(AtomicUsize::new(0));
         let estimated_total = Arc::new(AtomicUsize::new(0));
         let (decode_tx, decode_rx) = mpsc::channel::<Result<(Vec<f32>, Vec<f32>, u32, u16), String>>();
@@ -252,7 +247,6 @@ fn main() {
             &mut terminal,
             &filename,
             &track_name,
-            &file_dir,
             bpm_rx,
             total_duration,
             Arc::clone(&waveform),
@@ -282,7 +276,6 @@ fn tui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     filename: &str,
     track_name: &str,
-    file_dir: &std::path::Path,
     mut bpm_rx: mpsc::Receiver<(String, f32, i64, bool)>,
     total_duration: Duration,
     waveform: Arc<WaveformData>,
@@ -313,7 +306,11 @@ fn tui_loop(
     // Smooth display position: advances via wall clock to avoid audio-buffer-burst jitter.
     let mut smooth_display_samp: f64 = 0.0;
     let mut last_render = Instant::now();
-    let config_notice_start = Instant::now();
+    let mut active_notification: Option<Notification> = config_notice.map(|msg| Notification {
+        message: msg,
+        style:   NotificationStyle::Info,
+        expires: Instant::now() + Duration::from_secs(5),
+    });
     let mut last_viewport_start: usize = 0;
     const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let mut zoom_idx: usize = DEFAULT_ZOOM_IDX;
@@ -324,7 +321,6 @@ fn tui_loop(
     let mut nudge: i8 = 0; // -1 = backward, 0 = none, +1 = forward
     let mut nudge_mode = NudgeMode::Jump;
     let mut space_held = false;
-    let mut space_chord_fired = false;
     let mut volume: f32 = 1.0;
     let mut help_open = false;
     let mut palette_idx: usize = 0;
@@ -637,11 +633,6 @@ fn tui_loop(
             }
         }
 
-        let fmt_dur = |d: Duration| {
-            let s = d.as_secs();
-            format!("{:02}:{:02}", s / 60, s % 60)
-        };
-        let time_str = format!("{} / {}", fmt_dur(pos), fmt_dur(total_duration));
         detail_zoom_at.store(zoom_idx, Ordering::Relaxed);
 
         terminal.draw(|frame| {
@@ -671,17 +662,38 @@ fn tui_loop(
                 ])
                 .split(chunks[3])[0];
 
-            // Track name bar
-            let name_line = if let Some(ref notice) = config_notice {
-                if config_notice_start.elapsed().as_secs() < 5 {
-                    Line::from(Span::styled(notice.clone(), Style::default().fg(Color::DarkGray)))
+            // Expire stale notifications each frame.
+            if active_notification.as_ref().map_or(false, |n| Instant::now() >= n.expires) {
+                active_notification = None;
+            }
+
+            // Notification bar — priority: pending BPM confirmation > active notification > track name.
+            let notification_line = if let Some((_, p_bpm, _, received_at)) = &pending_bpm {
+                let secs_left = 15u64.saturating_sub(received_at.elapsed().as_secs());
+                let yellow = Style::default().fg(Color::Yellow);
+                let countdown_style = if secs_left <= 5 {
+                    Style::default().fg(Color::Red)
                 } else {
-                    Line::from(Span::styled(track_name.to_string(), Style::default().fg(Color::DarkGray)))
-                }
+                    yellow
+                };
+                Line::from(vec![
+                    Span::styled(format!("BPM detected: {p_bpm:.2}  [y] accept  [n] reject  ("), yellow),
+                    Span::styled(format!("{secs_left}s"), countdown_style),
+                    Span::styled(")", yellow),
+                ])
+            } else if let Some(ref n) = active_notification {
+                let color = match n.style {
+                    NotificationStyle::Info    => Color::DarkGray,
+                    NotificationStyle::Warning => Color::Yellow,
+                    NotificationStyle::Error   => Color::Red,
+                };
+                Line::from(Span::styled(n.message.clone(), Style::default().fg(color)))
             } else {
-                Line::from(Span::styled(track_name.to_string(), Style::default().fg(Color::DarkGray)))
+                let (_, _, (tr, tg, tb)) = SPECTRAL_PALETTES[palette_idx];
+                let muted = |c: u8| (c as f32 * 0.55) as u8;
+                Line::from(Span::styled(track_name.to_string(), Style::default().fg(Color::Rgb(muted(tr), muted(tg), muted(tb)))))
             };
-            frame.render_widget(Paragraph::new(name_line), chunks[0]);
+            frame.render_widget(Paragraph::new(notification_line), chunks[0]);
 
             // Info bar
             {
@@ -722,7 +734,7 @@ fn tui_loop(
                     let adjusted = (bpm - base_bpm).abs() >= 0.05;
 
                     // --- Left group ---
-                    let mut left_spans: Vec<Span<'static>> = {
+                    let left_spans: Vec<Span<'static>> = {
                         let mut spans = vec![Span::styled(format!("{play_icon}  "), dim)];
                         if adjusted {
                             spans.push(Span::styled(format!("{:.2} ", base_bpm), dim));
@@ -744,14 +756,6 @@ fn tui_loop(
 
                     // --- Right group ---
                     let mut right_spans: Vec<Span<'static>> = Vec::new();
-                    if let Some((_, p_bpm, _, received_at)) = &pending_bpm {
-                        let secs_left = 15u64.saturating_sub(received_at.elapsed().as_secs());
-                        let red = Style::default().fg(Color::Red);
-                        right_spans.push(Span::styled(
-                            format!("BPM detected: {:.2}  [y] accept  [n] reject  ({}s)", p_bpm, secs_left),
-                            red,
-                        ));
-                    } else {
                     if !nudge_str.is_empty() {
                         right_spans.push(Span::styled(nudge_str.to_string(), dim));
                     }
@@ -803,7 +807,6 @@ fn tui_loop(
                         }
                         right_spans.push(Span::styled("\u{258F}".to_string(), dim));
                     }
-                    } // end pending_bpm
 
                     // Spacer: fill gap between left and right groups.
                     let bar_w = chunks[1].width as usize;
@@ -1117,7 +1120,6 @@ Esc            quit";
                         && row >= rect.y as usize
                         && row < (rect.y + rect.height) as usize
                     {
-                        let overview_width = rect.width as usize;
                         let click_col = col - rect.x as usize;
                         let target_secs = last_bar_cols.iter().zip(last_bar_times.iter())
                             .filter(|(c, _)| **c <= click_col)
@@ -1147,7 +1149,7 @@ Esc            quit";
                 // Space modifier: track held state for chords.
                 if key.code == KeyCode::Char(' ') {
                     match key.kind {
-                        KeyEventKind::Press  => { space_held = true; space_chord_fired = false; }
+                        KeyEventKind::Press  => { space_held = true; }
                         KeyEventKind::Release => { space_held = false; }
                         _ => {}
                     }
@@ -1243,7 +1245,6 @@ Esc            quit";
                     }
                     let action = if space_held && key.code != KeyCode::Char(' ') {
                         if let Some(a) = keymap.get(&KeyBinding::SpaceChord(key.code)) {
-                            space_chord_fired = true;
                             space_held = false; // reset so subsequent keys aren't treated as chords
                             Some(a)
                         } else {
@@ -1505,7 +1506,6 @@ Esc            quit";
             }
         }
 
-        let total_mono_samps = seek_handle.samples.len() / seek_handle.channels as usize;
         let at_end = seek_handle.position.load(Ordering::Relaxed) >= seek_handle.samples.len();
         if at_end && !player.is_paused() {
             player.pause();
@@ -1546,6 +1546,15 @@ impl BrailleBuffer {
 /// Mapping: y = +1 → top dot row 0; y = −1 → bottom dot row (rows×4 − 1).
 #[derive(Clone, Copy, PartialEq)]
 enum NudgeMode { Jump, Warp }
+
+#[allow(dead_code)]
+enum NotificationStyle { Info, Warning, Error }
+
+struct Notification {
+    message: String,
+    style:   NotificationStyle,
+    expires: Instant,
+}
 
 // ---------------------------------------------------------------------------
 // Keyboard mapping
