@@ -1,4 +1,5 @@
 use std::io;
+use color_eyre::Result as EyreResult;
 use std::num::NonZero;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicUsize, Ordering};
@@ -55,6 +56,7 @@ fn cleanup_terminal() {
 }
 
 fn main() {
+    color_eyre::install().expect("color_eyre initialisation should succeed at startup");
     let args: Vec<String> = std::env::args().collect();
 
     let arg = args.get(1).map(std::path::PathBuf::from);
@@ -142,10 +144,10 @@ fn main() {
         let (decode_tx, decode_rx) = mpsc::channel::<Result<(Vec<f32>, Vec<f32>, u32, u16), String>>();
         {
             let path_clone = path_str.clone();
-            let ds = Arc::clone(&decoded_samples);
-            let et = Arc::clone(&estimated_total);
+            let decoded_samples_for_thread = Arc::clone(&decoded_samples);
+            let estimated_total_for_thread = Arc::clone(&estimated_total);
             thread::spawn(move || {
-                let _ = decode_tx.send(decode_audio(&path_clone, ds, et).map_err(|e| e.to_string()));
+                let _ = decode_tx.send(decode_audio(&path_clone, decoded_samples_for_thread, estimated_total_for_thread).map_err(|e| e.to_string()));
             });
         }
 
@@ -482,7 +484,7 @@ fn tui_loop(
         }
 
         // Snapshot samples_per_col for use in scrub outside the draw closure.
-        let scrub_spc = detail_braille_shared.lock().unwrap().samples_per_col;
+        let scrub_samples_per_col = detail_braille_shared.lock().unwrap().samples_per_col;
 
         let now = Instant::now();
         let dc = detail_cols.load(Ordering::Relaxed);
@@ -516,12 +518,12 @@ fn tui_loop(
             // Use set_position (no quiet-frame search) — no audio is playing so no click occurs.
             seek_handle.set_position(smooth_display_samp / sample_rate as f64);
             // Scrub: fire a snippet once per half-column advance for smooth continuity.
-            let half_spc = (scrub_spc / 2).max(1);
-            if scrub_spc > 0
-                && (smooth_display_samp - last_scrub_samp).abs() >= half_spc as f64
+            let half_samples_per_col = (scrub_samples_per_col / 2).max(1);
+            if scrub_samples_per_col > 0
+                && (smooth_display_samp - last_scrub_samp).abs() >= half_samples_per_col as f64
             {
                 scrub_audio(mixer, &seek_handle.samples, seek_handle.channels as u16,
-                            sample_rate, smooth_display_samp as usize, half_spc);
+                            sample_rate, smooth_display_samp as usize, half_samples_per_col);
                 last_scrub_samp = smooth_display_samp;
             }
         }
@@ -817,34 +819,34 @@ fn tui_loop(
             }
 
             // Overview waveform — Braille rendered fresh each frame (O(cols×rows), negligible).
-            let ow = chunks[2].width as usize;
-            let oh = chunks[2].height as usize;
+            let overview_width = chunks[2].width as usize;
+            let overview_height = chunks[2].height as usize;
             let total_peaks = waveform.peaks.len();
             let playhead_frac = if total_duration.is_zero() {
                 0.0
             } else {
                 (display_samp / sample_rate as f64 / total_duration.as_secs_f64()).clamp(0.0, 1.0)
             };
-            let playhead_col = ((playhead_frac * ow as f64).round() as usize).min(ow.saturating_sub(1));
+            let playhead_col = ((playhead_frac * overview_width as f64).round() as usize).min(overview_width.saturating_sub(1));
 
             // Sample at double width for half-column braille resolution.
-            let (ov_peaks_hires, ov_bass_hires): (Vec<(f32, f32)>, Vec<f32>) = (0..ow * 2)
+            let (ov_peaks_hires, ov_bass_hires): (Vec<(f32, f32)>, Vec<f32>) = (0..overview_width * 2)
                 .map(|col| {
-                    let idx = (col * total_peaks / (ow * 2).max(1)).min(total_peaks.saturating_sub(1));
+                    let idx = (col * total_peaks / (overview_width * 2).max(1)).min(total_peaks.saturating_sub(1));
                     (waveform.peaks[idx], waveform.bass_ratio[idx])
                 })
                 .unzip();
-            let hires_buf = render_braille(&ov_peaks_hires, oh, ow * 2, false);
+            let hires_buf = render_braille(&ov_peaks_hires, overview_height, overview_width * 2, false);
             // Pack pairs: left dot column from even half-col, right from odd half-col.
             // 0x47 = left dot bits (0,1,2,6); 0xB8 = right dot bits (3,4,5,7).
             let ov_braille: Vec<Vec<u8>> = hires_buf.iter()
-                .map(|row| (0..ow).map(|c| (row[c * 2] & 0x47) | (row[c * 2 + 1] & 0xB8)).collect())
+                .map(|row| (0..overview_width).map(|c| (row[c * 2] & 0x47) | (row[c * 2 + 1] & 0xB8)).collect())
                 .collect();
-            let ov_bass: Vec<f32> = (0..ow)
+            let ov_bass: Vec<f32> = (0..overview_width)
                 .map(|c| (ov_bass_hires[c * 2] + ov_bass_hires[c * 2 + 1]) / 2.0)
                 .collect();
             let (bar_cols, bar_times, bars_per_tick): (Vec<usize>, Vec<f64>, u32) = if !analysing {
-                bar_tick_cols(base_bpm as f64, offset_ms, total_duration.as_secs_f64(), ow)
+                bar_tick_cols(base_bpm as f64, offset_ms, total_duration.as_secs_f64(), overview_width)
             } else {
                 (Vec::new(), Vec::new(), 4)
             };
@@ -856,7 +858,7 @@ fn tui_loop(
             } else {
                 String::new()
             };
-            let legend_start = ow.saturating_sub(legend.len());
+            let legend_start = overview_width.saturating_sub(legend.len());
 
             let ov_lines: Vec<Line<'static>> = ov_braille
                 .into_iter()
@@ -911,15 +913,15 @@ fn tui_loop(
             frame.render_widget(Paragraph::new(ov_lines), chunks[2]);
 
             // Detail waveform — pan a viewport through the stable background-thread buffer.
-            let dw = detail_area.width as usize;
-            let dh = detail_area.height as usize;
-            detail_cols.store(dw, Ordering::Relaxed);
+            let detail_width = detail_area.width as usize;
+            let detail_panel_rows = detail_area.height as usize;
+            detail_cols.store(detail_width, Ordering::Relaxed);
             // Reserve top and bottom rows for tick marks; waveform uses the inner rows.
-            let waveform_rows = dh.saturating_sub(2);
+            let waveform_rows = detail_panel_rows.saturating_sub(2);
             detail_rows.store(waveform_rows, Ordering::Relaxed);
             let buf = Arc::clone(&*detail_braille_shared.lock().unwrap());
-            let centre_col = ((dw as f64 * display_cfg.playhead_position as f64 / 100.0) as usize)
-                .clamp(0, dw.saturating_sub(1));
+            let centre_col = ((detail_width as f64 * display_cfg.playhead_position as f64 / 100.0) as usize)
+                .clamp(0, detail_width.saturating_sub(1));
 
             // Compute the column offset into the buffer that places the playhead at centre_col.
             // Uses smooth_display_samp (wall-clock based) to avoid audio-buffer-burst jitter.
@@ -928,7 +930,7 @@ fn tui_loop(
             let mut sub_col = false;
             let mut delta_half_global: i64 = 0;
             let mut half_col_samp_global: f64 = 1.0;
-            let viewport_start: Option<usize> = if buf.buf_cols >= dw && buf.samples_per_col > 0 {
+            let viewport_start: Option<usize> = if buf.buf_cols >= detail_width && buf.samples_per_col > 0 {
                 let delta = display_pos_samp as i64 - buf.anchor_sample as i64;
                 let half_col_samp = buf.samples_per_col as f64 / 2.0;
                 let delta_half = (delta as f64 / half_col_samp).round() as i64;
@@ -936,19 +938,19 @@ fn tui_loop(
                 delta_half_global = delta_half;
                 half_col_samp_global = half_col_samp;
                 // div_euclid gives floor division so column-step phase is symmetric across
-                // positive and negative delta (vs advances once per full column, consistently).
+                // positive and negative delta (viewport_offset advances once per full column, consistently).
                 let delta_cols = delta_half.div_euclid(2);
-                let vs = buf.buf_cols as i64 / 2 + delta_cols - centre_col as i64;
-                // Need dw+1 columns when sub_col to supply the extra byte for the shift.
-                let need = if sub_col { dw + 1 } else { dw };
-                if vs >= 0 && (vs as usize) + need <= buf.buf_cols {
-                    let v = vs as usize;
-                    last_viewport_start = v;
-                    Some(v)
+                let viewport_offset = buf.buf_cols as i64 / 2 + delta_cols - centre_col as i64;
+                // Need detail_width+1 columns when sub_col to supply the extra byte for the shift.
+                let need = if sub_col { detail_width + 1 } else { detail_width };
+                if viewport_offset >= 0 && (viewport_offset as usize) + need <= buf.buf_cols {
+                    let start = viewport_offset as usize;
+                    last_viewport_start = start;
+                    Some(start)
                 } else {
-                    // vs out of bounds means either a seek just happened or the buffer hasn't
+                    // viewport_offset out of bounds means either a seek just happened or the buffer hasn't
                     // been recomputed yet. Show blank — the background thread recomputes at 75%
-                    // capacity, so in normal playback vs never reaches the buffer edges.
+                    // capacity, so in normal playback viewport_offset never reaches the buffer edges.
                     None
                 }
             } else {
@@ -956,27 +958,27 @@ fn tui_loop(
             };
 
             // Compute tick marks directly in display space at half-column resolution.
-            // Uses the same quantized visual centre as the waveform (anchor + delta_half * half_spc)
+            // Uses the same quantized visual centre as the waveform (anchor + delta_half * half_samples_per_col)
             // so ticks and waveform step in exact lock-step.
-            // Each beat: disp_half = round((t_samp - view_start) / half_spc);
+            // Each beat: disp_half = round((t_samp - view_start) / half_samples_per_col);
             //   even → left-half tick  (0x47 = ⡇), odd → right-half tick (0xB8 = ⢸).
             let tick_display: Vec<u8> = if !analysing && buf.samples_per_col > 0 {
-                let mut row = vec![0u8; dw];
-                let spc = buf.samples_per_col as f64;
-                let half_spc = half_col_samp_global;
+                let mut row = vec![0u8; detail_width];
+                let samples_per_col = buf.samples_per_col as f64;
+                let half_samples_per_col = half_col_samp_global;
                 let beat_period_samp = 60.0 / base_bpm as f64 * sample_rate as f64;
                 let offset_samp = offset_ms as f64 / 1000.0 * sample_rate as f64;
                 // Quantized visual centre: same reference point the waveform uses.
-                let visual_centre = buf.anchor_sample as f64 + delta_half_global as f64 * half_spc;
-                let view_start = visual_centre - centre_col as f64 * spc;
-                let view_end = view_start + dw as f64 * spc;
+                let visual_centre = buf.anchor_sample as f64 + delta_half_global as f64 * half_samples_per_col;
+                let view_start = visual_centre - centre_col as f64 * samples_per_col;
+                let view_end = view_start + detail_width as f64 * samples_per_col;
                 let n_start = ((view_start - offset_samp) / beat_period_samp).floor() as i64 - 1;
                 let mut t_samp = offset_samp + n_start as f64 * beat_period_samp;
                 while t_samp <= view_end {
-                    let disp_half = ((t_samp - view_start) / half_spc).round() as i64;
+                    let disp_half = ((t_samp - view_start) / half_samples_per_col).round() as i64;
                     if disp_half >= 0 {
                         let col = (disp_half / 2) as usize;
-                        if col < dw {
+                        if col < detail_width {
                             row[col] = if disp_half % 2 != 0 { 0xB8 } else { 0x47 };
                         }
                     }
@@ -987,9 +989,9 @@ fn tui_loop(
                 vec![]
             };
 
-            let detail_lines: Vec<Line<'static>> = (0..dh)
+            let detail_lines: Vec<Line<'static>> = (0..detail_panel_rows)
                 .map(|r| {
-                    let is_tick_row = r == 0 || r + 1 == dh;
+                    let is_tick_row = r == 0 || r + 1 == detail_panel_rows;
                     // Tick rows: computed directly in display space — no viewport slice or
                     // shift_braille_half needed. Waveform rows: apply shift_braille_half when
                     // sub_col for smooth half-column scrolling.
@@ -998,26 +1000,26 @@ fn tui_loop(
                     let row_slice: Option<&[u8]>;
                     if is_tick_row {
                         shifted = None;
-                        row_slice = if tick_display.len() == dw { Some(&tick_display) } else { None };
+                        row_slice = if tick_display.len() == detail_width { Some(&tick_display) } else { None };
                     } else {
                         let buf_r = r - 1;
                         shifted = if sub_col {
-                            viewport_start.and_then(|vs| {
+                            viewport_start.and_then(|start| {
                                 buf.grid.get(buf_r).map(|row| {
-                                    (0..dw).map(|c| shift_braille_half(row[vs + c], row[vs + c + 1])).collect()
+                                    (0..detail_width).map(|c| shift_braille_half(row[start + c], row[start + c + 1])).collect()
                                 })
                             })
                         } else { None };
                         row_slice = if sub_col {
                             shifted.as_deref()
                         } else {
-                            viewport_start.and_then(|vs| buf.grid.get(buf_r).map(|row| &row[vs..vs + dw]))
+                            viewport_start.and_then(|start| buf.grid.get(buf_r).map(|row| &row[start..start + detail_width]))
                         };
                     }
                     let _ = &shifted; // lifetime anchor — keeps shifted alive until row_slice is done
 
                     let row = match row_slice {
-                        None => return Line::from(Span::raw("\u{2800}".repeat(dw))),
+                        None => return Line::from(Span::raw("\u{2800}".repeat(detail_width))),
                         Some(s) => s,
                     };
                     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -1115,7 +1117,7 @@ Esc            quit";
                         && row >= rect.y as usize
                         && row < (rect.y + rect.height) as usize
                     {
-                        let ow = rect.width as usize;
+                        let overview_width = rect.width as usize;
                         let click_col = col - rect.x as usize;
                         let target_secs = last_bar_cols.iter().zip(last_bar_times.iter())
                             .filter(|(c, _)| **c <= click_col)
@@ -1173,7 +1175,7 @@ Esc            quit";
                                 smooth_display_samp += (target - current) * sample_rate as f64;
                                 if player.is_paused() {
                                     scrub_audio(mixer, &seek_handle.samples, seek_handle.channels as u16,
-                                                sample_rate, smooth_display_samp as usize, scrub_spc);
+                                                sample_rate, smooth_display_samp as usize, scrub_samples_per_col);
                                 }
                             }
                             NudgeMode::Warp => {
@@ -1193,7 +1195,7 @@ Esc            quit";
                                 smooth_display_samp += (target - current) * sample_rate as f64;
                                 if player.is_paused() {
                                     scrub_audio(mixer, &seek_handle.samples, seek_handle.channels as u16,
-                                                sample_rate, smooth_display_samp as usize, scrub_spc);
+                                                sample_rate, smooth_display_samp as usize, scrub_samples_per_col);
                                 }
                             }
                             NudgeMode::Warp => {
@@ -2370,7 +2372,7 @@ fn decode_audio(
     path: &str,
     decoded_samples: Arc<AtomicUsize>,
     estimated_total: Arc<AtomicUsize>,
-) -> Result<(Vec<f32>, Vec<f32>, u32, u16), Box<dyn std::error::Error>> {
+) -> EyreResult<(Vec<f32>, Vec<f32>, u32, u16)> {
     let src = std::fs::File::open(path)?;
     let mss = MediaSourceStream::new(Box::new(src), Default::default());
 
@@ -2388,10 +2390,10 @@ fn decode_audio(
         .tracks()
         .iter()
         .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-        .ok_or("no audio track found")?;
+        .ok_or_else(|| color_eyre::eyre::eyre!("no audio track found"))?;
 
     let track_id = track.id;
-    let sample_rate = track.codec_params.sample_rate.ok_or("track has no sample rate")?;
+    let sample_rate = track.codec_params.sample_rate.ok_or_else(|| color_eyre::eyre::eyre!("track has no sample rate"))?;
     let channels = track.codec_params.channels.map(|c| c.count()).unwrap_or(2) as u16;
 
     if let Some(n_frames) = track.codec_params.n_frames {
@@ -2591,9 +2593,9 @@ impl Cache {
 // BPM detection
 // ---------------------------------------------------------------------------
 
-fn detect_bpm(samples: &[f32], sample_rate: u32) -> Result<f32, Box<dyn std::error::Error>> {
+fn detect_bpm(samples: &[f32], sample_rate: u32) -> EyreResult<f32> {
     let result = analyze_audio(samples, sample_rate, AnalysisConfig::default())
-        .map_err(|e| format!("stratum-dsp: {e:?}"))?;
+        .map_err(|e| color_eyre::eyre::eyre!("stratum-dsp: {e:?}"))?;
     Ok(result.bpm)
 }
 

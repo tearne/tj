@@ -1,5 +1,5 @@
 # Proposal: Style Conformance
-**Status: Draft**
+**Status: Approved**
 
 ## Intent
 
