@@ -295,7 +295,6 @@ fn tui_loop(
     let mut last_render = Instant::now();
     let mut help_open = false;
     let mut space_held = false;
-
     struct InactiveDeckRender {
         display_samp:     f64,
         display_pos_samp: usize,
@@ -305,30 +304,38 @@ fn tui_loop(
         warn_beat_on:     bool,
     }
 
-    loop {
+    'tui: loop {
         frame_count += 1;
         let inactive = 1 - active_deck;
         let buf_a = Arc::clone(&*shared_renderer.shared_a.lock().unwrap());
         let buf_b = Arc::clone(&*shared_renderer.shared_b.lock().unwrap());
 
         // Frame timing — computed once and shared by both decks.
-        let now = Instant::now();
         let dc = shared_renderer.cols.load(Ordering::Relaxed);
         let zoom_secs = ZOOM_LEVELS[zoom_idx];
         let col_secs = if dc > 0 { zoom_secs as f64 / dc as f64 } else { 0.033 };
-        let elapsed = now.duration_since(last_render).as_secs_f64()
-            // Cap at 4 columns per frame. Must exceed the minimum poll_dur (8ms) at every zoom
+
+        // Frame budget: one half-column of scroll time, clamped to a sane range.
+        // Sleep is deferred to the END of the loop so variable draw/write time is absorbed
+        // automatically — the sleep shrinks to compensate for a slow terminal flush.
+        let frame_dur = Duration::from_secs_f64(col_secs / 2.0)
+            .max(Duration::from_millis(8))
+            .min(Duration::from_millis(200));
+
+        let frame_start = Instant::now();
+        let elapsed = frame_start.duration_since(last_render).as_secs_f64()
+            // Cap at 4 columns per frame. Must exceed the minimum frame_dur (8ms) at every zoom
             // level — a tighter cap causes systematic drift and periodic large-drift snapping.
             .min(col_secs * 4.0);
-        last_render = now;
+        last_render = frame_start;
 
         // Expire global notification.
-        if global_notification.as_ref().map_or(false, |n| now >= n.expires) {
+        if global_notification.as_ref().map_or(false, |n| frame_start >= n.expires) {
             global_notification = None;
         }
         // Expire inactive deck's active notification.
         if let Some(ref mut d) = decks[inactive] {
-            if d.active_notification.as_ref().map_or(false, |n| now >= n.expires) {
+            if d.active_notification.as_ref().map_or(false, |n| frame_start >= n.expires) {
                 d.active_notification = None;
             }
         }
@@ -351,10 +358,15 @@ fn tui_loop(
                 d.display.smooth_display_samp += elapsed * d.audio.sample_rate as f64 * speed;
                 let drift = d.display.smooth_display_samp - pos_samp as f64;
                 if drift.abs() > d.audio.sample_rate as f64 * 0.5 {
+                    // Large drift backstop (seek / startup): snap to nearest half-column.
                     let col_samp_f64 = col_secs * d.audio.sample_rate as f64 * speed;
-                    d.display.smooth_display_samp = if col_samp_f64 > 0.0 {
-                        (pos_samp as f64 / col_samp_f64).round() * col_samp_f64
+                    let half_col = col_samp_f64 / 2.0;
+                    d.display.smooth_display_samp = if half_col > 0.0 {
+                        (pos_samp as f64 / half_col).round() * half_col
                     } else { pos_samp as f64 };
+                } else {
+                    // Slew correction: nudge toward true position at 5% per frame.
+                    d.display.smooth_display_samp -= drift * 0.05;
                 }
             }
             // Spectrum analyser: same half-beat / 8-beat cadence as the active deck.
@@ -426,7 +438,7 @@ fn tui_loop(
         // If the active deck slot is empty, render a full layout with a placeholder and handle minimal input.
         let Some(mut deck) = decks[active_deck].take() else {
             // Active deck slot is empty — render full layout with placeholder for the empty slot.
-            let zoom_secs_t = zoom_secs;
+            let _zoom_secs_t = zoom_secs;
             let palette_idx = decks[inactive].as_ref()
                 .map(|d| d.display.palette_idx)
                 .unwrap_or(0);
@@ -626,23 +638,16 @@ Esc            quit";
                 }
             })?;
 
-            // Frame timing
-            let poll_dur = if dc > 0 {
-                Duration::from_secs_f32(zoom_secs_t / dc as f32 / 2.0)
-                    .max(Duration::from_millis(8))
-                    .min(Duration::from_millis(200))
-            } else {
-                Duration::from_millis(50)
-            };
-
-            if event::poll(poll_dur)? {
+            // Drain all pending events without blocking — frame timing is handled by the
+            // throttle sleep at the top of the outer loop.
+            while event::poll(Duration::ZERO)? {
                 if let Ok(Event::Key(key)) = event::read() {
                     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
                         if let Some(ref d) = decks[inactive] { d.audio.player.stop(); }
                         return Ok(());
                     }
                     if key.kind == KeyEventKind::Press {
-                        if help_open { help_open = false; continue; }
+                        if help_open { help_open = false; continue 'tui; }
                         match keymap.get(&KeyBinding::Key(key.code)) {
                             Some(&Action::Quit) => {
                                 if let Some(ref d) = decks[inactive] {
@@ -694,6 +699,7 @@ Esc            quit";
                     }
                 }
             }
+            thread::sleep(frame_dur.saturating_sub(frame_start.elapsed()));
             continue;
         };
 
@@ -763,21 +769,22 @@ Esc            quit";
             }
         }
         let drift = deck.display.smooth_display_samp - pos_samp as f64;
-        // When paused there is no audio jitter, so snap on any non-trivial drift (e.g. after
-        // a beat jump while paused). When playing, only snap on large drift (>500ms) to avoid
-        // reacting to normal audio-burst jitter.
+        // Large drift or paused: snap immediately (seek / startup / beat jump while paused).
+        // Playing with small drift: slew at 5% per frame — spreads correction across many
+        // frames so each nudge is sub-dot and visually imperceptible.
         if drift.abs() > deck.audio.sample_rate as f64 * 0.5 || (deck.audio.player.is_paused() && deck.nudge == 0 && drift.abs() > 1.0) {
-            // Large drift (seek / startup) — snap to the nearest column boundary so
-            // sub_col=false after every seek. This prevents sub_col from alternating
-            // when the seek distance is an odd number of half-columns, which would
-            // oscillate the viewport by 0.5 columns on every other seek.
+            // Snap to the nearest half-column so sub_col is consistent after every seek.
             let speed = (deck.tempo.bpm / deck.tempo.base_bpm) as f64;
             let col_samp_f64 = col_secs * deck.audio.sample_rate as f64 * speed;
-            deck.display.smooth_display_samp = if col_samp_f64 > 0.0 {
-                (pos_samp as f64 / col_samp_f64).round() * col_samp_f64
+            let half_col = col_samp_f64 / 2.0;
+            deck.display.smooth_display_samp = if half_col > 0.0 {
+                (pos_samp as f64 / half_col).round() * half_col
             } else {
                 pos_samp as f64
             };
+        } else if !deck.audio.player.is_paused() {
+            // Slew correction: nudge toward true position at 5% per frame.
+            deck.display.smooth_display_samp -= drift * 0.05;
         }
         // Apply audio latency compensation: shift the visual display backward by latency.
         let display_samp = deck.display.smooth_display_samp
@@ -1214,16 +1221,9 @@ Esc            quit";
             }
         })?;
 
-        // Adaptive frame rate: target one dot-column (half a character) per frame.
-        let poll_dur = if dc > 0 {
-            Duration::from_secs_f32(zoom_secs / dc as f32 / 2.0)
-                .max(Duration::from_millis(8))
-                .min(Duration::from_millis(200))
-        } else {
-            Duration::from_millis(30)
-        };
-
-        if event::poll(poll_dur)? {
+        // Drain all pending events without blocking — frame timing is now handled by the
+        // throttle sleep at the top of the loop, not by the event poll duration.
+        while event::poll(Duration::ZERO)? {
             match event::read()? {
             Event::Mouse(mouse_event) => {
                 if mouse_event.kind == MouseEventKind::Down(MouseButton::Left) {
@@ -1339,7 +1339,7 @@ Esc            quit";
                         help_open = false;
                     }
                     decks[active_deck] = Some(deck);
-                    continue;
+                    continue 'tui;
                 }
                 // All other actions fire on Press only.
                 if key.kind == KeyEventKind::Press {
@@ -1360,7 +1360,7 @@ Esc            quit";
                             _ => { /* reject — pending_bpm already taken/cleared */ }
                         }
                         decks[active_deck] = Some(deck);
-                        continue;
+                        continue 'tui;
                     }
                     let action = if space_held && key.code != KeyCode::Char(' ') {
                         if let Some(a) = keymap.get(&KeyBinding::SpaceChord(key.code)) {
@@ -1707,13 +1707,13 @@ Esc            quit";
                         deck_visible[0] = true;
                         decks[active_deck] = Some(deck);
                         active_deck = 0;
-                        continue;
+                        continue 'tui;
                     }
                     Some(Action::DeckSelectB) => {
                         deck_visible[1] = true;
                         decks[active_deck] = Some(deck);
                         active_deck = 1;
-                        continue;
+                        continue 'tui;
                     }
                     Some(Action::DeckAHide) => {
                         let other = 1;
@@ -1722,7 +1722,7 @@ Esc            quit";
                                 decks[0] = Some(deck);
                                 active_deck = 1;
                                 deck_visible[0] = false;
-                                continue;
+                                continue 'tui;
                             } else {
                                 deck_visible[0] = false;
                             }
@@ -1735,7 +1735,7 @@ Esc            quit";
                                 decks[1] = Some(deck);
                                 active_deck = 0;
                                 deck_visible[1] = false;
-                                continue;
+                                continue 'tui;
                             } else {
                                 deck_visible[1] = false;
                             }
@@ -1756,6 +1756,7 @@ Esc            quit";
             deck.audio.seek_handle.seek_direct(0.0);
             deck.display.smooth_display_samp = 0.0;
         }
+        thread::sleep(frame_dur.saturating_sub(frame_start.elapsed()));
         decks[active_deck] = Some(deck);
     }
 }
