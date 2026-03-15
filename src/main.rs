@@ -295,6 +295,7 @@ fn tui_loop(
     let mut last_render = Instant::now();
     let mut help_open = false;
     let mut space_held = false;
+
     struct InactiveDeckRender {
         display_samp:     f64,
         display_pos_samp: usize,
@@ -355,7 +356,7 @@ fn tui_loop(
                 d.display.smooth_display_samp = 0.0;
             } else if !d.audio.player.is_paused() {
                 let speed = (d.tempo.bpm / d.tempo.base_bpm) as f64;
-                d.display.smooth_display_samp += elapsed * d.audio.sample_rate as f64 * speed;
+                d.display.smooth_display_samp += frame_dur.as_secs_f64() * d.audio.sample_rate as f64 * speed;
                 let drift = d.display.smooth_display_samp - pos_samp as f64;
                 if drift.abs() > d.audio.sample_rate as f64 * 0.5 {
                     // Large drift backstop (seek / startup): snap to nearest half-column.
@@ -666,7 +667,7 @@ Esc            quit";
                             Some(&Action::DeckSelectA) => { active_deck = 0; }
                             Some(&Action::DeckSelectB) => { active_deck = 1; }
                             Some(&Action::TerminalRefresh) => { let _ = terminal.clear(); }
-                            Some(&Action::OpenBrowser) => {
+                                                        Some(&Action::OpenBrowser) => {
                                 match run_browser(terminal, browser_dir.clone())? {
                                     (BrowserResult::ReturnToPlayer, cwd) => {
                                         *browser_dir = cwd;
@@ -742,12 +743,15 @@ Esc            quit";
         let pos_samp = pos_raw / deck.audio.seek_handle.channels as usize;
         let pos      = Duration::from_secs_f64(pos_samp as f64 / deck.audio.sample_rate as f64);
 
-        // Smooth display position — advances via wall clock to avoid audio-buffer-burst jitter.
-        // Large drift (seek / startup) snaps immediately. Small drift correction rate is 1.0
-        // (also snaps) so any firing is visually obvious — for empirical observation only.
+        // Smooth display position — advances via wall clock to interpolate between audio-buffer
+        // bursts (pos_samp jumps by buffer size, not per-sample). Nudge while paused also uses
+        // elapsed time since the audio position doesn't advance then.
         if !deck.audio.player.is_paused() {
             let speed = (deck.tempo.bpm / deck.tempo.base_bpm) as f64 * (1.0 + deck.nudge as f64 * 0.1);
-            deck.display.smooth_display_samp += elapsed * deck.audio.sample_rate as f64 * speed;
+            // Use nominal frame duration — thread::sleep overshoots, so measured elapsed is
+            // consistently larger than frame_dur and would drive smooth_display_samp ahead of
+            // the audio every frame. Nominal has no such bias; the slew handles real drift.
+            deck.display.smooth_display_samp += frame_dur.as_secs_f64() * deck.audio.sample_rate as f64 * speed;
         } else if deck.nudge != 0 {
             // While paused and nudging, drift the display position at ±10% of normal speed
             // and sync the actual position atomic so seeking remains accurate.
@@ -770,8 +774,6 @@ Esc            quit";
         }
         let drift = deck.display.smooth_display_samp - pos_samp as f64;
         // Large drift or paused: snap immediately (seek / startup / beat jump while paused).
-        // Playing with small drift: slew at 5% per frame — spreads correction across many
-        // frames so each nudge is sub-dot and visually imperceptible.
         if drift.abs() > deck.audio.sample_rate as f64 * 0.5 || (deck.audio.player.is_paused() && deck.nudge == 0 && drift.abs() > 1.0) {
             // Snap to the nearest half-column so sub_col is consistent after every seek.
             let speed = (deck.tempo.bpm / deck.tempo.base_bpm) as f64;
@@ -1491,7 +1493,7 @@ Esc            quit";
                     Some(Action::TerminalRefresh) => {
                         let _ = terminal.clear();
                     }
-                    Some(Action::MetronomeToggle) => {
+                                        Some(Action::MetronomeToggle) => {
                         deck.metronome_mode = !deck.metronome_mode;
                         if deck.metronome_mode {
                             deck.last_metro_beat = Some(metro_beat_index); // suppress click on activation beat
@@ -3930,6 +3932,7 @@ struct BrowserState {
 
 impl BrowserState {
     fn new(dir: std::path::PathBuf) -> io::Result<Self> {
+        let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
         let mut entries = Vec::new();
 
         if dir.parent().is_some() {
@@ -3943,22 +3946,29 @@ impl BrowserState {
         let mut raw: Vec<_> = std::fs::read_dir(&dir)?.filter_map(|e| e.ok()).collect();
         raw.sort_by_key(|e| e.file_name().to_string_lossy().to_lowercase());
 
+        let mut dirs  = Vec::new();
+        let mut audio = Vec::new();
+        let mut other = Vec::new();
         for entry in raw {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
-            let kind = if path.is_dir() {
-                EntryKind::Dir
+            if path.is_dir() {
+                dirs.push(BrowserEntry { name, path, kind: EntryKind::Dir });
             } else if is_audio(&path) {
-                EntryKind::Audio
+                audio.push(BrowserEntry { name, path, kind: EntryKind::Audio });
             } else {
-                EntryKind::Other
-            };
-            entries.push(BrowserEntry { name, path, kind });
+                other.push(BrowserEntry { name, path, kind: EntryKind::Other });
+            }
         }
+        entries.extend(dirs);
+        entries.extend(audio);
+        entries.extend(other);
 
+        // Start on the first selectable entry that isn't `..` so Enter navigates
+        // into content rather than immediately going back up. `..` is reachable via Up.
         let cursor = entries
             .iter()
-            .position(|e| Self::is_selectable(&e.kind))
+            .position(|e| Self::is_selectable(&e.kind) && e.name != "..")
             .unwrap_or(0);
 
         Ok(Self { cwd: dir, entries, cursor })
