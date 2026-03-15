@@ -1,5 +1,5 @@
 # Proposal: Multi-Deck
-**Status: Draft**
+**Status: Approved**
 
 ## Intent
 

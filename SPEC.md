@@ -1,7 +1,7 @@
 # Specification: tj
 
 ## Overview
-A terminal-based music player written in Rust, with a real-time waveform visualisation and beat-aware transport controls.
+A terminal-based two-deck music player written in Rust, with real-time waveform visualisation and beat-aware transport controls. Each deck is an independent playback unit; a single active deck receives transport input at any time.
 
 ## Usage
 
@@ -11,7 +11,7 @@ tj [path]
 ```
 - If `path` is an audio file, opens and begins playing it immediately.
 - If `path` is a directory, opens the file browser rooted at that directory.
-- If `path` is omitted, opens the file browser rooted at the current working directory.
+- If `path` is omitted, the player opens with an empty deck; a startup notification on the notification bar prompts the user to press `z` to open the file browser.
 
 ### File Browser Controls
 | Key | Action |
@@ -23,36 +23,77 @@ tj [path]
 | `q` | Quit |
 
 ### Player Controls
+
+**Active-deck controls** (apply to whichever deck is currently selected):
 | Key | Action |
 |-----|--------|
 | `Space+Z` | Play / Pause |
 | `Space+F` / `Space+V` | Reset tempo to detected BPM (speed → 1×) |
 | `+` / `_` | Adjust beat phase offset (10ms steps) |
 | `[` / `]` | Latency ±10ms (live adjustment; also compensates `offset_ms` to keep ticks anchored) |
-| `u` / `7` | Filter sweep: `u` toward LPF (lower cutoff), `7` toward HPF (higher cutoff) |
-| `Space+u` / `Space+7` | Snap filter to flat (bypass) |
 | `Left` / `Right` | Seek backward / forward (small increment, e.g. 5s) |
 | `1` / `2` / `3` / `4` | Beat jump forward 1 / 4 / 16 / 64 beats |
 | `q` / `w` / `e` / `r` | Beat jump backward 1 / 4 / 16 / 64 beats |
-| `j` / `m` | Level up / down |
-| `Space+J` / `Space+M` | Level 100% / 0% |
 | `c` / `d` | Nudge backward / forward (mode-dependent) |
 | `C` / `D` | Toggle nudge mode: `jump` (10ms seek) / `warp` (±10% speed) |
 | `-` / `=` | Zoom in / out |
 | `{` / `}` | Detail height decrease / increase |
-| `f` / `v` | BPM +0.1 / −0.1 |
-| `F` / `V` | Detected BPM +0.01 / −0.01 |
-| `?` | Toggle key binding help popup |
+| `f` / `v` | BPM +1.0 / −1.0 |
+| `F` / `V` | Detected BPM +0.1 / −0.1 |
 | `b` | Tap BPM detection |
 | `'` | Toggle metronome |
 | `@` | Trigger manual BPM re-detection |
-| `z` | Open / close file browser |
+
+**Per-deck fixed controls** (always apply to the named deck, regardless of which is active):
+| Key | Action |
+|-----|--------|
+| `j` / `m` | Deck A level up / down |
+| `Space+J` / `Space+M` | Deck A level 100% / 0% |
+| `u` / `7` | Deck A filter sweep: `u` toward LPF, `7` toward HPF |
+| `Space+u` / `Space+7` | Deck A snap filter to flat |
+| `k` / `,` | Deck B level up / down |
+| `i` / `8` | Deck B filter sweep: `i` toward LPF, `8` toward HPF |
+
+**Global controls** (not deck-specific):
+| Key | Action |
+|-----|--------|
+| `g` | Select Deck A as active |
+| `h` | Select Deck B as active |
+| `z` | Open / close file browser (loads into active deck) |
+| `?` | Toggle key binding help popup |
 | `` ` `` | Refresh terminal (clear display glitches) |
 | `Esc` / `Ctrl-C` | Quit |
 
 > Key bindings reflect the defaults in `config.toml`. All player bindings are user-configurable.
 
 ## Behaviour
+
+### Deck Selection
+- Two decks — Deck A and Deck B — operate independently. Each deck maintains its own track, transport, BPM, offset, volume, filter, metronome, zoom, waveform, tap accumulator, BPM analysis state, and notification state.
+- One deck is active at a time. `g` selects Deck A; `h` selects Deck B. The active deck's control section is visually highlighted; the inactive deck's section is dim.
+- All active-deck controls (transport, BPM, offset, metronome, nudge, tap, re-detect) apply to the active deck only. Zoom and detail height are global and apply to both decks simultaneously.
+- Level and filter have dedicated per-deck bindings and may be adjusted on either deck regardless of which is active (see Player Controls).
+- Global controls (quit, help, terminal refresh, file browser, deck select) are not deck-specific.
+- At startup only Deck A is used. Deck B can be loaded by selecting it with `h` and opening the file browser.
+- Audio latency is a single global setting shared across both decks.
+
+### Layout
+The UI is structured into the following vertical sections (top to bottom):
+1. Detail info bar (shared)
+2. Detail waveform — Deck A
+3. Detail waveform — Deck B
+4. Notification bar — Deck A
+5. Info bar — Deck A
+6. Overview — Deck A
+7. Notification bar — Deck B
+8. Info bar — Deck B
+9. Overview — Deck B
+10. Global status bar
+
+### Global Status Bar
+A single row pinned to the bottom of the UI. Content priority:
+1. **System notification** — transient messages not tied to either deck (e.g. config parse warning, startup prompt). Shown until expired; uses the same `Notification` type and expiry mechanism as per-deck notifications.
+2. **Idle status** — shown when no system notification is active. Displays the current browser working directory in dim style.
 
 ### File Browser
 - Displays all files and subdirectories in the current directory, sorted alphabetically.
@@ -68,7 +109,7 @@ tj [path]
 - Supports audio formats: FLAC, MP3, OGG Vorbis, WAV, AAC, OPUS.
 - When playback reaches the end of the track, the transport pauses and the playhead returns to the start. The player view stays open and fully interactive.
 - Decode runs on a background thread. A loading screen displays a progress bar showing decode progress.
-- Playback begins as soon as decode completes, before BPM analysis is finished.
+- Decode completes and the deck is loaded paused. The user starts playback with `Space+Z`.
 - Displays track metadata: title, artist, album, duration, current position. The track name (artist – title, or filename) is shown in the notification bar above the info bar.
 - The TUI frame border title shows `tj vX.Y.Z` only.
 
@@ -82,7 +123,7 @@ tj [path]
 - A beat phase offset (in milliseconds) can be adjusted at runtime to align the beat indicator with the audio. The offset and BPM are displayed in the UI.
 - `offset_ms` is snapped to the nearest 10 ms boundary on load from the cache, ensuring `+`/`-` steps always land on multiples of 10 ms and 0 ms is always reachable. After each adjustment and on cache load, `offset_ms` is wrapped into `[0, beat_period_ms)` using `rem_euclid`, where `beat_period_ms` is derived from `base_bpm` rounded to the nearest 10 ms, ensuring the offset always remains on the 10 ms grid.
 - The user can correct an inaccurate detection at runtime:
-  - `f` increases the effective BPM by 0.1; `v` decreases it by 0.1. Adjustments affect playback speed proportionally (relative to the detected BPM) and clamp to the range 40.0–240.0.
+  - `f` increases the effective BPM by 0.01; `v` decreases it by 0.01. Adjustments affect playback speed proportionally (relative to the detected BPM) and clamp to the range 40.0–240.0.
   - `b` tap-detects BPM: press in time with the beat. After 8 taps, `base_bpm` and `offset_ms` are set from the tap session. BPM is derived via linear regression of tap index against tap time (slope = beat period), which converges and stabilises as more taps are added. Taps with a residual exceeding half a beat period are treated as outliers and excluded before the final regression. Any active `f`/`v` speed ratio is preserved relative to the new `base_bpm`. The tap count is shown in the info bar (`tap:N`) while a session is active; tapping stops 2 seconds after the last tap.
   - Corrections are persisted to the cache immediately.
 - Detected BPM and phase offset are cached in `~/.local/share/tj/cache.json`, keyed by a Blake3 hash of the decoded audio samples. This makes the cache invariant of filename, tags, and container format. The cache also stores the last browser directory.
@@ -99,7 +140,7 @@ tj [path]
 ### Info Bar
 - A single line below the track name bar. Content is split into two groups separated by a variable-width spacer that fills remaining width, keeping the right group pinned to the right edge regardless of transient field changes:
   - **Left group**: play/pause icon (`▶`/`⏸`), BPM, `♪` in red when metronome is active, phase offset. Tap count (`tap:N`) appended transiently while a tap session is active.
-  - **Right group**: nudge mode (`nudge:jump` / `nudge:warp`, fixed width), zoom indicator (`zoom:Ns`), level (`level:▕N▏` — single eighth-block character in dark yellow, in a bracketed indicator with mid-grey brackets), `lat:Xms` (shown only when `audio_latency_ms > 0`), spectrum strip.
+  - **Right group**: nudge mode (`nudge:jump` / `nudge:warp`, fixed width), level (`level:▕N▏` — single eighth-block character in dark yellow, in a bracketed indicator with mid-grey brackets), `lat:Xms` (shown only when `audio_latency_ms > 0`), spectrum strip.
 - The nudge mode field is always present and fixed-width so toggling between `jump` and `warp` does not shift anything to its right.
 - When no tempo adjustment is active, the detected BPM is shown to two decimal places (e.g. `120.00`) and receives a soft amber beat-flash. When a `f`/`v` adjustment is active, the detected BPM is shown plain and the adjusted tempo is shown alongside in parentheses (e.g. `120.00 (124.40)`), with only the adjusted number receiving the beat-flash.
 - `F` increases `base_bpm` by 0.01; `V` decreases it by 0.01. Both clamp to 40.0–240.0. Adjusting `base_bpm` resets any active `f`/`v` playback offset (`bpm` is set equal to the new `base_bpm`, speed returns to 1×) and is persisted to the cache immediately.
@@ -107,13 +148,23 @@ tj [path]
 - During BPM analysis the BPM field shows an animated spinner. When a confirmation is pending, the prompt appears in the notification bar (see Beat Detection); the right group is always rendered normally.
 - A BPM is considered "established" once it has been loaded from cache, set by tap, or adjusted with `f`/`v`/`F`/`V`. Only established BPM triggers confirmation on new detection.
 
+### Empty Deck Panels
+When no track is loaded in a deck slot, all deck sections render at full height with placeholder content:
+- **Notification bar**: dim deck label ("A" or "B") and prompt "no track — press z to open the file browser".
+- **Info bar**: `⏸  ---  +0ms` in dim style; level and filter widgets omitted.
+- **Overview**: a faint flat horizontal line at the vertical midpoint, rendered via the braille pipeline with zero-amplitude peaks and 120 BPM tick marks.
+- **Detail waveform**: a faint vertical line at the playhead column spanning the full height; all other columns blank.
+
+Layout constraints are based on the loaded deck's `detail_height` (defaulting to 8 rows), so no section collapses to zero when a deck slot is empty.
+
 ### Waveform Visualisation
 - Two waveform views are displayed simultaneously:
   - **Overview**: full-track waveform, with a playhead marker showing current position.
   - **Detail view**: zoomed waveform centred on the playhead, with variable zoom level.
 - Both views update in real time during playback.
 - The Detail view tracks the playhead as the track progresses.
-- Zoom level for the Detail view is adjustable by the user.
+- Zoom level and detail height are shared across both decks. `-`/`=` and `{`/`}` adjust them globally.
+- The detail waveform column grid is scaled by each deck's `bpm / base_bpm` ratio, so the viewport is expressed in playback-time columns. Beat tick marks placed at `base_bpm` sample spacing therefore appear at `bpm`-spaced columns: two decks at the same effective BPM show identical, waveform-anchored tick grids.
 - The Overview waveform is coloured by spectral content: each column blends between an orange/warm colour (bass-heavy) and a cyan/cool colour (treble-heavy), based on the ratio of low-frequency to high-frequency energy in that section. The frequency crossover is ~250 Hz. Several colour palettes are available and cycle with `p`; the active palette name is shown in the info bar.
 - The Overview waveform is rendered at half-column braille resolution: each braille character encodes two independent audio columns (left dot column and right dot column), doubling the horizontal detail within the same screen width.
 - The Overview displays bar markers as thin vertical lines (`│`) spanning the full overview height. The marker interval starts at every 4 bars and doubles if there are fewer than four characters between any pair of adjacent markers, repeating until all pairs have at least four characters between them. A legend in the top-right corner of the Overview shows the current interval (e.g. `4 bars`, `8 bars`).
@@ -135,7 +186,11 @@ The following principles are required to achieve smooth, stable rendering:
 - **Tick marks in screen space**: Beat tick marks must be computed in **screen space** from the **quantised viewport centre**, not encoded as isolated marks in **buffer space**. Isolated marks in buffer space produce completely different braille characters on alternating frames when processed through the half-column shift, causing visible oscillation at wide zoom.
 - **Consistent tick and viewport centre**: Tick mark positions and the waveform viewport must both be derived from the **quantised viewport centre**, not from the raw smooth display position. The two can differ by up to half a column, causing ticks to snap relative to the waveform on every frame at wide zoom.
 
-The detail waveform height is user-adjustable at runtime with `{` (decrease) and `}` (increase), defaulting to 8 rows. Any unused space below the panel is left blank.
+Both detail waveforms are rendered by a single shared background thread in the same pass at identical `samples_per_col`, ensuring their column grids are byte-for-byte compatible and both viewports advance at the same rate each frame.
+
+The detail info bar is a single shared row above both detail waveforms, showing the common zoom level (e.g. `zoom:4s`) in dim style.
+
+The detail waveform height is user-adjustable at runtime with `{` (decrease) and `}` (increase), and applies to both decks simultaneously. Any unused space below the panel is left blank. The initial height is set by `detail_height` in the `[display]` section of `config.toml` (default `6`, minimum `3`; value is total rows including the 2-row tick area, giving 4 waveform rows at the default).
 
 The playhead column in the detail panel is set by `playhead_position` (0–100, default `20`) in the `[display]` section of `config.toml`. The value is a percentage of the panel width from the left edge; out-of-range values are clamped silently.
 
@@ -151,8 +206,8 @@ The render frame period adapts to the current zoom level and detail panel width,
   - `0` — flat (filter bypassed).
   - `−1` to `−16` — low-pass filter; more negative = lower cutoff frequency.
   - `+1` to `+16` — high-pass filter; more positive = higher cutoff frequency.
-- `u` decreases `filter_offset` by 1 (clamped at −16); `7` increases it by 1 (clamped at +16).
-- `Space+u` or `Space+7` snaps `filter_offset` to 0 (flat) immediately.
+- Deck A: `u` decreases `filter_offset` by 1; `7` increases it by 1. `Space+u` or `Space+7` snaps to flat.
+- Deck B: `i` decreases `filter_offset` by 1; `8` increases it by 1. These bindings are active regardless of which deck is selected.
 - Cutoff frequencies are logarithmically spaced from ~40 Hz to ~18 kHz across the ±1–±16 range. Each step corresponds to exactly one character of the spectrum strip.
 - Filter state is visible in the spectrum strip (grey shading on attenuated bins) and not shown as separate text.
 - The spectrum analyser reflects the filtered output.
@@ -163,7 +218,7 @@ The render frame period adapts to the current zoom level and detail panel width,
 - The strip is 16 braille characters wide (32 frequency bins) and 1 braille row tall (4 dot rows). Each character encodes two adjacent bins as a bottom-up bar chart. Thin `▕` / `▏` block characters flank the strip as bounds indicators. The bars are rendered in amber (yellow foreground on a dark amber background). When sub-threshold activity is detected in a bin (energy exceeds ¼ of the single-dot threshold), the character cell background is lit even if no dots are drawn, giving a background glow effect. The glow resets on a 2-bar accumulation window: it lights on any activity within the window and can only go dark at window boundaries.
 - When a filter is active, the attenuated region of the spectrum is shaded with a grey background: LPF shades from the right, HPF from the left. Each of the 16 filter steps corresponds to exactly one spectrum character. At flat (offset 0) no shading is applied.
 - Bins are logarithmically spaced from 20 Hz to 20 kHz. Amplitude is mapped on a dB scale (floor ~10 dB, ceiling ~60 dB, ~12.5 dB per dot row) using the Goertzel algorithm over a 4096-sample Hann-windowed window at the current playback position.
-- The spectrum updates twice per beat period (every half beat). During BPM analysis the update interval falls back to 500 ms. The display holds its last value between updates.
+- The spectrum updates twice per beat period (every half beat). During BPM analysis the update interval falls back to 500 ms. The display holds its last value between updates. Both decks' spectra update at this cadence regardless of which deck is active.
 
 ### Audio Latency Calibration
 - An `audio_latency_ms` value shifts all visual rendering backward by a fixed number of milliseconds, compensating for audio output latency. The effective display position is `smooth_display_samp − audio_latency_ms × sample_rate / 1000`. This affects the waveform viewport, beat markers, beat flash, and overview playhead.
@@ -178,7 +233,7 @@ The render frame period adapts to the current zoom level and detail panel width,
 - Metronome mode resets to off on each new track load.
 
 ### Level Control
-- The playback level is adjustable at runtime using `↑` (increase) and `↓` (decrease) in 5% steps, from 0% to 100%. The current level is displayed in the info bar as `level:N%`. Changes take effect immediately without interrupting playback. Level is not persisted between sessions.
+- Each deck has an independent playback level, adjustable in 5% steps from 0% to 100%. Deck A uses `j` (up) / `m` (down); Deck B uses `k` (up) / `,` (down). These bindings are active regardless of which deck is selected. The current level is displayed in the info bar as `level:N%`. Changes take effect immediately without interrupting playback. Level is not persisted between sessions.
 
 ### Nudge
 - `c`/`d` nudge the transport backward/forward. Behaviour depends on the active nudge mode, toggled with `C`/`D`:
@@ -190,7 +245,7 @@ The render frame period adapts to the current zoom level and detail panel width,
 - While paused, each nudge step plays a short audio snippet at the new position — one half-column width of audio injected directly into the mixer. In jump mode a snippet fires on each key press/repeat; in warp mode snippets fire continuously at half-column intervals as the position drifts. Snippets play independently of the paused transport and do not interrupt each other.
 
 ### Beat Jump
-- Eight dedicated beat jump actions cover four sizes (1, 4, 16, 64 beats) in each direction. Each action jumps by exactly N × beat_period seconds from the current position, preserving rhythmic continuity.
+- Eight dedicated beat jump actions cover four sizes (1, 4, 16, 64 beats) in each direction. Each action jumps by exactly N × `(60 / base_bpm)` audio seconds, which equals N beat periods at the effective playback BPM and lands precisely on the next tick mark.
 - Jumping backward past the start clamps to position 0. Jumping forward past the end is a no-op.
 - Seeking is implemented via an atomic position counter shared with the audio thread; the audio thread never pauses.
 - A ~6ms fade-out before the cut and ~6ms fade-in after eliminate click artefacts without any perceptible gap.
