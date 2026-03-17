@@ -17,7 +17,7 @@ use crossterm::terminal::{
 };
 use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph};
@@ -229,14 +229,17 @@ fn load_deck(
         let entries = cache.entries_snapshot();
         thread::spawn(move || {
             let hash = hash_mono(&mono_bg);
+            // is_fresh=false → applied immediately and marks bpm_established=true (confirmed).
+            // is_fresh=true  → applied immediately only when bpm_established is false, leaves it false (unconfirmed).
             let (bpm, offset_ms, is_fresh) = if let Some(entry) = entries.get(&hash) {
                 let snapped = (entry.offset_ms as f64 / 10.0).round() as i64 * 10;
                 let period = (60_000.0 / entry.bpm as f64 / 10.0).round() as i64 * 10;
                 let snapped = snapped.rem_euclid(period);
                 (entry.bpm, snapped, false)
             } else {
-                let bpm = detect_bpm(&mono_bg, sample_rate).map(|b| b.round()).unwrap_or(120.0);
-                (bpm, 0i64, true)
+                // No cache entry: use 120 as a placeholder; leave bpm_established false so the UI
+                // signals that the BPM has not been confirmed.
+                (120.0f32, 0i64, true)
             };
             let _ = bpm_tx.send((hash, bpm, offset_ms, is_fresh));
         });
@@ -265,6 +268,16 @@ fn tui_loop(
     browser_dir: &mut std::path::PathBuf,
     mixer: &rodio::mixer::Mixer,
 ) -> io::Result<()> {
+    // Per-deck display values computed each frame from current deck state.
+    struct DeckRenderState {
+        display_samp:     f64,
+        display_pos_samp: usize,
+        analysing:        bool,
+        spinner_active:   bool,
+        beat_on:          bool,
+        warning_active:   bool,
+        warn_beat_on:     bool,
+    }
     let (keymap, display_cfg, config_notice) = load_config();
     let mut global_notification: Option<Notification> = None;
     if let Some(msg) = config_notice {
@@ -282,8 +295,6 @@ fn tui_loop(
         });
     }
     let mut decks: [Option<Deck>; 2] = [initial_deck, None];
-    let mut active_deck: usize = 0;
-    let mut deck_visible: [bool; 2] = [true, decks[1].is_some()];
     let mut audio_latency_ms: i64 = ((cache.get_latency() as f64 / 10.0).round() as i64 * 10).clamp(0, 250);
     let mut zoom_idx: usize = DEFAULT_ZOOM_IDX;
     let shared_renderer = SharedDetailRenderer::new(zoom_idx);
@@ -295,21 +306,13 @@ fn tui_loop(
     let mut last_render = Instant::now();
     let mut help_open = false;
     let mut space_held = false;
-
-    struct InactiveDeckRender {
-        display_samp:     f64,
-        display_pos_samp: usize,
-        analysing:        bool,
-        beat_on:          bool,
-        warning_active:   bool,
-        warn_beat_on:     bool,
-    }
+    let mut pending_quit = false;
+    // When Esc dismisses an overlay, suppress the next Quit action for a short window.
+    // This absorbs the duplicate Esc event that Kitty injects after the first one.
+    let mut suppress_quit_until: Option<Instant> = None;
 
     'tui: loop {
         frame_count += 1;
-        let inactive = 1 - active_deck;
-        let buf_a = Arc::clone(&*shared_renderer.shared_a.lock().unwrap());
-        let buf_b = Arc::clone(&*shared_renderer.shared_b.lock().unwrap());
 
         // Frame timing — computed once and shared by both decks.
         let dc = shared_renderer.cols.load(Ordering::Relaxed);
@@ -334,823 +337,160 @@ fn tui_loop(
         if global_notification.as_ref().map_or(false, |n| frame_start >= n.expires) {
             global_notification = None;
         }
-        // Expire inactive deck's active notification.
-        if let Some(ref mut d) = decks[inactive] {
-            if d.active_notification.as_ref().map_or(false, |n| frame_start >= n.expires) {
-                d.active_notification = None;
-            }
+        // Service both decks: BPM results, position, metronome, tap timeout, spectrum.
+        for slot in 0..2 {
+            service_deck_frame(slot, &mut decks, col_secs, frame_dur, elapsed, mixer, &shared_renderer, cache, audio_latency_ms);
         }
 
-        // Service the inactive deck: advance smooth position, auto-reject pending BPM,
-        // pause at end-of-track, update spectrum analyser.
-        if let Some(ref mut d) = decks[inactive] {
-            if let Some((_, _, _, received_at)) = &d.tempo.pending_bpm {
-                if received_at.elapsed().as_secs() >= 15 { d.tempo.pending_bpm = None; }
-            }
-            let pos_raw  = d.audio.seek_handle.position.load(Ordering::Relaxed);
-            let pos_samp = pos_raw / d.audio.seek_handle.channels as usize;
-            let at_end   = pos_samp >= d.audio.seek_handle.samples.len() / d.audio.seek_handle.channels as usize;
-            if at_end && !d.audio.player.is_paused() {
-                d.audio.player.pause();
-                d.audio.seek_handle.seek_direct(0.0);
-                d.display.smooth_display_samp = 0.0;
-            } else if !d.audio.player.is_paused() {
-                let speed = (d.tempo.bpm / d.tempo.base_bpm) as f64;
-                d.display.smooth_display_samp += frame_dur.as_secs_f64() * d.audio.sample_rate as f64 * speed;
-                let drift = d.display.smooth_display_samp - pos_samp as f64;
-                if drift.abs() > d.audio.sample_rate as f64 * 0.5 {
-                    // Large drift backstop (seek / startup): snap to nearest half-column.
-                    let col_samp_f64 = col_secs * d.audio.sample_rate as f64 * speed;
-                    let half_col = col_samp_f64 / 2.0;
-                    d.display.smooth_display_samp = if half_col > 0.0 {
-                        (pos_samp as f64 / half_col).round() * half_col
-                    } else { pos_samp as f64 };
-                } else {
-                    // Slew correction: nudge toward true position at 5% per frame.
-                    d.display.smooth_display_samp -= drift * 0.05;
-                }
-            }
-            // Spectrum analyser: same half-beat / 8-beat cadence as the active deck.
-            {
-                let beat_period_inactive = Duration::from_secs_f64(60.0 / d.tempo.base_bpm as f64);
-                let analysing_inactive   = d.tempo.analysis_hash.is_none();
-                let half_period = if analysing_inactive {
-                    Duration::from_millis(500)
-                } else {
-                    beat_period_inactive / 2
-                };
-                let bar_period  = beat_period_inactive * 8;
-                let chars_due = d.spectrum.last_update.map_or(true, |t| t.elapsed() >= half_period);
-                let bg_due    = d.spectrum.last_bg_update.map_or(true, |t| t.elapsed() >= bar_period);
-                if chars_due || bg_due {
-                    let (new_chars, new_bg) = compute_spectrum(&d.audio.mono, pos_samp, d.audio.sample_rate, d.filter_offset);
-                    if chars_due {
-                        d.spectrum.chars = new_chars;
-                        for i in 0..16 { d.spectrum.bg_accum[i] |= new_bg[i]; }
-                        d.spectrum.bg = d.spectrum.bg_accum;
-                        d.spectrum.last_update = Some(Instant::now());
-                    }
-                    if bg_due {
-                        d.spectrum.bg_accum = [false; 16];
-                        d.spectrum.last_bg_update = Some(Instant::now());
-                    }
-                }
-            }
-        }
-
-        // Compute simplified render values for the inactive deck (before take, so available in the empty-active-deck branch).
-        let inactive_render: Option<InactiveDeckRender> = decks[inactive].as_ref().map(|d| {
-            let display_samp_inactive = (d.display.smooth_display_samp
+        // Compute render state for both decks.
+        let render: [Option<DeckRenderState>; 2] = std::array::from_fn(|slot| {
+            let d = decks[slot].as_ref()?;
+            let display_samp = (d.display.smooth_display_samp
                 - audio_latency_ms as f64 * d.audio.sample_rate as f64 / 1000.0)
                 .max(0.0);
-            let display_pos_samp_inactive = display_samp_inactive as usize;
-            let pos_interleaved = display_pos_samp_inactive * d.audio.seek_handle.channels as usize;
-            if inactive == 0 {
+            let display_pos_samp = display_samp as usize;
+            let pos_interleaved  = display_pos_samp * d.audio.seek_handle.channels as usize;
+            if slot == 0 {
                 shared_renderer.display_pos_a.store(pos_interleaved, Ordering::Relaxed);
             } else {
                 shared_renderer.display_pos_b.store(pos_interleaved, Ordering::Relaxed);
             }
-            let analysing_inactive    = d.tempo.analysis_hash.is_none();
-            let beat_period_inactive  = Duration::from_secs_f64(60.0 / d.tempo.base_bpm as f64);
-            let flash_window_inactive = beat_period_inactive.mul_f64(0.15);
-            let smooth_pos_ns_inactive =
-                (display_samp_inactive / d.audio.sample_rate as f64 * 1_000_000_000.0) as i128
-                    - d.tempo.offset_ms as i128 * 1_000_000;
-            let phase_inactive   = smooth_pos_ns_inactive.rem_euclid(beat_period_inactive.as_nanos() as i128);
-            let beat_on_inactive = phase_inactive < flash_window_inactive.as_nanos() as i128;
-            let audio_pos_samp   = d.audio.seek_handle.position.load(Ordering::Relaxed) / d.audio.seek_handle.channels as usize;
-            let pos_dur_inactive = Duration::from_secs_f64(audio_pos_samp as f64 / d.audio.sample_rate as f64);
-            let remaining_inactive      = d.total_duration.saturating_sub(pos_dur_inactive);
-            let warning_active_inactive = !d.audio.player.is_paused()
-                && remaining_inactive < Duration::from_secs_f32(display_cfg.warning_threshold_secs);
-            let beat_index_inactive  = smooth_pos_ns_inactive.div_euclid(beat_period_inactive.as_nanos() as i128);
-            let warn_beat_on_inactive = warning_active_inactive && (beat_index_inactive % 2 == 0);
-            InactiveDeckRender {
-                display_samp:     display_samp_inactive,
-                display_pos_samp: display_pos_samp_inactive,
-                analysing:        analysing_inactive,
-                beat_on:          beat_on_inactive,
-                warning_active:   warning_active_inactive,
-                warn_beat_on:     warn_beat_on_inactive,
-            }
+            let spinner_active = d.tempo.analysis_hash.is_none();
+            let analysing      = spinner_active || !d.tempo.bpm_established;
+            let beat_period    = Duration::from_secs_f64(60.0 / d.tempo.base_bpm as f64);
+            let flash_window   = beat_period.mul_f64(0.15);
+            let smooth_pos_ns  = (display_samp / d.audio.sample_rate as f64 * 1_000_000_000.0) as i128
+                - d.tempo.offset_ms as i128 * 1_000_000;
+            let phase          = smooth_pos_ns.rem_euclid(beat_period.as_nanos() as i128);
+            let beat_on        = phase < flash_window.as_nanos() as i128;
+            let audio_pos_samp = d.audio.seek_handle.position.load(Ordering::Relaxed)
+                / d.audio.seek_handle.channels as usize;
+            let pos_dur        = Duration::from_secs_f64(audio_pos_samp as f64 / d.audio.sample_rate as f64);
+            let remaining      = d.total_duration.saturating_sub(pos_dur);
+            let warning_active = !d.audio.player.is_paused()
+                && remaining < Duration::from_secs_f32(display_cfg.warning_threshold_secs);
+            let beat_index     = smooth_pos_ns.div_euclid(beat_period.as_nanos() as i128);
+            let warn_beat_on   = warning_active && (beat_index % 2 == 0);
+            Some(DeckRenderState { display_samp, display_pos_samp, analysing, spinner_active, beat_on, warning_active, warn_beat_on })
         });
 
-        // Take the active deck for this iteration.
-        // If the active deck slot is empty, render a full layout with a placeholder and handle minimal input.
-        let Some(mut deck) = decks[active_deck].take() else {
-            // Active deck slot is empty — render full layout with placeholder for the empty slot.
-            let _zoom_secs_t = zoom_secs;
-            let palette_idx = decks[inactive].as_ref()
-                .map(|d| d.display.palette_idx)
-                .unwrap_or(0);
-            let (_, _, (tr, tg, tb)) = SPECTRAL_PALETTES[palette_idx];
-            let active_label_style  = Style::default().fg(Color::Rgb(tr, tg, tb));
-            let dim_label_style     = Style::default().fg(Color::Rgb(70, 70, 70));
-
-            terminal.draw(|frame| {
-                let area = frame.area();
-                let outer = Block::default()
-                    .title(format!(" tj {} ", env!("CARGO_PKG_VERSION")))
-                    .borders(Borders::ALL);
-                let inner = outer.inner(area);
-                frame.render_widget(outer, area);
-
-                let det_h = detail_height as u16;
-
-                // Same deck_visible-aware layout as the main draw path.
-                #[allow(clippy::type_complexity)]
-                let (area_detail_info, area_detail_a, area_detail_b,
-                     area_notif_a, area_info_a, area_overview_a,
-                     area_notif_b, area_info_b, area_overview_b,
-                     area_global): (Rect,Rect,Rect,Rect,Rect,Rect,Rect,Rect,Rect,Rect) = match deck_visible {
-                    [true, true] => {
-                        let c = Layout::default()
-                            .direction(Direction::Vertical)
-                            .constraints([
-                                Constraint::Length(1),    // 0: detail info bar
-                                Constraint::Length(det_h),// 1: detail A
-                                Constraint::Length(det_h),// 2: detail B
-                                Constraint::Length(1),    // 3: notif A
-                                Constraint::Length(1),    // 4: info A
-                                Constraint::Length(4),    // 5: overview A
-                                Constraint::Length(1),    // 6: notif B
-                                Constraint::Length(1),    // 7: info B
-                                Constraint::Length(4),    // 8: overview B
-                                Constraint::Length(1),    // 9: global bar
-                                Constraint::Min(0),       // 10: spacer
-                            ])
-                            .split(inner);
-                        (c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9])
-                    }
-                    [true, false] => {
-                        let c = Layout::default()
-                            .direction(Direction::Vertical)
-                            .constraints([
-                                Constraint::Length(1),    // 0: detail info bar
-                                Constraint::Length(det_h),// 1: detail A
-                                Constraint::Length(1),    // 2: notif A
-                                Constraint::Length(1),    // 3: info A
-                                Constraint::Length(4),    // 4: overview A
-                                Constraint::Length(1),    // 5: global bar
-                                Constraint::Min(0),       // 6: spacer
-                            ])
-                            .split(inner);
-                        (c[0], c[1], Rect::default(), c[2], c[3], c[4], Rect::default(), Rect::default(), Rect::default(), c[5])
-                    }
-                    _ => {
-                        // [false, true]: only deck B visible
-                        let c = Layout::default()
-                            .direction(Direction::Vertical)
-                            .constraints([
-                                Constraint::Length(1),    // 0: detail info bar
-                                Constraint::Length(det_h),// 1: detail B
-                                Constraint::Length(1),    // 2: notif B
-                                Constraint::Length(1),    // 3: info B
-                                Constraint::Length(4),    // 4: overview B
-                                Constraint::Length(1),    // 5: global bar
-                                Constraint::Min(0),       // 6: spacer
-                            ])
-                            .split(inner);
-                        (c[0], Rect::default(), c[1], Rect::default(), Rect::default(), Rect::default(), c[2], c[3], c[4], c[5])
-                    }
-                };
-
-                // Detail info bar
-                frame.render_widget(
-                    Paragraph::new(Line::from(Span::styled(
-                        format!("  zoom:{}s", zoom_secs),
-                        Style::default().fg(Color::Rgb(60, 60, 60)),
-                    ))),
-                    area_detail_info,
-                );
-
-                // Render the loaded (inactive) deck's sections, if it is visible.
-                if deck_visible[inactive] {
-                    if let Some(ref d) = decks[inactive] {
-                        if let Some(ref ir) = inactive_render {
-                            let loaded_is_a = inactive == 0;
-                            let (det_area, notif_area, info_area, ov_area) = if loaded_is_a {
-                                (area_detail_a, area_notif_a, area_info_a, area_overview_a)
-                            } else {
-                                (area_detail_b, area_notif_b, area_info_b, area_overview_b)
-                            };
-                            let ls = dim_label_style;
-                            let label_ch = if loaded_is_a { "A " } else { "B " };
-
-                            let det_buf = if inactive == 0 { &buf_a } else { &buf_b };
-                            render_detail_waveform_inactive(frame, det_buf, d, det_area, &display_cfg, ir.display_pos_samp);
-
-                            let notif = notification_line_for_deck(d);
-                            let mut spans = vec![Span::styled(label_ch, ls)];
-                            spans.extend(notif.spans);
-                            frame.render_widget(Paragraph::new(Line::from(spans)), notif_area);
-
-                            let info = info_line_for_deck(d, audio_latency_ms, frame_count, ir.beat_on, ir.analysing, ls, info_area.width);
-                            frame.render_widget(Paragraph::new(info), info_area);
-
-                            let (ov, _, _) = overview_for_deck(d, ov_area, ir.display_samp, ir.analysing, ir.warning_active, ir.warn_beat_on);
-                            frame.render_widget(Paragraph::new(ov), ov_area);
-                        }
-                    }
-                }
-
-                // Render the empty (active) deck's sections as placeholder.
-                // The active deck is always visible (hide logic enforces this invariant).
-                {
-                    let empty_is_a = active_deck == 0;
-                    let (notif_area, info_area, ov_area, detail_area) = if empty_is_a {
-                        (area_notif_a, area_info_a, area_overview_a, area_detail_a)
-                    } else {
-                        (area_notif_b, area_info_b, area_overview_b, area_detail_b)
-                    };
-                    let label_ch = if empty_is_a { "A " } else { "B " };
-
-                    let label = Span::styled(label_ch, active_label_style);
-                    let mut spans = vec![label];
-                    spans.extend(notification_line_empty().spans);
-                    frame.render_widget(
-                        Paragraph::new(Line::from(spans))
-                            .style(Style::default().bg(Color::Rgb(20, 20, 38))),
-                        notif_area,
-                    );
-                    frame.render_widget(Paragraph::new(info_line_empty(info_area.width)), info_area);
-                    frame.render_widget(Paragraph::new(overview_empty(ov_area)), ov_area);
-                    render_detail_empty(frame, detail_area, &display_cfg);
-                }
-
-                // Global status bar
-                {
-                    let global_line = if let Some(ref n) = global_notification {
-                        let color = match n.style {
-                            NotificationStyle::Info    => Color::DarkGray,
-                            NotificationStyle::Warning => Color::Yellow,
-                            NotificationStyle::Error   => Color::Red,
-                        };
-                        Line::from(Span::styled(n.message.clone(), Style::default().fg(color)))
-                    } else {
-                        Line::from(Span::styled(
-                            format!("  {}", browser_dir.display()),
-                            Style::default().fg(Color::Rgb(50, 50, 50)),
-                        ))
-                    };
-                    frame.render_widget(Paragraph::new(global_line), area_global);
-                }
-
-                // Help popup
-                if help_open {
-                    const HELP: &str = "\
-Space+Z        play / pause
-Space+F/V      reset playback speed to 1×  (cancel f/v adjustment)
-1/2/3/4        beat jump forward 1/4/16/64 beats
-q/w/e/r        beat jump backward 1/4/16/64 beats
-c  /  d        nudge backward / forward (mode-dependent)
-C  /  D        toggle nudge mode: jump (10ms) / warp (±10% speed)
-+  /  _        beat phase offset ±10ms
-[  /  ]        latency ±10ms
--  /  =        zoom in / out
-{  /  }        detail height decrease / increase
-f  /  v        BPM +1.0 / -1.0
-b              tap in time to set BPM + phase
-'              toggle metronome
-j  /  m        Deck A level up / down
-k  /  ,        Deck B level up / down
-Space+J        level 100%   Space+M  level 0%
-u  /  7        Deck A filter sweep
-i  /  8        Deck B filter sweep
-g  /  h        select Deck A / Deck B
-p              cycle spectral colour palette
-o              toggle waveform fill / outline
-z              open file browser
-`              refresh terminal
-?              toggle this help
-Esc            quit";
-                    let popup_w = 75u16;
-                    let popup_h = HELP.lines().count() as u16 + 2;
-                    let px = area.x + area.width.saturating_sub(popup_w) / 2;
-                    let py = area.y + area.height.saturating_sub(popup_h) / 2;
-                    let popup_rect = ratatui::layout::Rect { x: px, y: py, width: popup_w.min(area.width), height: popup_h.min(area.height) };
-                    frame.render_widget(ratatui::widgets::Clear, popup_rect);
-                    frame.render_widget(
-                        Paragraph::new(HELP)
-                            .block(Block::default().borders(Borders::ALL).title(" Key Bindings "))
-                            .style(Style::default().fg(Color::White)),
-                        popup_rect,
-                    );
-                }
-            })?;
-
-            // Drain all pending events without blocking — frame timing is handled by the
-            // throttle sleep at the top of the outer loop.
-            while event::poll(Duration::ZERO)? {
-                if let Ok(Event::Key(key)) = event::read() {
-                    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                        if let Some(ref d) = decks[inactive] { d.audio.player.stop(); }
-                        return Ok(());
-                    }
-                    if key.kind == KeyEventKind::Press {
-                        if help_open { help_open = false; continue 'tui; }
-                        match keymap.get(&KeyBinding::Key(key.code)) {
-                            Some(&Action::Quit) => {
-                                if let Some(ref d) = decks[inactive] {
-                                    d.audio.player.stop();
-                                    if let Some(ref hash) = d.tempo.analysis_hash {
-                                        if let Some(entry) = cache.get(hash.as_str()).cloned() {
-                                            cache.set(hash.clone(), CacheEntry { offset_ms: d.tempo.offset_ms, ..entry });
-                                        }
-                                    }
-                                }
-                                cache.set_latency(audio_latency_ms);
-                                cache.save();
-                                return Ok(());
-                            }
-                            Some(&Action::Help) => { help_open = !help_open; }
-                            Some(&Action::DeckSelectA) => { active_deck = 0; }
-                            Some(&Action::DeckSelectB) => { active_deck = 1; }
-                            Some(&Action::TerminalRefresh) => { let _ = terminal.clear(); }
-                                                        Some(&Action::OpenBrowser) => {
-                                match run_browser(terminal, browser_dir.clone())? {
-                                    (BrowserResult::ReturnToPlayer, cwd) => {
-                                        *browser_dir = cwd;
-                                        cache.set_last_browser_path(browser_dir);
-                                        cache.save();
-                                    }
-                                    (BrowserResult::Selected(path), cwd) => {
-                                        *browser_dir = cwd;
-                                        cache.set_last_browser_path(browser_dir);
-                                        cache.save();
-                                        match load_deck(&path, mixer, cache, terminal)? {
-                                            None => return Ok(()),
-                                            Some(new_deck) => {
-                                                shared_renderer.set_deck(active_deck, Arc::clone(&new_deck.audio.waveform), new_deck.audio.seek_handle.channels, new_deck.audio.sample_rate);
-                                                decks[active_deck] = Some(new_deck);
-                                            }
-                                        }
-                                    }
-                                    (BrowserResult::Quit, cwd) => {
-                                        *browser_dir = cwd;
-                                        cache.set_last_browser_path(browser_dir);
-                                        cache.save();
-                                        if let Some(ref d) = decks[inactive] { d.audio.player.stop(); }
-                                        return Ok(());
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            thread::sleep(frame_dur.saturating_sub(frame_start.elapsed()));
-            continue;
-        };
-
-        // Auto-reject pending BPM confirmation after 15 seconds.
-        if let Some((_, _, _, received_at)) = &deck.tempo.pending_bpm {
-            if received_at.elapsed().as_secs() >= 15 {
-                deck.tempo.pending_bpm = None;
-            }
-        }
-        if let Ok((hash, new_bpm, new_offset, is_fresh)) = deck.tempo.bpm_rx.try_recv() {
-            if !is_fresh || !deck.tempo.bpm_established {
-                // Cache hit or no BPM established yet: apply immediately.
-                deck.tempo.bpm = new_bpm;
-                deck.tempo.base_bpm = new_bpm;
-                shared_renderer.store_speed_ratio(active_deck, deck.tempo.bpm, deck.tempo.base_bpm);
-                deck.tempo.offset_ms = (new_offset as f64 / 10.0).round() as i64 * 10;
-                cache.set(hash.clone(), CacheEntry { bpm: deck.tempo.bpm, offset_ms: deck.tempo.offset_ms, name: deck.filename.clone() });
-                cache.save();
-                deck.tempo.analysis_hash = Some(hash);
-                deck.tempo.redetecting = false;
-                deck.tempo.redetect_saved_hash = None;
-                deck.tempo.background_rx = None;
-                if !is_fresh { deck.tempo.bpm_established = true; }
-            } else {
-                // Fresh detection with BPM already established: queue for confirmation.
-                deck.tempo.analysis_hash = Some(hash.clone()); // stop the analysing spinner
-                deck.tempo.redetecting = false;
-                deck.tempo.redetect_saved_hash = None;
-                deck.tempo.background_rx = None;
-                deck.tempo.pending_bpm = Some((hash, new_bpm, new_offset, Instant::now()));
-            }
-        }
-
-        // Snapshot samples_per_col for use in scrub outside the draw closure.
-        let active_buf = if active_deck == 0 { &buf_a } else { &buf_b };
-        let scrub_samples_per_col = active_buf.samples_per_col;
-
-        // Real audio position — used for beat flash, time display, overview playhead.
-        let pos_raw  = deck.audio.seek_handle.position.load(Ordering::Relaxed);
-        let pos_samp = pos_raw / deck.audio.seek_handle.channels as usize;
-        let pos      = Duration::from_secs_f64(pos_samp as f64 / deck.audio.sample_rate as f64);
-
-        // Smooth display position — advances via wall clock to interpolate between audio-buffer
-        // bursts (pos_samp jumps by buffer size, not per-sample). Nudge while paused also uses
-        // elapsed time since the audio position doesn't advance then.
-        if !deck.audio.player.is_paused() {
-            let speed = (deck.tempo.bpm / deck.tempo.base_bpm) as f64 * (1.0 + deck.nudge as f64 * 0.1);
-            // Use nominal frame duration — thread::sleep overshoots, so measured elapsed is
-            // consistently larger than frame_dur and would drive smooth_display_samp ahead of
-            // the audio every frame. Nominal has no such bias; the slew handles real drift.
-            deck.display.smooth_display_samp += frame_dur.as_secs_f64() * deck.audio.sample_rate as f64 * speed;
-        } else if deck.nudge != 0 {
-            // While paused and nudging, drift the display position at ±10% of normal speed
-            // and sync the actual position atomic so seeking remains accurate.
-            let total_mono_samps =
-                (deck.audio.seek_handle.samples.len() / deck.audio.seek_handle.channels as usize) as f64;
-            deck.display.smooth_display_samp = (deck.display.smooth_display_samp
-                + elapsed * deck.audio.sample_rate as f64 * deck.nudge as f64 * 0.1)
-                .clamp(0.0, total_mono_samps);
-            // Use set_position (no quiet-frame search) — no audio is playing so no click occurs.
-            deck.audio.seek_handle.set_position(deck.display.smooth_display_samp / deck.audio.sample_rate as f64);
-            // Scrub: fire a snippet once per half-column advance for smooth continuity.
-            let half_samples_per_col = (scrub_samples_per_col / 2).max(1);
-            if scrub_samples_per_col > 0
-                && (deck.display.smooth_display_samp - deck.display.last_scrub_samp).abs() >= half_samples_per_col as f64
-            {
-                scrub_audio(mixer, &deck.audio.seek_handle.samples, deck.audio.seek_handle.channels as u16,
-                            deck.audio.sample_rate, deck.display.smooth_display_samp as usize, half_samples_per_col);
-                deck.display.last_scrub_samp = deck.display.smooth_display_samp;
-            }
-        }
-        let drift = deck.display.smooth_display_samp - pos_samp as f64;
-        // Large drift or paused: snap immediately (seek / startup / beat jump while paused).
-        if drift.abs() > deck.audio.sample_rate as f64 * 0.5 || (deck.audio.player.is_paused() && deck.nudge == 0 && drift.abs() > 1.0) {
-            // Snap to the nearest half-column so sub_col is consistent after every seek.
-            let speed = (deck.tempo.bpm / deck.tempo.base_bpm) as f64;
-            let col_samp_f64 = col_secs * deck.audio.sample_rate as f64 * speed;
-            let half_col = col_samp_f64 / 2.0;
-            deck.display.smooth_display_samp = if half_col > 0.0 {
-                (pos_samp as f64 / half_col).round() * half_col
-            } else {
-                pos_samp as f64
-            };
-        } else if !deck.audio.player.is_paused() {
-            // Slew correction: nudge toward true position at 5% per frame.
-            deck.display.smooth_display_samp -= drift * 0.05;
-        }
-        // Apply audio latency compensation: shift the visual display backward by latency.
-        let display_samp = deck.display.smooth_display_samp
-            - audio_latency_ms as f64 * deck.audio.sample_rate as f64 / 1000.0;
-        let display_pos_samp = display_samp.max(0.0) as usize;
-        let pos_interleaved = display_pos_samp * deck.audio.seek_handle.channels as usize;
-        if active_deck == 0 {
-            shared_renderer.display_pos_a.store(pos_interleaved, Ordering::Relaxed);
-        } else {
-            shared_renderer.display_pos_b.store(pos_interleaved, Ordering::Relaxed);
-        }
-
-        // Beat-derived values — recomputed each frame so they react to bpm changes instantly.
-        // Use base_bpm and display_samp so the flash is in exact sync with tick marks.
-        let beat_period = Duration::from_secs_f64(60.0 / deck.tempo.base_bpm as f64);
-        let flash_window = beat_period.mul_f64(0.15);
-
-        // Beat flash — subtract offset so phase==0 when cursor is on a tick.
-        // Ticks are at (samp - offset_samp) % beat_period_samp == 0, so we subtract here.
-        let smooth_pos_ns = (display_samp / deck.audio.sample_rate as f64 * 1_000_000_000.0) as i128
-            - deck.tempo.offset_ms as i128 * 1_000_000;
-        let phase = smooth_pos_ns.rem_euclid(beat_period.as_nanos() as i128);
-        let beat_on = phase < flash_window.as_nanos() as i128;
-
-        let remaining = deck.total_duration.saturating_sub(pos);
-        let warning_active = !deck.audio.player.is_paused()
-            && remaining < Duration::from_secs_f32(display_cfg.warning_threshold_secs);
-        let beat_index = smooth_pos_ns.div_euclid(beat_period.as_nanos() as i128);
-        let warn_beat_on = warning_active && (beat_index % 2 == 0);
-
-        // Metronome beat index: derived from smooth_display_samp (buffer write position), not
-        // display_samp. When this crosses a beat boundary, the speaker is audio_latency_ms before
-        // the beat — so the injected click arrives at the speaker exactly on the beat.
-        // Using display_samp (the speaker position) would fire the click one full latency period late.
-        let metro_beat_index = {
-            let ns = (deck.display.smooth_display_samp / deck.audio.sample_rate as f64 * 1_000_000_000.0) as i128
-                - deck.tempo.offset_ms as i128 * 1_000_000;
-            ns.div_euclid(beat_period.as_nanos() as i128)
-        };
-
-        let analysing = deck.tempo.analysis_hash.is_none();
-
-        // Metronome: fire a click tone on each new metro_beat_index while playing.
-        if deck.metronome_mode && !deck.audio.player.is_paused() {
-            if deck.last_metro_beat != Some(metro_beat_index) {
-                play_click_tone(mixer, deck.audio.sample_rate);
-                deck.last_metro_beat = Some(metro_beat_index);
-            }
-        } else {
-            deck.last_metro_beat = None;
-        }
-
-        // Detect tap session end: active last frame, now timed out.
-        let tap_active_now = !deck.tap.tap_times.is_empty()
-            && deck.tap.last_tap_wall.map_or(false, |t| t.elapsed().as_secs_f64() < 2.0);
-        if deck.tap.was_tap_active && !tap_active_now && deck.tap.tap_times.len() >= 8 {
-            // TEST: re-detection disabled — BPM and offset come from taps only.
-            let (tapped_bpm, tapped_offset_raw) = compute_tap_bpm_offset(&deck.tap.tap_times);
-            let tapped_offset = (tapped_offset_raw as f64 / 10.0).round() as i64 * 10;
-            let speed_ratio = deck.tempo.bpm / deck.tempo.base_bpm;
-            deck.tempo.base_bpm = tapped_bpm;
-            deck.tempo.bpm = (deck.tempo.base_bpm * speed_ratio).clamp(40.0, 240.0);
-            deck.tempo.offset_ms = tapped_offset;
-            deck.tempo.bpm_established = true;
-            deck.audio.player.set_speed(deck.tempo.bpm / deck.tempo.base_bpm);
-            shared_renderer.store_speed_ratio(active_deck, deck.tempo.bpm, deck.tempo.base_bpm);
-            if let Some(ref hash) = deck.tempo.analysis_hash {
-                cache.set(hash.clone(), CacheEntry { bpm: deck.tempo.base_bpm, offset_ms: deck.tempo.offset_ms, name: deck.filename.clone() });
-                cache.save();
-            }
-        }
-        deck.tap.was_tap_active = tap_active_now;
-
-        // Spectrum analyser: chars every half beat, background glow every bar (4 beats).
-        {
-            let half_period = if analysing {
-                Duration::from_millis(500)
-            } else {
-                beat_period / 2
-            };
-            let bar_period = beat_period * 8;
-            let chars_due = deck.spectrum.last_update.map_or(true, |t| t.elapsed() >= half_period);
-            let bg_due = deck.spectrum.last_bg_update.map_or(true, |t| t.elapsed() >= bar_period);
-            if chars_due || bg_due {
-                let (new_chars, new_bg) = compute_spectrum(&deck.audio.mono, display_pos_samp, deck.audio.sample_rate, deck.filter_offset);
-                if chars_due {
-                    deck.spectrum.chars = new_chars;
-                    // Accumulate bg activity; background reflects running accum so it lights
-                    // up immediately and can only go dark when the window resets.
-                    for i in 0..16 { deck.spectrum.bg_accum[i] |= new_bg[i]; }
-                    deck.spectrum.bg = deck.spectrum.bg_accum;
-                    deck.spectrum.last_update = Some(Instant::now());
-                }
-                if bg_due {
-                    // Reset accumulator for the next 2-bar window.
-                    deck.spectrum.bg_accum = [false; 16];
-                    deck.spectrum.last_bg_update = Some(Instant::now());
-                }
-            }
-        }
-
         shared_renderer.zoom_at.store(zoom_idx, Ordering::Relaxed);
+        let buf_a = Arc::clone(&*shared_renderer.shared_a.lock().unwrap());
+        let buf_b = Arc::clone(&*shared_renderer.shared_b.lock().unwrap());
+        let scrub_spc_a = buf_a.samples_per_col;
+        let scrub_spc_b = buf_b.samples_per_col;
+
+        // Take both decks out so the draw closure can mutate them.
+        let mut d0 = decks[0].take();
+        let mut d1 = decks[1].take();
 
         terminal.draw(|frame| {
             let area = frame.area();
-
             let outer = Block::default()
                 .title(format!(" tj {} ", env!("CARGO_PKG_VERSION")))
                 .borders(Borders::ALL);
             let inner = outer.inner(area);
             frame.render_widget(outer, area);
 
-            let a_detail_h = detail_height as u16;
-            let b_detail_h = detail_height as u16;
-
-            // Compute named layout areas based on which decks are visible.
-            #[allow(clippy::type_complexity)]
+            let det_h = detail_height as u16;
+            let c = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1),    // 0: global bar
+                    Constraint::Length(1),    // 1: detail info bar
+                    Constraint::Length(det_h),// 2: detail A
+                    Constraint::Length(det_h),// 3: detail B
+                    Constraint::Length(1),    // 4: notif A
+                    Constraint::Length(1),    // 5: info A
+                    Constraint::Length(4),    // 6: overview A
+                    Constraint::Length(1),    // 7: notif B
+                    Constraint::Length(1),    // 8: info B
+                    Constraint::Length(4),    // 9: overview B
+                    Constraint::Min(0),       // 10: spacer
+                ])
+                .split(inner);
             let (area_detail_info, area_detail_a, area_detail_b,
                  area_notif_a, area_info_a, area_overview_a,
                  area_notif_b, area_info_b, area_overview_b,
-                 area_global): (Rect,Rect,Rect,Rect,Rect,Rect,Rect,Rect,Rect,Rect) = match deck_visible {
-                [true, true] => {
-                    let c = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([
-                            Constraint::Length(1),          // 0: detail info bar
-                            Constraint::Length(a_detail_h), // 1: detail A
-                            Constraint::Length(b_detail_h), // 2: detail B
-                            Constraint::Length(1),          // 3: notif A
-                            Constraint::Length(1),          // 4: info A
-                            Constraint::Length(4),          // 5: overview A
-                            Constraint::Length(1),          // 6: notif B
-                            Constraint::Length(1),          // 7: info B
-                            Constraint::Length(4),          // 8: overview B
-                            Constraint::Length(1),          // 9: global bar
-                            Constraint::Min(0),             // 10: spacer
-                        ])
-                        .split(inner);
-                    (c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9])
-                }
-                [true, false] => {
-                    let c = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([
-                            Constraint::Length(1),          // 0: detail info bar
-                            Constraint::Length(a_detail_h), // 1: detail A
-                            Constraint::Length(1),          // 2: notif A
-                            Constraint::Length(1),          // 3: info A
-                            Constraint::Length(4),          // 4: overview A
-                            Constraint::Length(1),          // 5: global bar
-                            Constraint::Min(0),             // 6: spacer
-                        ])
-                        .split(inner);
-                    (c[0], c[1], Rect::default(), c[2], c[3], c[4], Rect::default(), Rect::default(), Rect::default(), c[5])
-                }
-                _ => {
-                    // [false, true]: only deck B visible
-                    let c = Layout::default()
-                        .direction(Direction::Vertical)
-                        .constraints([
-                            Constraint::Length(1),          // 0: detail info bar
-                            Constraint::Length(b_detail_h), // 1: detail B
-                            Constraint::Length(1),          // 2: notif B
-                            Constraint::Length(1),          // 3: info B
-                            Constraint::Length(4),          // 4: overview B
-                            Constraint::Length(1),          // 5: global bar
-                            Constraint::Min(0),             // 6: spacer
-                        ])
-                        .split(inner);
-                    (c[0], Rect::default(), c[1], Rect::default(), Rect::default(), Rect::default(), c[2], c[3], c[4], c[5])
-                }
-            };
+                 area_global) = (c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[0]);
 
-            // ---- Detail info bar ----
+            // Update renderer dimensions from layout.
+            {
+                let w = area_detail_a.width as usize;
+                let h = area_detail_a.height as usize;
+                if w > 0 && h > 0 {
+                    shared_renderer.cols.store(w, Ordering::Relaxed);
+                    shared_renderer.rows.store(h.saturating_sub(2), Ordering::Relaxed);
+                }
+            }
+
+            // Detail info bar
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
-                    format!("  zoom:{}s", zoom_secs),
+                    format!("  zoom:{}s  lat:{}ms", zoom_secs, audio_latency_ms),
                     Style::default().fg(Color::Rgb(60, 60, 60)),
                 ))),
                 area_detail_info,
             );
 
-            // Palette colours for active-deck highlight.
-            let (_, _, (tr, tg, tb)) = SPECTRAL_PALETTES[deck.display.palette_idx];
-            let active_label_style = Style::default().fg(Color::Rgb(tr, tg, tb));
-            let dim_label_style    = Style::default().fg(Color::Rgb(70, 70, 70));
+            let label_style = Style::default().fg(Color::Rgb(40, 60, 100));
+            let notif_bg    = Style::default().bg(Color::Rgb(20, 20, 38));
 
-            let a_is_active = active_deck == 0;
-            let b_is_active = active_deck == 1;
-
-            // ---- DECK A ----
-            if deck_visible[0] {
-                // Notification bar A
-                {
-                    let label_style = if a_is_active { active_label_style } else { dim_label_style };
-                    let label = Span::styled("A ", label_style);
-                    let content: Line<'static> = if a_is_active {
-                        if deck.active_notification.as_ref().map_or(false, |n| Instant::now() >= n.expires) {
-                            deck.active_notification = None;
-                        }
-                        notification_line_for_deck(&deck)
-                    } else {
-                        decks[0].as_ref().map(notification_line_for_deck)
-                            .unwrap_or_else(|| Line::from(""))
-                    };
-                    let mut spans = vec![label];
-                    spans.extend(content.spans);
-                    let a_bg = if a_is_active { Style::default().bg(Color::Rgb(20, 20, 38)) } else { Style::default() };
-                    frame.render_widget(Paragraph::new(Line::from(spans)).style(a_bg), area_notif_a);
-                }
-
-                // Info bar A
-                {
-                    let label_style = if a_is_active { active_label_style } else { dim_label_style };
-                    if a_is_active {
-                        let info = info_line_for_deck(
-                            &deck, audio_latency_ms, frame_count,
-                            beat_on, analysing, label_style, area_info_a.width,
-                        );
-                        frame.render_widget(Paragraph::new(info), area_info_a);
-                    } else if let Some(ref d) = decks[0] {
-                        let ir = inactive_render.as_ref().unwrap();
-                        let info = info_line_for_deck(
-                            d, audio_latency_ms, frame_count,
-                            ir.beat_on, ir.analysing, label_style, area_info_a.width,
-                        );
-                        frame.render_widget(Paragraph::new(info), area_info_a);
-                    }
-                }
-
-                // Overview waveform A
-                {
-                    if a_is_active {
-                        let (ov, bar_cols, bar_times) = overview_for_deck(
-                            &deck, area_overview_a, display_samp, analysing, warning_active, warn_beat_on,
-                        );
-                        deck.display.overview_rect    = area_overview_a;
-                        deck.display.last_bar_cols    = bar_cols;
-                        deck.display.last_bar_times   = bar_times;
-                        frame.render_widget(Paragraph::new(ov), area_overview_a);
-                    } else if let Some(ref d) = decks[0] {
-                        let ir = inactive_render.as_ref().unwrap();
-                        let (ov, _, _) = overview_for_deck(
-                            d, area_overview_a, ir.display_samp, ir.analysing, ir.warning_active, ir.warn_beat_on,
-                        );
-                        frame.render_widget(Paragraph::new(ov), area_overview_a);
-                    }
-                }
-
-                // Detail waveform A
-                {
-                    if a_is_active {
-                        render_detail_waveform(frame, &buf_a, &mut deck, area_detail_a, &display_cfg, display_pos_samp);
-                    } else if let Some(ref d) = decks[0] {
-                        let ir = inactive_render.as_ref().unwrap();
-                        render_detail_waveform_inactive(frame, &buf_a, d, area_detail_a, &display_cfg, ir.display_pos_samp);
-                    }
-                }
+            // ---- Deck A ----
+            if let (Some(deck), Some(rs)) = (&mut d0, &render[0]) {
+                let content = notification_line_for_deck(deck);
+                let mut spans = vec![Span::styled("A ", label_style)];
+                spans.extend(content.spans);
+                frame.render_widget(Paragraph::new(Line::from(spans)).style(notif_bg), area_notif_a);
+                let info = info_line_for_deck(deck, frame_count, rs.beat_on, rs.spinner_active, label_style, area_info_a.width);
+                frame.render_widget(Paragraph::new(info), area_info_a);
+                let (ov, bar_cols, bar_times) = overview_for_deck(deck, area_overview_a, rs.display_samp, rs.analysing, rs.warning_active, rs.warn_beat_on);
+                deck.display.overview_rect  = area_overview_a;
+                deck.display.last_bar_cols  = bar_cols;
+                deck.display.last_bar_times = bar_times;
+                frame.render_widget(Paragraph::new(ov), area_overview_a);
+                render_detail_waveform(frame, &buf_a, deck, area_detail_a, &display_cfg, rs.display_pos_samp);
+            } else {
+                let mut spans = vec![Span::styled("A ", label_style)];
+                spans.extend(notification_line_empty().spans);
+                frame.render_widget(Paragraph::new(Line::from(spans)).style(notif_bg), area_notif_a);
+                frame.render_widget(Paragraph::new(info_line_empty(area_info_a.width)), area_info_a);
+                frame.render_widget(Paragraph::new(overview_empty(area_overview_a)), area_overview_a);
+                render_detail_empty(frame, area_detail_a, &display_cfg);
             }
 
-            // ---- DECK B ----
-            if deck_visible[1] {
-                let deck_b_loaded = b_is_active || decks[1].is_some();
-
-                if !deck_b_loaded {
-                    // Deck B not loaded — render placeholder panels.
-                    let b_label_style = dim_label_style;
-                    let b_active_bg   = if b_is_active { Style::default().bg(Color::Rgb(20, 20, 38)) } else { Style::default() };
-
-                    // Notification bar B
-                    {
-                        let label = Span::styled("B ", if b_is_active { active_label_style } else { b_label_style });
-                        let mut spans = vec![label];
-                        spans.extend(notification_line_empty().spans);
-                        frame.render_widget(
-                            Paragraph::new(Line::from(spans)).style(b_active_bg),
-                            area_notif_b,
-                        );
-                    }
-                    // Info bar B
-                    frame.render_widget(
-                        Paragraph::new(info_line_empty(area_info_b.width)),
-                        area_info_b,
-                    );
-                    // Overview B
-                    frame.render_widget(
-                        Paragraph::new(overview_empty(area_overview_b)),
-                        area_overview_b,
-                    );
-                    // Detail B
-                    render_detail_empty(frame, area_detail_b, &display_cfg);
-                } else {
-                    // Notification bar B
-                    {
-                        let label_style = if b_is_active { active_label_style } else { dim_label_style };
-                        let label = Span::styled("B ", label_style);
-                        let content = if b_is_active {
-                            if deck.active_notification.as_ref().map_or(false, |n| Instant::now() >= n.expires) {
-                                deck.active_notification = None;
-                            }
-                            notification_line_for_deck(&deck)
-                        } else {
-                            // inactive: decks[1] is Some (checked above)
-                            notification_line_for_deck(decks[1].as_ref().unwrap())
-                        };
-                        let mut spans = vec![label];
-                        spans.extend(content.spans);
-                        let b_bg = if b_is_active { Style::default().bg(Color::Rgb(20, 20, 38)) } else { Style::default() };
-                        frame.render_widget(Paragraph::new(Line::from(spans)).style(b_bg), area_notif_b);
-                    }
-
-                    // Info bar B
-                    {
-                        let label_style = if b_is_active { active_label_style } else { dim_label_style };
-                        if b_is_active {
-                            let info = info_line_for_deck(
-                                &deck, audio_latency_ms, frame_count,
-                                beat_on, analysing, label_style, area_info_b.width,
-                            );
-                            frame.render_widget(Paragraph::new(info), area_info_b);
-                        } else {
-                            let ir = inactive_render.as_ref().unwrap();
-                            let info = info_line_for_deck(
-                                decks[1].as_ref().unwrap(), audio_latency_ms, frame_count,
-                                ir.beat_on, ir.analysing, label_style, area_info_b.width,
-                            );
-                            frame.render_widget(Paragraph::new(info), area_info_b);
-                        }
-                    }
-
-                    // Overview B
-                    {
-                        if b_is_active {
-                            let (ov, bar_cols, bar_times) = overview_for_deck(
-                                &deck, area_overview_b, display_samp, analysing, warning_active, warn_beat_on,
-                            );
-                            deck.display.overview_rect  = area_overview_b;
-                            deck.display.last_bar_cols  = bar_cols;
-                            deck.display.last_bar_times = bar_times;
-                            frame.render_widget(Paragraph::new(ov), area_overview_b);
-                        } else {
-                            let ir = inactive_render.as_ref().unwrap();
-                            let (ov, _, _) = overview_for_deck(
-                                decks[1].as_ref().unwrap(), area_overview_b, ir.display_samp, ir.analysing, ir.warning_active, ir.warn_beat_on,
-                            );
-                            frame.render_widget(Paragraph::new(ov), area_overview_b);
-                        }
-                    }
-
-                    // Detail waveform B
-                    {
-                        if b_is_active {
-                            render_detail_waveform(frame, &buf_b, &mut deck, area_detail_b, &display_cfg, display_pos_samp);
-                        } else {
-                            let ir = inactive_render.as_ref().unwrap();
-                            render_detail_waveform_inactive(frame, &buf_b, decks[1].as_ref().unwrap(), area_detail_b, &display_cfg, ir.display_pos_samp);
-                        }
-                    }
-                }
+            // ---- Deck B ----
+            if let (Some(deck), Some(rs)) = (&mut d1, &render[1]) {
+                let content = notification_line_for_deck(deck);
+                let mut spans = vec![Span::styled("B ", label_style)];
+                spans.extend(content.spans);
+                frame.render_widget(Paragraph::new(Line::from(spans)).style(notif_bg), area_notif_b);
+                let info = info_line_for_deck(deck, frame_count, rs.beat_on, rs.spinner_active, label_style, area_info_b.width);
+                frame.render_widget(Paragraph::new(info), area_info_b);
+                let (ov, bar_cols, bar_times) = overview_for_deck(deck, area_overview_b, rs.display_samp, rs.analysing, rs.warning_active, rs.warn_beat_on);
+                deck.display.overview_rect  = area_overview_b;
+                deck.display.last_bar_cols  = bar_cols;
+                deck.display.last_bar_times = bar_times;
+                frame.render_widget(Paragraph::new(ov), area_overview_b);
+                render_detail_waveform(frame, &buf_b, deck, area_detail_b, &display_cfg, rs.display_pos_samp);
+            } else {
+                let mut spans = vec![Span::styled("B ", label_style)];
+                spans.extend(notification_line_empty().spans);
+                frame.render_widget(Paragraph::new(Line::from(spans)).style(notif_bg), area_notif_b);
+                frame.render_widget(Paragraph::new(info_line_empty(area_info_b.width)), area_info_b);
+                frame.render_widget(Paragraph::new(overview_empty(area_overview_b)), area_overview_b);
+                render_detail_empty(frame, area_detail_b, &display_cfg);
             }
 
             // ---- Global status bar ----
             {
-                let global_line = if let Some(ref n) = global_notification {
+                let global_line = if pending_quit {
+                    Line::from(vec![
+                        Span::styled("  Track is playing — quit? ", Style::default().fg(Color::Yellow)),
+                        Span::styled("[y] yes  ", Style::default().fg(Color::White)),
+                        Span::styled("[Esc/n] cancel", Style::default().fg(Color::DarkGray)),
+                    ])
+                } else if let Some(ref n) = global_notification {
                     let color = match n.style {
                         NotificationStyle::Info    => Color::DarkGray,
                         NotificationStyle::Warning => Color::Yellow,
@@ -1166,44 +506,30 @@ Esc            quit";
                 frame.render_widget(Paragraph::new(global_line), area_global);
             }
 
-            // ---- Update active deck renderer dimensions (from layout) ----
-            {
-                let active_detail_area = if a_is_active { area_detail_a } else { area_detail_b };
-                let detail_width  = active_detail_area.width as usize;
-                let detail_height = active_detail_area.height as usize;
-                let waveform_rows = detail_height.saturating_sub(2);
-                shared_renderer.cols.store(detail_width,  Ordering::Relaxed);
-                shared_renderer.rows.store(waveform_rows, Ordering::Relaxed);
-            }
-
             // Help popup
             if help_open {
                 const HELP: &str = "\
-Space+Z        play / pause
-Space+F/V      reset playback speed to 1×  (cancel f/v adjustment)
-1/2/3/4        beat jump forward 1/4/16/64 beats
-q/w/e/r        beat jump backward 1/4/16/64 beats
-c  /  d        nudge backward / forward (mode-dependent)
-C  /  D        toggle nudge mode: jump (10ms) / warp (±10% speed)
-+  /  _        beat phase offset ±10ms
-[  /  ]        latency ±10ms
--  /  =        zoom in / out
-{  /  }        detail height decrease / increase
-f  /  v        BPM +1.0 / -1.0
-b              tap in time to set BPM + phase
-'              toggle metronome
-j  /  m        Deck A level up / down
-k  /  ,        Deck B level up / down
-Space+J        level 100%   Space+M  level 0%
-u  /  7        Deck A filter sweep
-i  /  8        Deck B filter sweep
-g  /  h        select Deck A / Deck B
-p              cycle spectral colour palette
-o              toggle waveform fill / outline
-z              open file browser
-`              refresh terminal
-?              toggle this help
-Esc            quit";
+Space+Z / Space+C    play / pause  Deck 1 / Deck 2
+Z / C                load file into Deck 1 / Deck 2
+1/2  q/w             Deck 1 jump ±4/±8 bars    Space+1/2  q/w  ±1/±4 beats
+3/4  e/r             Deck 2 jump ±4/±8 bars    Space+3/4  e/r  ±1/±4 beats
+a / z                Deck 1 nudge fwd / bwd     d / c  Deck 2
+|                    toggle nudge mode: jump (10ms) / warp (±10%)
+j/m  k/,             Deck 1/2 level up/down     Space+J/M  K/,  snap 100%/0%
+7/u  i/8             Deck 1/2 filter sweep      Space+7/u  i/8  filter reset
+s/x  f/v             Deck 1/2 BPM ±0.1          S/X  F/V  base BPM ±0.01
+@  /  ~              Deck 1/2 tempo reset
+b  /  n              Deck 1/2 tap BPM            B / N  metronome
+'  /  #              Deck 1/2 BPM redetect
+!  Q                 Deck 1 offset ±10ms         £  E  Deck 2
+[  /  ]              latency ±10ms
+-  /  =              zoom in / out
+{  /  }              detail height decrease / increase
+O                    toggle waveform fill / outline
+P                    cycle spectral colour palette
+`                    refresh terminal
+?                    toggle this help
+Esc                  close this / quit";
                 let popup_w = 75u16;
                 let popup_h = HELP.lines().count() as u16 + 2;
                 let px = area.x + area.width.saturating_sub(popup_w) / 2;
@@ -1223,30 +549,37 @@ Esc            quit";
             }
         })?;
 
-        // Drain all pending events without blocking — frame timing is now handled by the
-        // throttle sleep at the top of the loop, not by the event poll duration.
+        // Put both decks back after render.
+        decks[0] = d0;
+        decks[1] = d1;
+
+        // Single event handler — all actions work regardless of which deck is loaded.
         while event::poll(Duration::ZERO)? {
             match event::read()? {
             Event::Mouse(mouse_event) => {
                 if mouse_event.kind == MouseEventKind::Down(MouseButton::Left) {
                     let col = mouse_event.column as usize;
                     let row = mouse_event.row as usize;
-                    let rect = deck.display.overview_rect;
-                    if col >= rect.x as usize
-                        && col < (rect.x + rect.width) as usize
-                        && row >= rect.y as usize
-                        && row < (rect.y + rect.height) as usize
-                    {
-                        let click_col = col - rect.x as usize;
-                        let target_secs = deck.display.last_bar_cols.iter().zip(deck.display.last_bar_times.iter())
-                            .filter(|(c, _)| **c <= click_col)
-                            .last()
-                            .map(|(_, t)| *t)
-                            .unwrap_or(0.0);
-                        if deck.audio.player.is_paused() {
-                            deck.audio.seek_handle.seek_direct(target_secs);
-                        } else {
-                            deck.audio.seek_handle.seek_to(target_secs);
+                    for slot in 0..2 {
+                        if let Some(ref d) = decks[slot] {
+                            let rect = d.display.overview_rect;
+                            if col >= rect.x as usize && col < (rect.x + rect.width) as usize
+                                && row >= rect.y as usize && row < (rect.y + rect.height) as usize
+                            {
+                                let click_col = col - rect.x as usize;
+                                let target_secs = d.display.last_bar_cols.iter()
+                                    .zip(d.display.last_bar_times.iter())
+                                    .filter(|(c, _)| **c <= click_col)
+                                    .last()
+                                    .map(|(_, t)| *t)
+                                    .unwrap_or(0.0);
+                                if d.audio.player.is_paused() {
+                                    d.audio.seek_handle.seek_direct(target_secs);
+                                } else {
+                                    d.audio.seek_handle.seek_to(target_secs);
+                                }
+                                break;
+                            }
                         }
                     }
                 }
@@ -1254,119 +587,219 @@ Esc            quit";
             Event::Key(key) => {
                 // Ctrl-C: unconditional quit.
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    deck.audio.player.stop();
-                    if let Some(ref d) = decks[inactive] { d.audio.player.stop(); }
-                    if let Some(ref hash) = deck.tempo.analysis_hash {
-                        if let Some(entry) = cache.get(hash.as_str()).cloned() {
-                            cache.set(hash.clone(), CacheEntry { offset_ms: deck.tempo.offset_ms, ..entry });
-                            cache.save();
+                    for slot in 0..2 {
+                        if let Some(ref d) = decks[slot] {
+                            d.audio.player.stop();
+                            if let Some(ref hash) = d.tempo.analysis_hash {
+                                if let Some(entry) = cache.get(hash.as_str()).cloned() {
+                                    cache.set(hash.clone(), CacheEntry { offset_ms: d.tempo.offset_ms, ..entry });
+                                }
+                            }
                         }
                     }
+                    cache.save();
                     return Ok(());
                 }
                 // Space modifier: track held state for chords.
                 if key.code == KeyCode::Char(' ') {
                     match key.kind {
-                        KeyEventKind::Press  => { space_held = true; }
+                        KeyEventKind::Press   => { space_held = true; }
                         KeyEventKind::Release => { space_held = false; }
                         _ => {}
                     }
                 }
-                // Nudge/toggle: handled for all key kinds so Release is detected.
+                // Nudge and mode toggle — handled for all key kinds (Release must be detected).
                 match key.kind {
-                    KeyEventKind::Press if keymap.get(&KeyBinding::Key(key.code)) == Some(&Action::NudgeModeToggle) => {
-                        if deck.nudge != 0 {
-                            deck.nudge = 0;
-                            deck.audio.player.set_speed(deck.tempo.bpm / deck.tempo.base_bpm);
-                        }
-                        deck.nudge_mode = match deck.nudge_mode {
-                            NudgeMode::Jump => NudgeMode::Warp,
-                            NudgeMode::Warp => NudgeMode::Jump,
-                        };
-                    }
-                    KeyEventKind::Press | KeyEventKind::Repeat
-                        if keymap.get(&KeyBinding::Key(key.code)) == Some(&Action::NudgeBackward) =>
+                    KeyEventKind::Press
+                        if keymap.get(&KeyBinding::Key(key.code)) == Some(&Action::NudgeModeToggle) =>
                     {
-                        match deck.nudge_mode {
-                            NudgeMode::Jump => {
-                                let current = deck.audio.seek_handle.current_pos().as_secs_f64();
-                                let target = (current - 0.010).max(0.0);
-                                deck.audio.seek_handle.set_position(target);
-                                deck.display.smooth_display_samp += (target - current) * deck.audio.sample_rate as f64;
-                                if deck.audio.player.is_paused() {
-                                    scrub_audio(mixer, &deck.audio.seek_handle.samples, deck.audio.seek_handle.channels as u16,
-                                                deck.audio.sample_rate, deck.display.smooth_display_samp as usize, scrub_samples_per_col);
+                        let new_mode = decks.iter().flatten().next()
+                            .map(|d| match d.nudge_mode {
+                                NudgeMode::Jump => NudgeMode::Warp,
+                                NudgeMode::Warp => NudgeMode::Jump,
+                            })
+                            .unwrap_or(NudgeMode::Jump);
+                        for slot in 0..2 {
+                            if let Some(ref mut d) = decks[slot] {
+                                if d.nudge != 0 {
+                                    d.nudge = 0;
+                                    d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm);
                                 }
-                            }
-                            NudgeMode::Warp => {
-                                deck.nudge = -1;
-                                deck.audio.player.set_speed(deck.tempo.bpm / deck.tempo.base_bpm * 0.9);
+                                d.nudge_mode = new_mode;
                             }
                         }
                     }
+                    // Deck 1 nudge
                     KeyEventKind::Press | KeyEventKind::Repeat
-                        if keymap.get(&KeyBinding::Key(key.code)) == Some(&Action::NudgeForward) =>
+                        if keymap.get(&KeyBinding::Key(key.code)) == Some(&Action::Deck1NudgeBackward) =>
                     {
-                        match deck.nudge_mode {
-                            NudgeMode::Jump => {
-                                let current = deck.audio.seek_handle.current_pos().as_secs_f64();
-                                let target = (current + 0.010).min(deck.total_duration.as_secs_f64());
-                                deck.audio.seek_handle.set_position(target);
-                                deck.display.smooth_display_samp += (target - current) * deck.audio.sample_rate as f64;
-                                if deck.audio.player.is_paused() {
-                                    scrub_audio(mixer, &deck.audio.seek_handle.samples, deck.audio.seek_handle.channels as u16,
-                                                deck.audio.sample_rate, deck.display.smooth_display_samp as usize, scrub_samples_per_col);
+                        if let Some(ref mut d) = decks[0] {
+                            match d.nudge_mode {
+                                NudgeMode::Jump => {
+                                    let current = d.audio.seek_handle.current_pos().as_secs_f64();
+                                    let target = (current - 0.010).max(0.0);
+                                    d.audio.seek_handle.set_position(target);
+                                    d.display.smooth_display_samp += (target - current) * d.audio.sample_rate as f64;
+                                    if d.audio.player.is_paused() {
+                                        scrub_audio(mixer, &d.audio.seek_handle.samples, d.audio.seek_handle.channels as u16,
+                                                    d.audio.sample_rate, d.display.smooth_display_samp as usize, scrub_spc_a);
+                                    }
+                                }
+                                NudgeMode::Warp => {
+                                    d.nudge = -1;
+                                    d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm * 0.9);
                                 }
                             }
-                            NudgeMode::Warp => {
-                                deck.nudge = 1;
-                                deck.audio.player.set_speed(deck.tempo.bpm / deck.tempo.base_bpm * 1.1);
+                        }
+                    }
+                    KeyEventKind::Press | KeyEventKind::Repeat
+                        if keymap.get(&KeyBinding::Key(key.code)) == Some(&Action::Deck1NudgeForward) =>
+                    {
+                        if let Some(ref mut d) = decks[0] {
+                            match d.nudge_mode {
+                                NudgeMode::Jump => {
+                                    let current = d.audio.seek_handle.current_pos().as_secs_f64();
+                                    let target = (current + 0.010).min(d.total_duration.as_secs_f64());
+                                    d.audio.seek_handle.set_position(target);
+                                    d.display.smooth_display_samp += (target - current) * d.audio.sample_rate as f64;
+                                    if d.audio.player.is_paused() {
+                                        scrub_audio(mixer, &d.audio.seek_handle.samples, d.audio.seek_handle.channels as u16,
+                                                    d.audio.sample_rate, d.display.smooth_display_samp as usize, scrub_spc_a);
+                                    }
+                                }
+                                NudgeMode::Warp => {
+                                    d.nudge = 1;
+                                    d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm * 1.1);
+                                }
                             }
                         }
                     }
                     KeyEventKind::Release
                         if matches!(keymap.get(&KeyBinding::Key(key.code)),
-                            Some(&Action::NudgeBackward) | Some(&Action::NudgeForward)) =>
+                            Some(&Action::Deck1NudgeBackward) | Some(&Action::Deck1NudgeForward)) =>
                     {
-                        if deck.nudge_mode == NudgeMode::Warp {
-                            deck.nudge = 0;
-                            deck.audio.player.set_speed(deck.tempo.bpm / deck.tempo.base_bpm);
+                        if let Some(ref mut d) = decks[0] {
+                            if d.nudge_mode == NudgeMode::Warp {
+                                d.nudge = 0;
+                                d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm);
+                            }
+                        }
+                    }
+                    // Deck 2 nudge
+                    KeyEventKind::Press | KeyEventKind::Repeat
+                        if keymap.get(&KeyBinding::Key(key.code)) == Some(&Action::Deck2NudgeBackward) =>
+                    {
+                        if let Some(ref mut d) = decks[1] {
+                            match d.nudge_mode {
+                                NudgeMode::Jump => {
+                                    let current = d.audio.seek_handle.current_pos().as_secs_f64();
+                                    let target = (current - 0.010).max(0.0);
+                                    d.audio.seek_handle.set_position(target);
+                                    d.display.smooth_display_samp += (target - current) * d.audio.sample_rate as f64;
+                                    if d.audio.player.is_paused() {
+                                        scrub_audio(mixer, &d.audio.seek_handle.samples, d.audio.seek_handle.channels as u16,
+                                                    d.audio.sample_rate, d.display.smooth_display_samp as usize, scrub_spc_b);
+                                    }
+                                }
+                                NudgeMode::Warp => {
+                                    d.nudge = -1;
+                                    d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm * 0.9);
+                                }
+                            }
+                        }
+                    }
+                    KeyEventKind::Press | KeyEventKind::Repeat
+                        if keymap.get(&KeyBinding::Key(key.code)) == Some(&Action::Deck2NudgeForward) =>
+                    {
+                        if let Some(ref mut d) = decks[1] {
+                            match d.nudge_mode {
+                                NudgeMode::Jump => {
+                                    let current = d.audio.seek_handle.current_pos().as_secs_f64();
+                                    let target = (current + 0.010).min(d.total_duration.as_secs_f64());
+                                    d.audio.seek_handle.set_position(target);
+                                    d.display.smooth_display_samp += (target - current) * d.audio.sample_rate as f64;
+                                    if d.audio.player.is_paused() {
+                                        scrub_audio(mixer, &d.audio.seek_handle.samples, d.audio.seek_handle.channels as u16,
+                                                    d.audio.sample_rate, d.display.smooth_display_samp as usize, scrub_spc_b);
+                                    }
+                                }
+                                NudgeMode::Warp => {
+                                    d.nudge = 1;
+                                    d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm * 1.1);
+                                }
+                            }
+                        }
+                    }
+                    KeyEventKind::Release
+                        if matches!(keymap.get(&KeyBinding::Key(key.code)),
+                            Some(&Action::Deck2NudgeBackward) | Some(&Action::Deck2NudgeForward)) =>
+                    {
+                        if let Some(ref mut d) = decks[1] {
+                            if d.nudge_mode == NudgeMode::Warp {
+                                d.nudge = 0;
+                                d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm);
+                            }
                         }
                     }
                     _ => {}
                 }
-                // While help is open, any key dismisses it.
-                if help_open {
-                    if key.kind == KeyEventKind::Press {
-                        help_open = false;
-                    }
-                    decks[active_deck] = Some(deck);
-                    continue 'tui;
-                }
                 // All other actions fire on Press only.
                 if key.kind == KeyEventKind::Press {
-                    // BPM confirmation intercept — y/Enter accept, n/Esc reject.
-                    if let Some((hash, p_bpm, p_offset, _)) = deck.tempo.pending_bpm.take() {
-                        match key.code {
-                            KeyCode::Char('y') | KeyCode::Enter => {
-                                deck.tempo.bpm = p_bpm;
-                                deck.tempo.base_bpm = p_bpm;
-                                deck.tempo.offset_ms = (p_offset as f64 / 10.0).round() as i64 * 10;
-                                deck.tempo.bpm_established = true;
-                                deck.audio.player.set_speed(1.0);
-                                shared_renderer.store_speed_ratio(active_deck, deck.tempo.bpm, deck.tempo.base_bpm);
-                                cache.set(hash.clone(), CacheEntry { bpm: deck.tempo.bpm, offset_ms: deck.tempo.offset_ms, name: deck.filename.clone() });
-                                cache.save();
-                                deck.tempo.analysis_hash = Some(hash);
-                            }
-                            _ => { /* reject — pending_bpm already taken/cleared */ }
+                    // Dismiss any open overlay before processing any other action.
+                    if help_open {
+                        help_open = false;
+                        if keymap.get(&KeyBinding::Key(key.code)) == Some(&Action::Quit) {
+                            suppress_quit_until = Some(Instant::now() + Duration::from_millis(300));
                         }
-                        decks[active_deck] = Some(deck);
                         continue 'tui;
                     }
+                    // Quit confirmation intercept — y/Enter confirms, anything else cancels.
+                    if pending_quit {
+                        pending_quit = false;
+                        if matches!(key.code, KeyCode::Char('y') | KeyCode::Enter) {
+                            for slot in 0..2 {
+                                if let Some(ref d) = decks[slot] {
+                                    d.audio.player.stop();
+                                    if let Some(ref hash) = d.tempo.analysis_hash {
+                                        if let Some(entry) = cache.get(hash.as_str()).cloned() {
+                                            cache.set(hash.clone(), CacheEntry { offset_ms: d.tempo.offset_ms, ..entry });
+                                        }
+                                    }
+                                }
+                            }
+                            cache.set_latency(audio_latency_ms);
+                            cache.save();
+                            return Ok(());
+                        }
+                        continue 'tui;
+                    }
+                    // BPM confirmation intercept — check both decks.
+                    let mut bpm_intercepted = false;
+                    for slot in 0..2 {
+                        if let Some(ref mut d) = decks[slot] {
+                            if let Some((hash, p_bpm, p_offset, _)) = d.tempo.pending_bpm.take() {
+                                if matches!(key.code, KeyCode::Char('y') | KeyCode::Enter) {
+                                    d.tempo.bpm = p_bpm;
+                                    d.tempo.base_bpm = p_bpm;
+                                    d.tempo.offset_ms = (p_offset as f64 / 10.0).round() as i64 * 10;
+                                    d.tempo.bpm_established = true;
+                                    d.audio.player.set_speed(1.0);
+                                    shared_renderer.store_speed_ratio(slot, d.tempo.bpm, d.tempo.base_bpm);
+                                    cache.set(hash.clone(), CacheEntry { bpm: d.tempo.bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone() });
+                                    cache.save();
+                                    d.tempo.analysis_hash = Some(hash);
+                                }
+                                // Any key dismisses the confirmation.
+                                bpm_intercepted = true;
+                                break;
+                            }
+                        }
+                    }
+                    if bpm_intercepted { continue 'tui; }
+
                     let action = if space_held && key.code != KeyCode::Char(' ') {
                         if let Some(a) = keymap.get(&KeyBinding::SpaceChord(key.code)) {
-                            space_held = false; // reset so subsequent keys aren't treated as chords
+                            space_held = false;
                             Some(a)
                         } else {
                             keymap.get(&KeyBinding::Key(key.code))
@@ -1376,8 +809,31 @@ Esc            quit";
                     };
                     match action {
                     Some(Action::Quit) => {
-                        deck.audio.player.stop();
-                        if let Some(ref d) = decks[inactive] {
+                        if suppress_quit_until.take().map_or(false, |until| Instant::now() < until) {
+                            continue 'tui;
+                        }
+                        let any_playing = decks.iter().flatten().any(|d| !d.audio.player.is_paused());
+                        if any_playing && !pending_quit {
+                            pending_quit = true;
+                            continue 'tui;
+                        }
+                        for slot in 0..2 {
+                            if let Some(ref d) = decks[slot] {
+                                d.audio.player.stop();
+                                if let Some(ref hash) = d.tempo.analysis_hash {
+                                    if let Some(entry) = cache.get(hash.as_str()).cloned() {
+                                        cache.set(hash.clone(), CacheEntry { offset_ms: d.tempo.offset_ms, ..entry });
+                                    }
+                                }
+                            }
+                        }
+                        cache.set_latency(audio_latency_ms);
+                        cache.save();
+                        return Ok(());
+                    }
+                    Some(Action::Deck1OpenBrowser) | Some(Action::Deck2OpenBrowser) => {
+                        let target = if action == Some(&Action::Deck1OpenBrowser) { 0 } else { 1 };
+                        if let Some(ref d) = decks[target] {
                             d.audio.player.stop();
                             if let Some(ref hash) = d.tempo.analysis_hash {
                                 if let Some(entry) = cache.get(hash.as_str()).cloned() {
@@ -1385,16 +841,7 @@ Esc            quit";
                                 }
                             }
                         }
-                        cache.set_latency(audio_latency_ms);
-                        if let Some(ref hash) = deck.tempo.analysis_hash {
-                            if let Some(entry) = cache.get(hash.as_str()).cloned() {
-                                cache.set(hash.clone(), CacheEntry { offset_ms: deck.tempo.offset_ms, ..entry });
-                            }
-                        }
                         cache.save();
-                        return Ok(());
-                    }
-                    Some(Action::OpenBrowser) => {
                         match run_browser(terminal, browser_dir.clone())? {
                             (BrowserResult::ReturnToPlayer, cwd) => {
                                 *browser_dir = cwd;
@@ -1404,346 +851,356 @@ Esc            quit";
                             (BrowserResult::Selected(path), cwd) => {
                                 *browser_dir = cwd;
                                 cache.set_last_browser_path(browser_dir);
-                                deck.audio.player.stop();
-                                if let Some(ref hash) = deck.tempo.analysis_hash {
-                                    if let Some(entry) = cache.get(hash.as_str()).cloned() {
-                                        cache.set(hash.clone(), CacheEntry { offset_ms: deck.tempo.offset_ms, ..entry });
-                                    }
-                                }
                                 cache.save();
                                 match load_deck(&path, mixer, cache, terminal)? {
                                     None => return Ok(()),
                                     Some(new_deck) => {
-                                        shared_renderer.set_deck(active_deck, Arc::clone(&new_deck.audio.waveform), new_deck.audio.seek_handle.channels, new_deck.audio.sample_rate);
-                                        deck = new_deck;
+                                        shared_renderer.set_deck(target, Arc::clone(&new_deck.audio.waveform), new_deck.audio.seek_handle.channels, new_deck.audio.sample_rate);
+                                        decks[target] = Some(new_deck);
                                     }
                                 }
                             }
                             (BrowserResult::Quit, cwd) => {
                                 *browser_dir = cwd;
                                 cache.set_last_browser_path(browser_dir);
-                                deck.audio.player.stop();
-                                if let Some(ref hash) = deck.tempo.analysis_hash {
-                                    if let Some(entry) = cache.get(hash.as_str()).cloned() {
-                                        cache.set(hash.clone(), CacheEntry { offset_ms: deck.tempo.offset_ms, ..entry });
-                                    }
-                                }
+                                for slot in 0..2 { if let Some(ref d) = decks[slot] { d.audio.player.stop(); } }
                                 cache.save();
                                 return Ok(());
                             }
                         }
+                        continue 'tui;
                     }
-                    Some(Action::PlayPause) => {
-                        if deck.audio.player.is_paused() { deck.audio.player.play(); } else { deck.audio.player.pause(); }
-                    }
-                    Some(Action::DeckALevelUp) => {
-                        if active_deck == 0 {
-                            deck.volume = (deck.volume + 0.05).min(1.0);
-                            deck.audio.player.set_volume(deck.volume);
-                        } else if let Some(ref mut d) = decks[0] {
-                            d.volume = (d.volume + 0.05).min(1.0);
-                            d.audio.player.set_volume(d.volume);
+                    Some(Action::Deck1PlayPause) => {
+                        if let Some(ref d) = decks[0] {
+                            if d.audio.player.is_paused() { d.audio.player.play(); } else { d.audio.player.pause(); }
                         }
                     }
-                    Some(Action::DeckALevelDown) => {
-                        if active_deck == 0 {
-                            deck.volume = (deck.volume - 0.05).max(0.0);
-                            deck.audio.player.set_volume(deck.volume);
-                        } else if let Some(ref mut d) = decks[0] {
-                            d.volume = (d.volume - 0.05).max(0.0);
-                            d.audio.player.set_volume(d.volume);
+                    Some(Action::Deck2PlayPause) => {
+                        if let Some(ref d) = decks[1] {
+                            if d.audio.player.is_paused() { d.audio.player.play(); } else { d.audio.player.pause(); }
                         }
                     }
-                    Some(Action::DeckBLevelUp) => {
-                        if active_deck == 1 {
-                            deck.volume = (deck.volume + 0.05).min(1.0);
-                            deck.audio.player.set_volume(deck.volume);
-                        } else if let Some(ref mut d) = decks[1] {
-                            d.volume = (d.volume + 0.05).min(1.0);
-                            d.audio.player.set_volume(d.volume);
+                    Some(Action::Deck1LevelUp)   => { if let Some(ref mut d) = decks[0] { d.volume = (d.volume + 0.05).min(1.0); d.audio.player.set_volume(d.volume); } }
+                    Some(Action::Deck1LevelDown)  => { if let Some(ref mut d) = decks[0] { d.volume = (d.volume - 0.05).max(0.0); d.audio.player.set_volume(d.volume); } }
+                    Some(Action::Deck1LevelMax)   => { if let Some(ref mut d) = decks[0] { d.volume = 1.0; d.audio.player.set_volume(d.volume); } }
+                    Some(Action::Deck1LevelMin)   => { if let Some(ref mut d) = decks[0] { d.volume = 0.0; d.audio.player.set_volume(d.volume); } }
+                    Some(Action::Deck2LevelUp)    => { if let Some(ref mut d) = decks[1] { d.volume = (d.volume + 0.05).min(1.0); d.audio.player.set_volume(d.volume); } }
+                    Some(Action::Deck2LevelDown)  => { if let Some(ref mut d) = decks[1] { d.volume = (d.volume - 0.05).max(0.0); d.audio.player.set_volume(d.volume); } }
+                    Some(Action::Deck2LevelMax)   => { if let Some(ref mut d) = decks[1] { d.volume = 1.0; d.audio.player.set_volume(d.volume); } }
+                    Some(Action::Deck2LevelMin)   => { if let Some(ref mut d) = decks[1] { d.volume = 0.0; d.audio.player.set_volume(d.volume); } }
+                    Some(Action::Deck1MetronomeToggle) => {
+                        if let Some(ref mut d) = decks[0] {
+                            d.metronome_mode = !d.metronome_mode;
+                            d.last_metro_beat = if d.metronome_mode {
+                                let beat_period = Duration::from_secs_f64(60.0 / d.tempo.base_bpm as f64);
+                                let ns = (d.display.smooth_display_samp / d.audio.sample_rate as f64 * 1_000_000_000.0) as i128
+                                    - d.tempo.offset_ms as i128 * 1_000_000;
+                                Some(ns.div_euclid(beat_period.as_nanos() as i128))
+                            } else { None };
                         }
                     }
-                    Some(Action::DeckBLevelDown) => {
-                        if active_deck == 1 {
-                            deck.volume = (deck.volume - 0.05).max(0.0);
-                            deck.audio.player.set_volume(deck.volume);
-                        } else if let Some(ref mut d) = decks[1] {
-                            d.volume = (d.volume - 0.05).max(0.0);
-                            d.audio.player.set_volume(d.volume);
+                    Some(Action::Deck2MetronomeToggle) => {
+                        if let Some(ref mut d) = decks[1] {
+                            d.metronome_mode = !d.metronome_mode;
+                            d.last_metro_beat = if d.metronome_mode {
+                                let beat_period = Duration::from_secs_f64(60.0 / d.tempo.base_bpm as f64);
+                                let ns = (d.display.smooth_display_samp / d.audio.sample_rate as f64 * 1_000_000_000.0) as i128
+                                    - d.tempo.offset_ms as i128 * 1_000_000;
+                                Some(ns.div_euclid(beat_period.as_nanos() as i128))
+                            } else { None };
                         }
                     }
-                    Some(Action::DeckALevelMax) => {
-                        if active_deck == 0 {
-                            deck.volume = 1.0;
-                            deck.audio.player.set_volume(deck.volume);
-                        } else if let Some(ref mut d) = decks[0] {
-                            d.volume = 1.0;
-                            d.audio.player.set_volume(d.volume);
-                        }
-                    }
-                    Some(Action::DeckALevelMin) => {
-                        if active_deck == 0 {
-                            deck.volume = 0.0;
-                            deck.audio.player.set_volume(deck.volume);
-                        } else if let Some(ref mut d) = decks[0] {
-                            d.volume = 0.0;
-                            d.audio.player.set_volume(d.volume);
-                        }
-                    }
-                    Some(Action::TerminalRefresh) => {
-                        let _ = terminal.clear();
-                    }
-                                        Some(Action::MetronomeToggle) => {
-                        deck.metronome_mode = !deck.metronome_mode;
-                        if deck.metronome_mode {
-                            deck.last_metro_beat = Some(metro_beat_index); // suppress click on activation beat
-                        } else {
-                            deck.last_metro_beat = None;
-                        }
-                    }
-                    Some(Action::RedetectBpm) => {
-                        if deck.tempo.pending_bpm.is_some() {
-                            // Press while confirmation showing: reject.
-                            deck.tempo.pending_bpm = None;
-                        } else if deck.tempo.redetecting {
-                            // Press while spinner showing: hide the analysis (keep thread alive).
-                            let (_, dead_rx) = mpsc::channel::<(String, f32, i64, bool)>();
-                            deck.tempo.background_rx = Some(std::mem::replace(&mut deck.tempo.bpm_rx, dead_rx));
-                            deck.tempo.redetecting = false;
-                            deck.tempo.analysis_hash = deck.tempo.redetect_saved_hash.take();
-                        } else if deck.tempo.analysis_hash.is_some() {
-                            if let Some(bg_rx) = deck.tempo.background_rx.take() {
-                                // Reconnect to already-running hidden analysis.
-                                deck.tempo.redetect_saved_hash = deck.tempo.analysis_hash.take();
-                                deck.tempo.bpm_rx = bg_rx;
-                                deck.tempo.redetecting = true;
-                            } else {
-                                // Idle, no hidden analysis: spawn fresh.
-                                let mono_bg = Arc::clone(&deck.audio.mono);
-                                let (tx, rx) = mpsc::channel::<(String, f32, i64, bool)>();
-                                let hash_bg = deck.tempo.analysis_hash.clone().unwrap_or_default();
-                                let sr_bg = deck.audio.sample_rate;
-                                thread::spawn(move || {
-                                    if let Ok(bpm) = detect_bpm(&mono_bg, sr_bg) {
-                                        let _ = tx.send((hash_bg, bpm, 0, true));
-                                    }
-                                });
-                                deck.tempo.bpm_rx = rx;
-                                deck.tempo.redetect_saved_hash = deck.tempo.analysis_hash.take();
-                                deck.tempo.redetecting = true;
+                    Some(Action::Deck1RedetectBpm) => {
+                        if let Some(ref mut d) = decks[0] {
+                            if d.tempo.pending_bpm.is_some() {
+                                d.tempo.pending_bpm = None;
+                            } else if d.tempo.redetecting {
+                                let (_, dead_rx) = mpsc::channel::<(String, f32, i64, bool)>();
+                                d.tempo.background_rx = Some(std::mem::replace(&mut d.tempo.bpm_rx, dead_rx));
+                                d.tempo.redetecting = false;
+                                d.tempo.analysis_hash = d.tempo.redetect_saved_hash.take();
+                            } else if d.tempo.analysis_hash.is_some() {
+                                if let Some(bg_rx) = d.tempo.background_rx.take() {
+                                    d.tempo.redetect_saved_hash = d.tempo.analysis_hash.take();
+                                    d.tempo.bpm_rx = bg_rx;
+                                    d.tempo.redetecting = true;
+                                } else {
+                                    let mono_bg = Arc::clone(&d.audio.mono);
+                                    let (tx, rx) = mpsc::channel::<(String, f32, i64, bool)>();
+                                    let hash_bg = d.tempo.analysis_hash.clone().unwrap_or_default();
+                                    let sr_bg = d.audio.sample_rate;
+                                    thread::spawn(move || {
+                                        if let Ok(bpm) = detect_bpm(&mono_bg, sr_bg) {
+                                            let _ = tx.send((hash_bg, bpm, 0, true));
+                                        }
+                                    });
+                                    d.tempo.bpm_rx = rx;
+                                    d.tempo.redetect_saved_hash = d.tempo.analysis_hash.take();
+                                    d.tempo.redetecting = true;
+                                }
                             }
                         }
                     }
-                    Some(Action::Help) => { help_open = true; }
-                    Some(Action::LatencyDecrease) => {
+                    Some(Action::Deck2RedetectBpm) => {
+                        if let Some(ref mut d) = decks[1] {
+                            if d.tempo.pending_bpm.is_some() {
+                                d.tempo.pending_bpm = None;
+                            } else if d.tempo.redetecting {
+                                let (_, dead_rx) = mpsc::channel::<(String, f32, i64, bool)>();
+                                d.tempo.background_rx = Some(std::mem::replace(&mut d.tempo.bpm_rx, dead_rx));
+                                d.tempo.redetecting = false;
+                                d.tempo.analysis_hash = d.tempo.redetect_saved_hash.take();
+                            } else if d.tempo.analysis_hash.is_some() {
+                                if let Some(bg_rx) = d.tempo.background_rx.take() {
+                                    d.tempo.redetect_saved_hash = d.tempo.analysis_hash.take();
+                                    d.tempo.bpm_rx = bg_rx;
+                                    d.tempo.redetecting = true;
+                                } else {
+                                    let mono_bg = Arc::clone(&d.audio.mono);
+                                    let (tx, rx) = mpsc::channel::<(String, f32, i64, bool)>();
+                                    let hash_bg = d.tempo.analysis_hash.clone().unwrap_or_default();
+                                    let sr_bg = d.audio.sample_rate;
+                                    thread::spawn(move || {
+                                        if let Ok(bpm) = detect_bpm(&mono_bg, sr_bg) {
+                                            let _ = tx.send((hash_bg, bpm, 0, true));
+                                        }
+                                    });
+                                    d.tempo.bpm_rx = rx;
+                                    d.tempo.redetect_saved_hash = d.tempo.analysis_hash.take();
+                                    d.tempo.redetecting = true;
+                                }
+                            }
+                        }
+                    }
+                    Some(Action::Help)            => { help_open = true; }
+                    Some(Action::TerminalRefresh)  => { let _ = terminal.clear(); }
+                    Some(Action::LatencyDecrease)  => {
                         audio_latency_ms = (audio_latency_ms - 10).max(0);
-                        let period = (60_000.0 / deck.tempo.base_bpm as f64 / 10.0).round() as i64 * 10;
-                        deck.tempo.offset_ms = (deck.tempo.offset_ms + 10).rem_euclid(period);
                         cache.set_latency(audio_latency_ms);
-                        if let Some(ref hash) = deck.tempo.analysis_hash {
-                            if let Some(entry) = cache.get(hash.as_str()).cloned() {
-                                cache.set(hash.clone(), CacheEntry { offset_ms: deck.tempo.offset_ms, ..entry });
-                            }
-                        }
                         cache.save();
                     }
-                    Some(Action::LatencyIncrease) => {
+                    Some(Action::LatencyIncrease)  => {
                         audio_latency_ms = (audio_latency_ms + 10).min(250);
-                        let period = (60_000.0 / deck.tempo.base_bpm as f64 / 10.0).round() as i64 * 10;
-                        deck.tempo.offset_ms = (deck.tempo.offset_ms - 10).rem_euclid(period);
                         cache.set_latency(audio_latency_ms);
-                        if let Some(ref hash) = deck.tempo.analysis_hash {
-                            if let Some(entry) = cache.get(hash.as_str()).cloned() {
-                                cache.set(hash.clone(), CacheEntry { offset_ms: deck.tempo.offset_ms, ..entry });
-                            }
-                        }
                         cache.save();
                     }
-                    Some(Action::DeckAFilterIncrease) => {
-                        if active_deck == 0 {
-                            deck.filter_offset = (deck.filter_offset + 1).min(16);
-                            deck.audio.filter_offset_shared.store(deck.filter_offset, Ordering::Relaxed);
-                        } else if let Some(ref mut d) = decks[0] {
-                            d.filter_offset = (d.filter_offset + 1).min(16);
-                            d.audio.filter_offset_shared.store(d.filter_offset, Ordering::Relaxed);
-                        }
-                    }
-                    Some(Action::DeckAFilterDecrease) => {
-                        if active_deck == 0 {
-                            deck.filter_offset = (deck.filter_offset - 1).max(-16);
-                            deck.audio.filter_offset_shared.store(deck.filter_offset, Ordering::Relaxed);
-                        } else if let Some(ref mut d) = decks[0] {
-                            d.filter_offset = (d.filter_offset - 1).max(-16);
-                            d.audio.filter_offset_shared.store(d.filter_offset, Ordering::Relaxed);
-                        }
-                    }
-                    Some(Action::DeckBFilterIncrease) => {
-                        if active_deck == 1 {
-                            deck.filter_offset = (deck.filter_offset + 1).min(16);
-                            deck.audio.filter_offset_shared.store(deck.filter_offset, Ordering::Relaxed);
-                        } else if let Some(ref mut d) = decks[1] {
-                            d.filter_offset = (d.filter_offset + 1).min(16);
-                            d.audio.filter_offset_shared.store(d.filter_offset, Ordering::Relaxed);
-                        }
-                    }
-                    Some(Action::DeckBFilterDecrease) => {
-                        if active_deck == 1 {
-                            deck.filter_offset = (deck.filter_offset - 1).max(-16);
-                            deck.audio.filter_offset_shared.store(deck.filter_offset, Ordering::Relaxed);
-                        } else if let Some(ref mut d) = decks[1] {
-                            d.filter_offset = (d.filter_offset - 1).max(-16);
-                            d.audio.filter_offset_shared.store(d.filter_offset, Ordering::Relaxed);
-                        }
-                    }
-                    Some(Action::FilterReset) => {
-                        deck.filter_offset = 0;
-                        deck.audio.filter_offset_shared.store(0, Ordering::Relaxed);
-                    }
+                    Some(Action::Deck1FilterIncrease) => { if let Some(ref mut d) = decks[0] { d.filter_offset = (d.filter_offset + 1).min(16);  d.audio.filter_offset_shared.store(d.filter_offset, Ordering::Relaxed); } }
+                    Some(Action::Deck1FilterDecrease) => { if let Some(ref mut d) = decks[0] { d.filter_offset = (d.filter_offset - 1).max(-16); d.audio.filter_offset_shared.store(d.filter_offset, Ordering::Relaxed); } }
+                    Some(Action::Deck1FilterReset)    => { if let Some(ref mut d) = decks[0] { d.filter_offset = 0; d.audio.filter_offset_shared.store(0, Ordering::Relaxed); } }
+                    Some(Action::Deck2FilterIncrease) => { if let Some(ref mut d) = decks[1] { d.filter_offset = (d.filter_offset + 1).min(16);  d.audio.filter_offset_shared.store(d.filter_offset, Ordering::Relaxed); } }
+                    Some(Action::Deck2FilterDecrease) => { if let Some(ref mut d) = decks[1] { d.filter_offset = (d.filter_offset - 1).max(-16); d.audio.filter_offset_shared.store(d.filter_offset, Ordering::Relaxed); } }
+                    Some(Action::Deck2FilterReset)    => { if let Some(ref mut d) = decks[1] { d.filter_offset = 0; d.audio.filter_offset_shared.store(0, Ordering::Relaxed); } }
                     Some(Action::WaveformStyle) => {
                         let s = shared_renderer.style.load(Ordering::Relaxed);
                         shared_renderer.style.store(1 - s, Ordering::Relaxed);
                     }
                     Some(Action::PaletteCycle) => {
-                        deck.display.palette_idx = (deck.display.palette_idx + 1) % SPECTRAL_PALETTES.len();
+                        let next = decks.iter().flatten().next()
+                            .map(|d| (d.display.palette_idx + 1) % SPECTRAL_PALETTES.len())
+                            .unwrap_or(0);
+                        for slot in 0..2 {
+                            if let Some(ref mut d) = decks[slot] { d.display.palette_idx = next; }
+                        }
                     }
-                    Some(Action::OffsetIncrease) => {
-                        deck.tempo.offset_ms += 10;
-                        let period = (60_000.0 / deck.tempo.base_bpm as f64 / 10.0).round() as i64 * 10;
-                        deck.tempo.offset_ms = deck.tempo.offset_ms.rem_euclid(period);
+                    Some(Action::Deck1OffsetIncrease) => {
+                        if let Some(ref mut d) = decks[0] {
+                            d.tempo.offset_ms += 10;
+                            let period = (60_000.0 / d.tempo.base_bpm as f64 / 10.0).round() as i64 * 10;
+                            d.tempo.offset_ms = d.tempo.offset_ms.rem_euclid(period);
+                        }
                     }
-                    Some(Action::OffsetDecrease) => {
-                        deck.tempo.offset_ms -= 10;
-                        let period = (60_000.0 / deck.tempo.base_bpm as f64 / 10.0).round() as i64 * 10;
-                        deck.tempo.offset_ms = deck.tempo.offset_ms.rem_euclid(period);
+                    Some(Action::Deck1OffsetDecrease) => {
+                        if let Some(ref mut d) = decks[0] {
+                            d.tempo.offset_ms -= 10;
+                            let period = (60_000.0 / d.tempo.base_bpm as f64 / 10.0).round() as i64 * 10;
+                            d.tempo.offset_ms = d.tempo.offset_ms.rem_euclid(period);
+                        }
                     }
-
-                    Some(Action::ZoomOut) => {
-                        if zoom_idx > 0 { zoom_idx -= 1; }
+                    Some(Action::Deck2OffsetIncrease) => {
+                        if let Some(ref mut d) = decks[1] {
+                            d.tempo.offset_ms += 10;
+                            let period = (60_000.0 / d.tempo.base_bpm as f64 / 10.0).round() as i64 * 10;
+                            d.tempo.offset_ms = d.tempo.offset_ms.rem_euclid(period);
+                        }
                     }
-                    Some(Action::ZoomIn) => {
-                        if zoom_idx + 1 < ZOOM_LEVELS.len() { zoom_idx += 1; }
+                    Some(Action::Deck2OffsetDecrease) => {
+                        if let Some(ref mut d) = decks[1] {
+                            d.tempo.offset_ms -= 10;
+                            let period = (60_000.0 / d.tempo.base_bpm as f64 / 10.0).round() as i64 * 10;
+                            d.tempo.offset_ms = d.tempo.offset_ms.rem_euclid(period);
+                        }
                     }
-                    Some(Action::HeightDecrease) => {
-                        if detail_height > 1 { detail_height -= 1; }
+                    Some(Action::ZoomOut) => { if zoom_idx > 0 { zoom_idx -= 1; } }
+                    Some(Action::ZoomIn)  => { if zoom_idx + 1 < ZOOM_LEVELS.len() { zoom_idx += 1; } }
+                    Some(Action::HeightDecrease) => { if detail_height > 1 { detail_height -= 1; } }
+                    Some(Action::HeightIncrease) => { detail_height += 1; }
+                    Some(Action::Deck1BpmIncrease) => {
+                        if let Some(ref mut d) = decks[0] {
+                            d.tempo.bpm = (d.tempo.bpm + 0.01).min(240.0);
+                            d.tempo.bpm_established = true;
+                            d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm);
+                            shared_renderer.store_speed_ratio(0, d.tempo.bpm, d.tempo.base_bpm);
+                        }
                     }
-                    Some(Action::HeightIncrease) => {
-                        detail_height += 1;
+                    Some(Action::Deck1BpmDecrease) => {
+                        if let Some(ref mut d) = decks[0] {
+                            d.tempo.bpm = (d.tempo.bpm - 0.01).max(40.0);
+                            d.tempo.bpm_established = true;
+                            d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm);
+                            shared_renderer.store_speed_ratio(0, d.tempo.bpm, d.tempo.base_bpm);
+                        }
                     }
-                    Some(Action::BpmIncrease) => {
-                        deck.tempo.bpm = (deck.tempo.bpm + 0.01).min(240.0);
-                        deck.tempo.bpm_established = true;
-                        deck.audio.player.set_speed(deck.tempo.bpm / deck.tempo.base_bpm);
-                        shared_renderer.store_speed_ratio(active_deck, deck.tempo.bpm, deck.tempo.base_bpm);
+                    Some(Action::Deck2BpmIncrease) => {
+                        if let Some(ref mut d) = decks[1] {
+                            d.tempo.bpm = (d.tempo.bpm + 0.01).min(240.0);
+                            d.tempo.bpm_established = true;
+                            d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm);
+                            shared_renderer.store_speed_ratio(1, d.tempo.bpm, d.tempo.base_bpm);
+                        }
                     }
-                    Some(Action::BpmDecrease) => {
-                        deck.tempo.bpm = (deck.tempo.bpm - 0.01).max(40.0);
-                        deck.tempo.bpm_established = true;
-                        deck.audio.player.set_speed(deck.tempo.bpm / deck.tempo.base_bpm);
-                        shared_renderer.store_speed_ratio(active_deck, deck.tempo.bpm, deck.tempo.base_bpm);
+                    Some(Action::Deck2BpmDecrease) => {
+                        if let Some(ref mut d) = decks[1] {
+                            d.tempo.bpm = (d.tempo.bpm - 0.01).max(40.0);
+                            d.tempo.bpm_established = true;
+                            d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm);
+                            shared_renderer.store_speed_ratio(1, d.tempo.bpm, d.tempo.base_bpm);
+                        }
                     }
-                    Some(Action::BaseBpmIncrease) => {
-                        deck.tempo.base_bpm = (deck.tempo.base_bpm + 0.01).min(240.0);
-                        deck.tempo.bpm = deck.tempo.base_bpm;
-                        deck.tempo.bpm_established = true;
-                        deck.audio.player.set_speed(1.0);
-                        shared_renderer.store_speed_ratio(active_deck, deck.tempo.bpm, deck.tempo.base_bpm);
-                        if let Some(ref hash) = deck.tempo.analysis_hash {
-                            if let Some(entry) = cache.get(hash.as_str()).cloned() {
-                                cache.set(hash.clone(), CacheEntry { bpm: deck.tempo.base_bpm, offset_ms: deck.tempo.offset_ms, ..entry });
-                                cache.save();
+                    Some(Action::Deck1BaseBpmIncrease) => {
+                        if let Some(ref mut d) = decks[0] {
+                            d.tempo.base_bpm = (d.tempo.base_bpm + 0.01).min(240.0);
+                            d.tempo.bpm = d.tempo.base_bpm;
+                            d.tempo.bpm_established = true;
+                            d.audio.player.set_speed(1.0);
+                            shared_renderer.store_speed_ratio(0, d.tempo.bpm, d.tempo.base_bpm);
+                            if let Some(ref hash) = d.tempo.analysis_hash {
+                                if let Some(entry) = cache.get(hash.as_str()).cloned() {
+                                    cache.set(hash.clone(), CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, ..entry });
+                                    cache.save();
+                                }
                             }
                         }
                     }
-                    Some(Action::BaseBpmDecrease) => {
-                        deck.tempo.base_bpm = (deck.tempo.base_bpm - 0.01).max(40.0);
-                        deck.tempo.bpm = deck.tempo.base_bpm;
-                        deck.tempo.bpm_established = true;
-                        deck.audio.player.set_speed(1.0);
-                        shared_renderer.store_speed_ratio(active_deck, deck.tempo.bpm, deck.tempo.base_bpm);
-                        if let Some(ref hash) = deck.tempo.analysis_hash {
-                            if let Some(entry) = cache.get(hash.as_str()).cloned() {
-                                cache.set(hash.clone(), CacheEntry { bpm: deck.tempo.base_bpm, offset_ms: deck.tempo.offset_ms, ..entry });
-                                cache.save();
+                    Some(Action::Deck1BaseBpmDecrease) => {
+                        if let Some(ref mut d) = decks[0] {
+                            d.tempo.base_bpm = (d.tempo.base_bpm - 0.01).max(40.0);
+                            d.tempo.bpm = d.tempo.base_bpm;
+                            d.tempo.bpm_established = true;
+                            d.audio.player.set_speed(1.0);
+                            shared_renderer.store_speed_ratio(0, d.tempo.bpm, d.tempo.base_bpm);
+                            if let Some(ref hash) = d.tempo.analysis_hash {
+                                if let Some(entry) = cache.get(hash.as_str()).cloned() {
+                                    cache.set(hash.clone(), CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, ..entry });
+                                    cache.save();
+                                }
                             }
                         }
                     }
-                    Some(Action::JumpForward1)  => do_jump(&deck.audio.seek_handle, &deck.audio.player, deck.tempo.base_bpm, deck.total_duration,  1),
-                    Some(Action::JumpBackward1) => do_jump(&deck.audio.seek_handle, &deck.audio.player, deck.tempo.base_bpm, deck.total_duration, -1),
-                    Some(Action::JumpForward4)  => do_jump(&deck.audio.seek_handle, &deck.audio.player, deck.tempo.base_bpm, deck.total_duration,  4),
-                    Some(Action::JumpBackward4) => do_jump(&deck.audio.seek_handle, &deck.audio.player, deck.tempo.base_bpm, deck.total_duration, -4),
-                    Some(Action::JumpForward16) => do_jump(&deck.audio.seek_handle, &deck.audio.player, deck.tempo.base_bpm, deck.total_duration,  16),
-                    Some(Action::JumpBackward16)=> do_jump(&deck.audio.seek_handle, &deck.audio.player, deck.tempo.base_bpm, deck.total_duration, -16),
-                    Some(Action::JumpForward64) => do_jump(&deck.audio.seek_handle, &deck.audio.player, deck.tempo.base_bpm, deck.total_duration,  64),
-                    Some(Action::JumpBackward64)=> do_jump(&deck.audio.seek_handle, &deck.audio.player, deck.tempo.base_bpm, deck.total_duration, -64),
-                    Some(Action::TempoReset) => {
-                        deck.tempo.bpm = deck.tempo.base_bpm;
-                        deck.audio.player.set_speed(1.0);
-                        shared_renderer.store_speed_ratio(active_deck, deck.tempo.bpm, deck.tempo.base_bpm);
-                    }
-                    Some(Action::BpmTap) => {
-                        let now = Instant::now();
-                        if let Some(last) = deck.tap.last_tap_wall {
-                            if now.duration_since(last).as_secs_f64() > 2.0 {
-                                deck.tap.tap_times.clear();
-                            }
-                        }
-                        deck.tap.tap_times.push(display_samp / deck.audio.sample_rate as f64);
-                        deck.tap.last_tap_wall = Some(now);
-                        if deck.tap.tap_times.len() >= 8 {
-                            let (tapped_bpm, tapped_offset_raw) = compute_tap_bpm_offset(&deck.tap.tap_times);
-                            let tapped_offset = (tapped_offset_raw as f64 / 10.0).round() as i64 * 10;
-                            // Preserve any f/v speed ratio across the base_bpm correction.
-                            // Without this, bpm stays at the old detected value (e.g. 117)
-                            // while base_bpm changes (e.g. to 120), making playback 97.5% speed
-                            // and causing ticks to drift ahead of the audio.
-                            let speed_ratio = deck.tempo.bpm / deck.tempo.base_bpm;
-                            deck.tempo.base_bpm = tapped_bpm;
-                            deck.tempo.bpm = (deck.tempo.base_bpm * speed_ratio).clamp(40.0, 240.0);
-                            deck.tempo.offset_ms = tapped_offset;
-                            deck.audio.player.set_speed(deck.tempo.bpm / deck.tempo.base_bpm);
-                            shared_renderer.store_speed_ratio(active_deck, deck.tempo.bpm, deck.tempo.base_bpm);
-                            // Analysis is launched when the session ends (2s after last tap).
-                        }
-                    }
-                    Some(Action::DeckSelectA) => {
-                        deck_visible[0] = true;
-                        decks[active_deck] = Some(deck);
-                        active_deck = 0;
-                        continue 'tui;
-                    }
-                    Some(Action::DeckSelectB) => {
-                        deck_visible[1] = true;
-                        decks[active_deck] = Some(deck);
-                        active_deck = 1;
-                        continue 'tui;
-                    }
-                    Some(Action::DeckAHide) => {
-                        let other = 1;
-                        if deck_visible[other] && deck.audio.player.is_paused() {
-                            if active_deck == 0 {
-                                decks[0] = Some(deck);
-                                active_deck = 1;
-                                deck_visible[0] = false;
-                                continue 'tui;
-                            } else {
-                                deck_visible[0] = false;
+                    Some(Action::Deck2BaseBpmIncrease) => {
+                        if let Some(ref mut d) = decks[1] {
+                            d.tempo.base_bpm = (d.tempo.base_bpm + 0.01).min(240.0);
+                            d.tempo.bpm = d.tempo.base_bpm;
+                            d.tempo.bpm_established = true;
+                            d.audio.player.set_speed(1.0);
+                            shared_renderer.store_speed_ratio(1, d.tempo.bpm, d.tempo.base_bpm);
+                            if let Some(ref hash) = d.tempo.analysis_hash {
+                                if let Some(entry) = cache.get(hash.as_str()).cloned() {
+                                    cache.set(hash.clone(), CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, ..entry });
+                                    cache.save();
+                                }
                             }
                         }
                     }
-                    Some(Action::DeckBHide) => {
-                        let other = 0;
-                        if deck_visible[other] && deck.audio.player.is_paused() {
-                            if active_deck == 1 {
-                                decks[1] = Some(deck);
-                                active_deck = 0;
-                                deck_visible[1] = false;
-                                continue 'tui;
-                            } else {
-                                deck_visible[1] = false;
+                    Some(Action::Deck2BaseBpmDecrease) => {
+                        if let Some(ref mut d) = decks[1] {
+                            d.tempo.base_bpm = (d.tempo.base_bpm - 0.01).max(40.0);
+                            d.tempo.bpm = d.tempo.base_bpm;
+                            d.tempo.bpm_established = true;
+                            d.audio.player.set_speed(1.0);
+                            shared_renderer.store_speed_ratio(1, d.tempo.bpm, d.tempo.base_bpm);
+                            if let Some(ref hash) = d.tempo.analysis_hash {
+                                if let Some(entry) = cache.get(hash.as_str()).cloned() {
+                                    cache.set(hash.clone(), CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, ..entry });
+                                    cache.save();
+                                }
                             }
                         }
                     }
-                    Some(Action::NudgeBackward) | Some(Action::NudgeForward) | Some(Action::NudgeModeToggle) => {}
+                    Some(Action::Deck1JumpForward4b)   => { if let Some(ref d) = decks[0] { do_jump(&d.audio.seek_handle, &d.audio.player, d.tempo.base_bpm, d.total_duration,  16); } }
+                    Some(Action::Deck1JumpBackward4b)  => { if let Some(ref d) = decks[0] { do_jump(&d.audio.seek_handle, &d.audio.player, d.tempo.base_bpm, d.total_duration, -16); } }
+                    Some(Action::Deck1JumpForward8b)   => { if let Some(ref d) = decks[0] { do_jump(&d.audio.seek_handle, &d.audio.player, d.tempo.base_bpm, d.total_duration,  32); } }
+                    Some(Action::Deck1JumpBackward8b)  => { if let Some(ref d) = decks[0] { do_jump(&d.audio.seek_handle, &d.audio.player, d.tempo.base_bpm, d.total_duration, -32); } }
+                    Some(Action::Deck1JumpForward1bt)  => { if let Some(ref d) = decks[0] { do_jump(&d.audio.seek_handle, &d.audio.player, d.tempo.base_bpm, d.total_duration,  1); } }
+                    Some(Action::Deck1JumpBackward1bt) => { if let Some(ref d) = decks[0] { do_jump(&d.audio.seek_handle, &d.audio.player, d.tempo.base_bpm, d.total_duration, -1); } }
+                    Some(Action::Deck1JumpForward4bt)  => { if let Some(ref d) = decks[0] { do_jump(&d.audio.seek_handle, &d.audio.player, d.tempo.base_bpm, d.total_duration,  4); } }
+                    Some(Action::Deck1JumpBackward4bt) => { if let Some(ref d) = decks[0] { do_jump(&d.audio.seek_handle, &d.audio.player, d.tempo.base_bpm, d.total_duration, -4); } }
+                    Some(Action::Deck2JumpForward4b)   => { if let Some(ref d) = decks[1] { do_jump(&d.audio.seek_handle, &d.audio.player, d.tempo.base_bpm, d.total_duration,  16); } }
+                    Some(Action::Deck2JumpBackward4b)  => { if let Some(ref d) = decks[1] { do_jump(&d.audio.seek_handle, &d.audio.player, d.tempo.base_bpm, d.total_duration, -16); } }
+                    Some(Action::Deck2JumpForward8b)   => { if let Some(ref d) = decks[1] { do_jump(&d.audio.seek_handle, &d.audio.player, d.tempo.base_bpm, d.total_duration,  32); } }
+                    Some(Action::Deck2JumpBackward8b)  => { if let Some(ref d) = decks[1] { do_jump(&d.audio.seek_handle, &d.audio.player, d.tempo.base_bpm, d.total_duration, -32); } }
+                    Some(Action::Deck2JumpForward1bt)  => { if let Some(ref d) = decks[1] { do_jump(&d.audio.seek_handle, &d.audio.player, d.tempo.base_bpm, d.total_duration,  1); } }
+                    Some(Action::Deck2JumpBackward1bt) => { if let Some(ref d) = decks[1] { do_jump(&d.audio.seek_handle, &d.audio.player, d.tempo.base_bpm, d.total_duration, -1); } }
+                    Some(Action::Deck2JumpForward4bt)  => { if let Some(ref d) = decks[1] { do_jump(&d.audio.seek_handle, &d.audio.player, d.tempo.base_bpm, d.total_duration,  4); } }
+                    Some(Action::Deck2JumpBackward4bt) => { if let Some(ref d) = decks[1] { do_jump(&d.audio.seek_handle, &d.audio.player, d.tempo.base_bpm, d.total_duration, -4); } }
+                    Some(Action::Deck1TempoReset) => {
+                        if let Some(ref mut d) = decks[0] {
+                            d.tempo.bpm = d.tempo.base_bpm;
+                            d.audio.player.set_speed(1.0);
+                            shared_renderer.store_speed_ratio(0, d.tempo.bpm, d.tempo.base_bpm);
+                        }
+                    }
+                    Some(Action::Deck2TempoReset) => {
+                        if let Some(ref mut d) = decks[1] {
+                            d.tempo.bpm = d.tempo.base_bpm;
+                            d.audio.player.set_speed(1.0);
+                            shared_renderer.store_speed_ratio(1, d.tempo.bpm, d.tempo.base_bpm);
+                        }
+                    }
+                    Some(Action::Deck1BpmTap) => {
+                        if let Some(ref mut d) = decks[0] {
+                            let now = Instant::now();
+                            if let Some(last) = d.tap.last_tap_wall {
+                                if now.duration_since(last).as_secs_f64() > 2.0 { d.tap.tap_times.clear(); }
+                            }
+                            let display_samp = render[0].as_ref().map_or(d.display.smooth_display_samp, |rs| rs.display_samp);
+                            d.tap.tap_times.push(display_samp / d.audio.sample_rate as f64);
+                            d.tap.last_tap_wall = Some(now);
+                            if d.tap.tap_times.len() >= 8 {
+                                let (tapped_bpm, tapped_offset_raw) = compute_tap_bpm_offset(&d.tap.tap_times);
+                                let tapped_offset = (tapped_offset_raw as f64 / 10.0).round() as i64 * 10;
+                                let speed_ratio = d.tempo.bpm / d.tempo.base_bpm;
+                                d.tempo.base_bpm = tapped_bpm;
+                                d.tempo.bpm = (d.tempo.base_bpm * speed_ratio).clamp(40.0, 240.0);
+                                d.tempo.offset_ms = tapped_offset;
+                                d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm);
+                                shared_renderer.store_speed_ratio(0, d.tempo.bpm, d.tempo.base_bpm);
+                            }
+                        }
+                    }
+                    Some(Action::Deck2BpmTap) => {
+                        if let Some(ref mut d) = decks[1] {
+                            let now = Instant::now();
+                            if let Some(last) = d.tap.last_tap_wall {
+                                if now.duration_since(last).as_secs_f64() > 2.0 { d.tap.tap_times.clear(); }
+                            }
+                            let display_samp = render[1].as_ref().map_or(d.display.smooth_display_samp, |rs| rs.display_samp);
+                            d.tap.tap_times.push(display_samp / d.audio.sample_rate as f64);
+                            d.tap.last_tap_wall = Some(now);
+                            if d.tap.tap_times.len() >= 8 {
+                                let (tapped_bpm, tapped_offset_raw) = compute_tap_bpm_offset(&d.tap.tap_times);
+                                let tapped_offset = (tapped_offset_raw as f64 / 10.0).round() as i64 * 10;
+                                let speed_ratio = d.tempo.bpm / d.tempo.base_bpm;
+                                d.tempo.base_bpm = tapped_bpm;
+                                d.tempo.bpm = (d.tempo.base_bpm * speed_ratio).clamp(40.0, 240.0);
+                                d.tempo.offset_ms = tapped_offset;
+                                d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm);
+                                shared_renderer.store_speed_ratio(1, d.tempo.bpm, d.tempo.base_bpm);
+                            }
+                        }
+                    }
+                    Some(Action::Deck1NudgeBackward) | Some(Action::Deck1NudgeForward)
+                    | Some(Action::Deck2NudgeBackward) | Some(Action::Deck2NudgeForward)
+                    | Some(Action::NudgeModeToggle) => {}
                     None => {}
                     }
                 } // end if Press
@@ -1752,14 +1209,171 @@ Esc            quit";
             }
         }
 
-        let at_end = deck.audio.seek_handle.position.load(Ordering::Relaxed) >= deck.audio.seek_handle.samples.len();
-        if at_end && !deck.audio.player.is_paused() {
-            deck.audio.player.pause();
-            deck.audio.seek_handle.seek_direct(0.0);
-            deck.display.smooth_display_samp = 0.0;
-        }
         thread::sleep(frame_dur.saturating_sub(frame_start.elapsed()));
-        decks[active_deck] = Some(deck);
+    }
+}
+
+fn service_deck_frame(
+    slot: usize,
+    decks: &mut [Option<Deck>; 2],
+    col_secs: f64,
+    frame_dur: Duration,
+    elapsed: f64,
+    mixer: &rodio::mixer::Mixer,
+    shared_renderer: &SharedDetailRenderer,
+    cache: &mut Cache,
+    audio_latency_ms: i64,
+) {
+    let Some(ref mut d) = decks[slot] else { return; };
+
+    // Auto-reject pending BPM confirmation after 15 seconds.
+    if let Some((_, _, _, received_at)) = &d.tempo.pending_bpm {
+        if received_at.elapsed().as_secs() >= 15 {
+            d.tempo.pending_bpm = None;
+        }
+    }
+
+    // Poll BPM detection results.
+    if let Ok((hash, new_bpm, new_offset, is_fresh)) = d.tempo.bpm_rx.try_recv() {
+        if !is_fresh || !d.tempo.bpm_established {
+            d.tempo.bpm      = new_bpm;
+            d.tempo.base_bpm = new_bpm;
+            shared_renderer.store_speed_ratio(slot, d.tempo.bpm, d.tempo.base_bpm);
+            d.tempo.offset_ms = (new_offset as f64 / 10.0).round() as i64 * 10;
+            cache.set(hash.clone(), CacheEntry { bpm: d.tempo.bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone() });
+            cache.save();
+            d.tempo.analysis_hash      = Some(hash);
+            d.tempo.redetecting        = false;
+            d.tempo.redetect_saved_hash = None;
+            d.tempo.background_rx      = None;
+            if !is_fresh { d.tempo.bpm_established = true; }
+        } else {
+            d.tempo.analysis_hash      = Some(hash.clone());
+            d.tempo.redetecting        = false;
+            d.tempo.redetect_saved_hash = None;
+            d.tempo.background_rx      = None;
+            d.tempo.pending_bpm        = Some((hash, new_bpm, new_offset, Instant::now()));
+        }
+    }
+
+    // Real audio position.
+    let pos_raw  = d.audio.seek_handle.position.load(Ordering::Relaxed);
+    let pos_samp = pos_raw / d.audio.seek_handle.channels as usize;
+    let total_mono_samps = d.audio.seek_handle.samples.len() / d.audio.seek_handle.channels as usize;
+
+    // End-of-track: pause and reset to start.
+    let at_end = pos_samp >= total_mono_samps;
+    if at_end && !d.audio.player.is_paused() {
+        d.audio.player.pause();
+        d.audio.seek_handle.seek_direct(0.0);
+        d.display.smooth_display_samp = 0.0;
+        return;
+    }
+
+    // Advance smooth display position.
+    if !d.audio.player.is_paused() {
+        // Include warp-nudge speed factor so the display tracks the audio speed exactly.
+        let speed = (d.tempo.bpm / d.tempo.base_bpm) as f64 * (1.0 + d.nudge as f64 * 0.1);
+        // Use nominal frame duration rather than measured elapsed to avoid systematic drift:
+        // thread::sleep overshoots, so elapsed is consistently larger than frame_dur.
+        d.display.smooth_display_samp += frame_dur.as_secs_f64() * d.audio.sample_rate as f64 * speed;
+    } else if d.nudge != 0 {
+        // Paused with warp nudge: drift display and sync actual audio position for scrubbing.
+        d.display.smooth_display_samp = (d.display.smooth_display_samp
+            + elapsed * d.audio.sample_rate as f64 * d.nudge as f64 * 0.1)
+            .clamp(0.0, total_mono_samps as f64);
+        d.audio.seek_handle.set_position(d.display.smooth_display_samp / d.audio.sample_rate as f64);
+        // Fire a scrub snippet once per half-column advance.
+        let scrub_spc = if slot == 0 {
+            shared_renderer.shared_a.lock().unwrap().samples_per_col
+        } else {
+            shared_renderer.shared_b.lock().unwrap().samples_per_col
+        };
+        let half_samples_per_col = (scrub_spc / 2).max(1);
+        if scrub_spc > 0
+            && (d.display.smooth_display_samp - d.display.last_scrub_samp).abs() >= half_samples_per_col as f64
+        {
+            scrub_audio(mixer, &d.audio.seek_handle.samples, d.audio.seek_handle.channels as u16,
+                        d.audio.sample_rate, d.display.smooth_display_samp as usize, half_samples_per_col);
+            d.display.last_scrub_samp = d.display.smooth_display_samp;
+        }
+    }
+
+    // Drift correction.
+    let drift = d.display.smooth_display_samp - pos_samp as f64;
+    let large_drift = drift.abs() > d.audio.sample_rate as f64 * 0.5;
+    let paused_snap  = d.audio.player.is_paused() && d.nudge == 0 && drift.abs() > 1.0;
+    if large_drift || paused_snap {
+        // Snap to nearest half-column so sub_col is stable after seeks.
+        let speed = (d.tempo.bpm / d.tempo.base_bpm) as f64;
+        let col_samp_f64 = col_secs * d.audio.sample_rate as f64 * speed;
+        let half_col = col_samp_f64 / 2.0;
+        d.display.smooth_display_samp = if half_col > 0.0 {
+            (pos_samp as f64 / half_col).round() * half_col
+        } else {
+            pos_samp as f64
+        };
+    } else if !d.audio.player.is_paused() {
+        d.display.smooth_display_samp -= drift * 0.05;
+    }
+
+    // Metronome: fire from buffer write position so the click arrives at the speaker on the beat.
+    let beat_period = Duration::from_secs_f64(60.0 / d.tempo.base_bpm as f64);
+    let metro_beat_index = {
+        let ns = (d.display.smooth_display_samp / d.audio.sample_rate as f64 * 1_000_000_000.0) as i128
+            - d.tempo.offset_ms as i128 * 1_000_000;
+        ns.div_euclid(beat_period.as_nanos() as i128)
+    };
+    if d.metronome_mode && !d.audio.player.is_paused() {
+        if d.last_metro_beat != Some(metro_beat_index) {
+            play_click_tone(mixer, d.audio.sample_rate);
+            d.last_metro_beat = Some(metro_beat_index);
+        }
+    } else {
+        d.last_metro_beat = None;
+    }
+
+    // Tap session timeout: finalise BPM when the user stops tapping.
+    let tap_active_now = !d.tap.tap_times.is_empty()
+        && d.tap.last_tap_wall.map_or(false, |t| t.elapsed().as_secs_f64() < 2.0);
+    if d.tap.was_tap_active && !tap_active_now && d.tap.tap_times.len() >= 8 {
+        let (tapped_bpm, tapped_offset_raw) = compute_tap_bpm_offset(&d.tap.tap_times);
+        let tapped_offset  = (tapped_offset_raw as f64 / 10.0).round() as i64 * 10;
+        let speed_ratio    = d.tempo.bpm / d.tempo.base_bpm;
+        d.tempo.base_bpm   = tapped_bpm;
+        d.tempo.bpm        = (d.tempo.base_bpm * speed_ratio).clamp(40.0, 240.0);
+        d.tempo.offset_ms  = tapped_offset;
+        d.tempo.bpm_established = true;
+        d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm);
+        shared_renderer.store_speed_ratio(slot, d.tempo.bpm, d.tempo.base_bpm);
+        if let Some(ref hash) = d.tempo.analysis_hash {
+            cache.set(hash.clone(), CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone() });
+            cache.save();
+        }
+    }
+    d.tap.was_tap_active = tap_active_now;
+
+    // Spectrum analyser: chars every half beat, background glow every 8 beats.
+    let analysing   = d.tempo.analysis_hash.is_none();
+    let half_period = if analysing { Duration::from_millis(500) } else { beat_period / 2 };
+    let bar_period  = beat_period * 8;
+    let chars_due   = d.spectrum.last_update.map_or(true,    |t| t.elapsed() >= half_period);
+    let bg_due      = d.spectrum.last_bg_update.map_or(true, |t| t.elapsed() >= bar_period);
+    if chars_due || bg_due {
+        let display_pos_samp = (d.display.smooth_display_samp
+            - audio_latency_ms as f64 * d.audio.sample_rate as f64 / 1000.0)
+            .max(0.0) as usize;
+        let (new_chars, new_bg) = compute_spectrum(&d.audio.mono, display_pos_samp, d.audio.sample_rate, d.filter_offset);
+        if chars_due {
+            d.spectrum.chars = new_chars;
+            for i in 0..16 { d.spectrum.bg_accum[i] |= new_bg[i]; }
+            d.spectrum.bg = d.spectrum.bg_accum;
+            d.spectrum.last_update = Some(Instant::now());
+        }
+        if bg_due {
+            d.spectrum.bg_accum = [false; 16];
+            d.spectrum.last_bg_update = Some(Instant::now());
+        }
     }
 }
 
@@ -1800,7 +1414,6 @@ fn notification_line_for_deck(deck: &Deck) -> Line<'static> {
 
 fn info_line_for_deck(
     deck: &Deck,
-    audio_latency_ms: i64,
     frame_count: usize,
     beat_on: bool,
     analysing: bool,
@@ -1830,7 +1443,7 @@ fn info_line_for_deck(
         return Line::from(vec![
             Span::styled(format!("{play_icon}  "), dim),
             Span::styled(
-                format!("[analysing {}]", SPINNER[frame_count % SPINNER.len()]),
+                format!("[analysing {}]", SPINNER[(frame_count / 6) % SPINNER.len()]),
                 dim,
             ),
         ]);
@@ -1845,11 +1458,19 @@ fn info_line_for_deck(
     // --- Left group ---
     let left_spans: Vec<Span<'static>> = {
         let mut spans = vec![Span::styled(format!("{play_icon}  "), dim)];
+        let unconfirmed = !deck.tempo.bpm_established;
+        let red_style = Style::default().fg(Color::Red);
         if adjusted {
             spans.push(Span::styled(format!("{:.2} ", deck.tempo.base_bpm), dim));
             spans.push(Span::styled("(", dim));
-            spans.push(Span::styled(format!("{:.2}", deck.tempo.bpm), beat_style));
+            if unconfirmed {
+                spans.push(Span::styled(format!("~{:.2}", deck.tempo.bpm), red_style));
+            } else {
+                spans.push(Span::styled(format!("{:.2}", deck.tempo.bpm), beat_style));
+            }
             spans.push(Span::styled(")", dim));
+        } else if unconfirmed {
+            spans.push(Span::styled(format!("~{:.2}", deck.tempo.base_bpm), red_style));
         } else {
             spans.push(Span::styled(format!("{:.2}", deck.tempo.base_bpm), beat_style));
         }
@@ -1869,9 +1490,6 @@ fn info_line_for_deck(
         right_spans.push(Span::styled(nudge_str.to_string(), dim));
     }
     right_spans.push(Span::styled(format!("  nudge:{}", mode_str), dim));
-    if audio_latency_ms > 0 {
-        right_spans.push(Span::styled(format!("  lat:{}ms", audio_latency_ms), dim));
-    }
     const LEVEL_BARS: [char; 8] = ['▁','▂','▃','▄','▅','▆','▇','█'];
     let level_char = LEVEL_BARS[((deck.volume * 7.0).round() as usize).min(7)];
     let bracket_style = Style::default().fg(Color::Rgb(140, 140, 140));
@@ -2203,129 +1821,7 @@ fn render_detail_waveform(
     };
 
     let tick_display: Vec<u8> = {
-        let analysing = deck.tempo.analysis_hash.is_none();
-        if !analysing && buf.samples_per_col > 0 {
-            let mut row = vec![0u8; detail_width];
-            let samples_per_col = buf.samples_per_col as f64;
-            let half_samples_per_col = half_col_samp_global;
-            let beat_period_samp = 60.0 / deck.tempo.base_bpm as f64 * deck.audio.sample_rate as f64;
-            let offset_samp = deck.tempo.offset_ms as f64 / 1000.0 * deck.audio.sample_rate as f64;
-            let visual_centre = buf.anchor_sample as f64 + delta_half_global as f64 * half_samples_per_col;
-            let view_start = visual_centre - centre_col as f64 * samples_per_col;
-            let view_end = view_start + detail_width as f64 * samples_per_col;
-            let n_start = ((view_start - offset_samp) / beat_period_samp).floor() as i64 - 1;
-            let mut t_samp = offset_samp + n_start as f64 * beat_period_samp;
-            while t_samp <= view_end {
-                let disp_half = ((t_samp - view_start) / half_samples_per_col).round() as i64;
-                if disp_half >= 0 {
-                    let col = (disp_half / 2) as usize;
-                    if col < detail_width {
-                        row[col] = if disp_half % 2 != 0 { 0xB8 } else { 0x47 };
-                    }
-                }
-                t_samp += beat_period_samp;
-            }
-            row
-        } else {
-            vec![]
-        }
-    };
-
-    let detail_lines: Vec<Line<'static>> = (0..detail_panel_rows)
-        .map(|r| {
-            let is_tick_row = r == 0 || r + 1 == detail_panel_rows;
-            let shifted: Option<Vec<u8>>;
-            let row_slice: Option<&[u8]>;
-            if is_tick_row {
-                shifted = None;
-                row_slice = if tick_display.len() == detail_width { Some(&tick_display) } else { None };
-            } else {
-                let buf_r = r - 1;
-                shifted = if sub_col {
-                    viewport_start.and_then(|start| {
-                        buf.grid.get(buf_r).map(|row| {
-                            (0..detail_width).map(|c| shift_braille_half(row[start + c], row[start + c + 1])).collect()
-                        })
-                    })
-                } else { None };
-                row_slice = if sub_col {
-                    shifted.as_deref()
-                } else {
-                    viewport_start.and_then(|start| buf.grid.get(buf_r).map(|row| &row[start..start + detail_width]))
-                };
-            }
-            let _ = &shifted;
-            let row = match row_slice {
-                None => return Line::from(Span::raw("\u{2800}".repeat(detail_width))),
-                Some(s) => s,
-            };
-            let mut spans: Vec<Span<'static>> = Vec::new();
-            let mut run = String::new();
-            let mut run_color = Color::Reset;
-            for (c, &byte) in row.iter().enumerate() {
-                let (color, ch) = if c == centre_col {
-                    (Color::White, '\u{28FF}')
-                } else if is_tick_row {
-                    (Color::Gray, char::from_u32(0x2800 | byte as u32).unwrap_or(' '))
-                } else {
-                    (Color::Cyan, char::from_u32(0x2800 | byte as u32).unwrap_or(' '))
-                };
-                if color != run_color {
-                    if !run.is_empty() {
-                        spans.push(Span::styled(std::mem::take(&mut run), Style::default().fg(run_color)));
-                    }
-                    run_color = color;
-                }
-                run.push(ch);
-            }
-            if !run.is_empty() {
-                spans.push(Span::styled(run, Style::default().fg(run_color)));
-            }
-            Line::from(spans)
-        })
-        .collect();
-
-    frame.render_widget(Paragraph::new(detail_lines), detail_area);
-}
-
-fn render_detail_waveform_inactive(
-    frame: &mut ratatui::Frame,
-    buf: &Arc<BrailleBuffer>,
-    deck: &Deck,
-    detail_area: ratatui::layout::Rect,
-    display_cfg: &DisplayConfig,
-    display_pos_samp: usize,
-) {
-    let detail_width      = detail_area.width  as usize;
-    let detail_panel_rows = detail_area.height as usize;
-    let buf = Arc::clone(buf);
-    let centre_col = ((detail_width as f64 * display_cfg.playhead_position as f64 / 100.0) as usize)
-        .clamp(0, detail_width.saturating_sub(1));
-
-    let mut sub_col = false;
-    let mut delta_half_global: i64 = 0;
-    let mut half_col_samp_global: f64 = 1.0;
-    let viewport_start: Option<usize> = if buf.buf_cols >= detail_width && buf.samples_per_col > 0 {
-        let delta = display_pos_samp as i64 - buf.anchor_sample as i64;
-        let half_col_samp = buf.samples_per_col as f64 / 2.0;
-        let delta_half = (delta as f64 / half_col_samp).round() as i64;
-        sub_col = delta_half % 2 != 0;
-        delta_half_global = delta_half;
-        half_col_samp_global = half_col_samp;
-        let delta_cols = delta_half.div_euclid(2);
-        let viewport_offset = buf.buf_cols as i64 / 2 + delta_cols - centre_col as i64;
-        let need = if sub_col { detail_width + 1 } else { detail_width };
-        if viewport_offset >= 0 && (viewport_offset as usize) + need <= buf.buf_cols {
-            Some(viewport_offset as usize)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    let tick_display: Vec<u8> = {
-        let analysing = deck.tempo.analysis_hash.is_none();
+        let analysing = deck.tempo.analysis_hash.is_none() || !deck.tempo.bpm_established;
         if !analysing && buf.samples_per_col > 0 {
             let mut row = vec![0u8; detail_width];
             let samples_per_col = buf.samples_per_col as f64;
@@ -2520,6 +2016,10 @@ struct SharedDetailRenderer {
     display_pos_b:  Arc<AtomicUsize>,
     channels_a:     Arc<AtomicUsize>,
     channels_b:     Arc<AtomicUsize>,
+    /// Incremented each time a new track is loaded into the slot; signals the
+    /// background thread to recompute immediately rather than waiting for drift.
+    load_gen_a:     Arc<AtomicUsize>,
+    load_gen_b:     Arc<AtomicUsize>,
     shared_a:       Arc<Mutex<Arc<BrailleBuffer>>>,
     shared_b:       Arc<Mutex<Arc<BrailleBuffer>>>,
     _stop_guard:    StopOnDrop,
@@ -2541,6 +2041,8 @@ impl SharedDetailRenderer {
         let display_pos_b  = Arc::new(AtomicUsize::new(0));
         let channels_a     = Arc::new(AtomicUsize::new(1));
         let channels_b     = Arc::new(AtomicUsize::new(1));
+        let load_gen_a     = Arc::new(AtomicUsize::new(0));
+        let load_gen_b     = Arc::new(AtomicUsize::new(0));
         let shared_a: Arc<Mutex<Arc<BrailleBuffer>>> =
             Arc::new(Mutex::new(Arc::new(BrailleBuffer::empty())));
         let shared_b: Arc<Mutex<Arc<BrailleBuffer>>> =
@@ -2563,6 +2065,8 @@ impl SharedDetailRenderer {
             let pos_b_bg     = Arc::clone(&display_pos_b);
             let ch_a_bg      = Arc::clone(&channels_a);
             let ch_b_bg      = Arc::clone(&channels_b);
+            let gen_a_bg     = Arc::clone(&load_gen_a);
+            let gen_b_bg     = Arc::clone(&load_gen_b);
             let shared_a_bg  = Arc::clone(&shared_a);
             let shared_b_bg  = Arc::clone(&shared_b);
             let stop_bg      = Arc::clone(&stop);
@@ -2576,6 +2080,8 @@ impl SharedDetailRenderer {
                 let mut last_col_samp_b = 0usize;
                 let mut last_anchor_a  = 0usize;
                 let mut last_anchor_b  = 0usize;
+                let mut last_gen_a     = usize::MAX;
+                let mut last_gen_b     = usize::MAX;
 
                 loop {
                     if stop_bg.load(Ordering::Relaxed) { break; }
@@ -2610,6 +2116,8 @@ impl SharedDetailRenderer {
                     } else { usize::MAX };
 
                     let style = style_bg.load(Ordering::Relaxed);
+                    let gen_a = gen_a_bg.load(Ordering::Relaxed);
+                    let gen_b = gen_b_bg.load(Ordering::Relaxed);
                     let must_recompute = cols != last_cols
                         || rows != last_rows
                         || zoom != last_zoom
@@ -2617,7 +2125,9 @@ impl SharedDetailRenderer {
                         || col_samp_a != last_col_samp_a
                         || col_samp_b != last_col_samp_b
                         || drift_a >= cols * 3 / 4
-                        || drift_b >= cols * 3 / 4;
+                        || drift_b >= cols * 3 / 4
+                        || gen_a != last_gen_a
+                        || gen_b != last_gen_b;
 
                     if must_recompute {
                         let buf_cols = cols * 5;
@@ -2658,6 +2168,8 @@ impl SharedDetailRenderer {
                         last_col_samp_b = col_samp_b;
                         last_anchor_a   = anchor_a;
                         last_anchor_b   = anchor_b;
+                        last_gen_a      = gen_a;
+                        last_gen_b      = gen_b;
                     }
 
                     thread::sleep(Duration::from_millis(8));
@@ -2672,6 +2184,7 @@ impl SharedDetailRenderer {
             waveform_a, waveform_b,
             display_pos_a, display_pos_b,
             channels_a, channels_b,
+            load_gen_a, load_gen_b,
             shared_a, shared_b,
             _stop_guard: stop_guard,
         }
@@ -2684,12 +2197,14 @@ impl SharedDetailRenderer {
                 self.channels_a.store(channels as usize, Ordering::Relaxed);
                 self.sample_rate_a.store(sample_rate as usize, Ordering::Relaxed);
                 self.speed_ratio_a.store(65536, Ordering::Relaxed); // reset to 1.0 on load
+                self.load_gen_a.fetch_add(1, Ordering::Relaxed);
             }
             _ => {
                 *self.waveform_b.lock().unwrap() = Some(wf);
                 self.channels_b.store(channels as usize, Ordering::Relaxed);
                 self.sample_rate_b.store(sample_rate as usize, Ordering::Relaxed);
                 self.speed_ratio_b.store(65536, Ordering::Relaxed);
+                self.load_gen_b.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -2702,12 +2217,6 @@ impl SharedDetailRenderer {
         }
     }
 
-    fn clear_deck(&self, slot: usize) {
-        match slot {
-            0 => { *self.waveform_a.lock().unwrap() = None; }
-            _ => { *self.waveform_b.lock().unwrap() = None; }
-        }
-    }
 }
 
 fn peaks_for_slot(
@@ -2832,81 +2341,112 @@ struct Notification {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Action {
-    PlayPause, Quit,
-    JumpForward1, JumpForward4, JumpForward16, JumpForward64,
-    JumpBackward1, JumpBackward4, JumpBackward16, JumpBackward64,
-    NudgeBackward, NudgeForward, NudgeModeToggle,
-    OffsetIncrease, OffsetDecrease,
-    ZoomIn, ZoomOut,
-    HeightIncrease, HeightDecrease,
-    DeckALevelMax, DeckALevelMin,
-    DeckALevelUp, DeckALevelDown,
-    DeckBLevelUp, DeckBLevelDown,
-    BpmIncrease, BpmDecrease, BaseBpmIncrease, BaseBpmDecrease,
-    BpmTap,
-    PaletteCycle, OpenBrowser, Help, WaveformStyle, TempoReset,
-    DeckAFilterIncrease, DeckAFilterDecrease,
-    DeckBFilterIncrease, DeckBFilterDecrease,
-    FilterReset,
-    TerminalRefresh,
-    MetronomeToggle,
-    RedetectBpm,
-    LatencyDecrease,
-    LatencyIncrease,
-    DeckSelectA, DeckSelectB,
-    DeckAHide, DeckBHide,
+    Quit, Help, TerminalRefresh,
+    ZoomIn, ZoomOut, HeightIncrease, HeightDecrease,
+    LatencyIncrease, LatencyDecrease,
+    WaveformStyle, PaletteCycle,
+    NudgeModeToggle,
+    // Deck 1
+    Deck1PlayPause, Deck1OpenBrowser,
+    Deck1LevelUp, Deck1LevelDown, Deck1LevelMax, Deck1LevelMin,
+    Deck1FilterIncrease, Deck1FilterDecrease, Deck1FilterReset,
+    Deck1BpmTap, Deck1MetronomeToggle, Deck1RedetectBpm,
+    Deck1BpmIncrease, Deck1BpmDecrease,
+    Deck1BaseBpmIncrease, Deck1BaseBpmDecrease, Deck1TempoReset,
+    Deck1NudgeForward, Deck1NudgeBackward,
+    Deck1OffsetIncrease, Deck1OffsetDecrease,
+    Deck1JumpForward4b, Deck1JumpBackward4b,
+    Deck1JumpForward8b, Deck1JumpBackward8b,
+    Deck1JumpForward1bt, Deck1JumpBackward1bt,
+    Deck1JumpForward4bt, Deck1JumpBackward4bt,
+    // Deck 2
+    Deck2PlayPause, Deck2OpenBrowser,
+    Deck2LevelUp, Deck2LevelDown, Deck2LevelMax, Deck2LevelMin,
+    Deck2FilterIncrease, Deck2FilterDecrease, Deck2FilterReset,
+    Deck2BpmTap, Deck2MetronomeToggle, Deck2RedetectBpm,
+    Deck2BpmIncrease, Deck2BpmDecrease,
+    Deck2BaseBpmIncrease, Deck2BaseBpmDecrease, Deck2TempoReset,
+    Deck2NudgeForward, Deck2NudgeBackward,
+    Deck2OffsetIncrease, Deck2OffsetDecrease,
+    Deck2JumpForward4b, Deck2JumpBackward4b,
+    Deck2JumpForward8b, Deck2JumpBackward8b,
+    Deck2JumpForward1bt, Deck2JumpBackward1bt,
+    Deck2JumpForward4bt, Deck2JumpBackward4bt,
 }
 
 static ACTION_NAMES: &[(&str, Action)] = &[
-    ("play_pause",       Action::PlayPause),
-    ("quit",             Action::Quit),
-    ("jump_forward_1",   Action::JumpForward1),
-    ("jump_forward_4",   Action::JumpForward4),
-    ("jump_forward_16",  Action::JumpForward16),
-    ("jump_forward_64",  Action::JumpForward64),
-    ("jump_backward_1",  Action::JumpBackward1),
-    ("jump_backward_4",  Action::JumpBackward4),
-    ("jump_backward_16", Action::JumpBackward16),
-    ("jump_backward_64", Action::JumpBackward64),
-    ("nudge_backward",   Action::NudgeBackward),
-    ("nudge_forward",    Action::NudgeForward),
-    ("nudge_mode_toggle",Action::NudgeModeToggle),
-    ("offset_increase",  Action::OffsetIncrease),
-    ("offset_decrease",  Action::OffsetDecrease),
-    ("zoom_in",          Action::ZoomIn),
-    ("zoom_out",         Action::ZoomOut),
-    ("height_increase",  Action::HeightIncrease),
-    ("height_decrease",  Action::HeightDecrease),
-    ("deck_a_level_up",  Action::DeckALevelUp),
-    ("deck_a_level_down",Action::DeckALevelDown),
-    ("deck_a_level_max", Action::DeckALevelMax),
-    ("deck_a_level_min", Action::DeckALevelMin),
-    ("bpm_increase",      Action::BpmIncrease),
-    ("bpm_decrease",      Action::BpmDecrease),
-    ("base_bpm_increase", Action::BaseBpmIncrease),
-    ("base_bpm_decrease", Action::BaseBpmDecrease),
+    ("quit",              Action::Quit),
+    ("help",              Action::Help),
     ("terminal_refresh",  Action::TerminalRefresh),
-    ("metronome_toggle", Action::MetronomeToggle),
-    ("redetect_bpm",     Action::RedetectBpm),
-    ("latency_decrease", Action::LatencyDecrease),
-    ("latency_increase", Action::LatencyIncrease),
-    ("bpm_tap",          Action::BpmTap),
-    ("palette_cycle",    Action::PaletteCycle),
-    ("open_browser",     Action::OpenBrowser),
-    ("help",             Action::Help),
-    ("waveform_style",       Action::WaveformStyle),
-    ("tempo_reset",          Action::TempoReset),
-    ("deck_a_filter_increase", Action::DeckAFilterIncrease),
-    ("deck_a_filter_decrease", Action::DeckAFilterDecrease),
-    ("filter_reset",           Action::FilterReset),
-    ("deck_select_a", Action::DeckSelectA),
-    ("deck_select_b", Action::DeckSelectB),
-    ("deck_a_hide",   Action::DeckAHide),
-    ("deck_b_hide",   Action::DeckBHide),
-    ("deck_b_level_up",        Action::DeckBLevelUp),
-    ("deck_b_level_down",      Action::DeckBLevelDown),
-    ("deck_b_filter_increase", Action::DeckBFilterIncrease),
-    ("deck_b_filter_decrease", Action::DeckBFilterDecrease),
+    ("zoom_in",           Action::ZoomIn),
+    ("zoom_out",          Action::ZoomOut),
+    ("height_increase",   Action::HeightIncrease),
+    ("height_decrease",   Action::HeightDecrease),
+    ("latency_increase",  Action::LatencyIncrease),
+    ("latency_decrease",  Action::LatencyDecrease),
+    ("waveform_style",    Action::WaveformStyle),
+    ("palette_cycle",     Action::PaletteCycle),
+    ("nudge_mode_toggle", Action::NudgeModeToggle),
+    // Deck 1
+    ("deck1_play_pause",        Action::Deck1PlayPause),
+    ("deck1_open_browser",      Action::Deck1OpenBrowser),
+    ("deck1_level_up",          Action::Deck1LevelUp),
+    ("deck1_level_down",        Action::Deck1LevelDown),
+    ("deck1_level_max",         Action::Deck1LevelMax),
+    ("deck1_level_min",         Action::Deck1LevelMin),
+    ("deck1_filter_increase",   Action::Deck1FilterIncrease),
+    ("deck1_filter_decrease",   Action::Deck1FilterDecrease),
+    ("deck1_filter_reset",      Action::Deck1FilterReset),
+    ("deck1_bpm_tap",           Action::Deck1BpmTap),
+    ("deck1_metronome",         Action::Deck1MetronomeToggle),
+    ("deck1_redetect_bpm",      Action::Deck1RedetectBpm),
+    ("deck1_bpm_increase",      Action::Deck1BpmIncrease),
+    ("deck1_bpm_decrease",      Action::Deck1BpmDecrease),
+    ("deck1_base_bpm_increase", Action::Deck1BaseBpmIncrease),
+    ("deck1_base_bpm_decrease", Action::Deck1BaseBpmDecrease),
+    ("deck1_tempo_reset",       Action::Deck1TempoReset),
+    ("deck1_nudge_forward",     Action::Deck1NudgeForward),
+    ("deck1_nudge_backward",    Action::Deck1NudgeBackward),
+    ("deck1_offset_increase",   Action::Deck1OffsetIncrease),
+    ("deck1_offset_decrease",   Action::Deck1OffsetDecrease),
+    ("deck1_jump_forward_4b",   Action::Deck1JumpForward4b),
+    ("deck1_jump_backward_4b",  Action::Deck1JumpBackward4b),
+    ("deck1_jump_forward_8b",   Action::Deck1JumpForward8b),
+    ("deck1_jump_backward_8b",  Action::Deck1JumpBackward8b),
+    ("deck1_jump_forward_1bt",  Action::Deck1JumpForward1bt),
+    ("deck1_jump_backward_1bt", Action::Deck1JumpBackward1bt),
+    ("deck1_jump_forward_4bt",  Action::Deck1JumpForward4bt),
+    ("deck1_jump_backward_4bt", Action::Deck1JumpBackward4bt),
+    // Deck 2
+    ("deck2_play_pause",        Action::Deck2PlayPause),
+    ("deck2_open_browser",      Action::Deck2OpenBrowser),
+    ("deck2_level_up",          Action::Deck2LevelUp),
+    ("deck2_level_down",        Action::Deck2LevelDown),
+    ("deck2_level_max",         Action::Deck2LevelMax),
+    ("deck2_level_min",         Action::Deck2LevelMin),
+    ("deck2_filter_increase",   Action::Deck2FilterIncrease),
+    ("deck2_filter_decrease",   Action::Deck2FilterDecrease),
+    ("deck2_filter_reset",      Action::Deck2FilterReset),
+    ("deck2_bpm_tap",           Action::Deck2BpmTap),
+    ("deck2_metronome",         Action::Deck2MetronomeToggle),
+    ("deck2_redetect_bpm",      Action::Deck2RedetectBpm),
+    ("deck2_bpm_increase",      Action::Deck2BpmIncrease),
+    ("deck2_bpm_decrease",      Action::Deck2BpmDecrease),
+    ("deck2_base_bpm_increase", Action::Deck2BaseBpmIncrease),
+    ("deck2_base_bpm_decrease", Action::Deck2BaseBpmDecrease),
+    ("deck2_tempo_reset",       Action::Deck2TempoReset),
+    ("deck2_nudge_forward",     Action::Deck2NudgeForward),
+    ("deck2_nudge_backward",    Action::Deck2NudgeBackward),
+    ("deck2_offset_increase",   Action::Deck2OffsetIncrease),
+    ("deck2_offset_decrease",   Action::Deck2OffsetDecrease),
+    ("deck2_jump_forward_4b",   Action::Deck2JumpForward4b),
+    ("deck2_jump_backward_4b",  Action::Deck2JumpBackward4b),
+    ("deck2_jump_forward_8b",   Action::Deck2JumpForward8b),
+    ("deck2_jump_backward_8b",  Action::Deck2JumpBackward8b),
+    ("deck2_jump_forward_1bt",  Action::Deck2JumpForward1bt),
+    ("deck2_jump_backward_1bt", Action::Deck2JumpBackward1bt),
+    ("deck2_jump_forward_4bt",  Action::Deck2JumpForward4bt),
+    ("deck2_jump_backward_4bt", Action::Deck2JumpBackward4bt),
 ];
 
 #[derive(Hash, Eq, PartialEq)]
