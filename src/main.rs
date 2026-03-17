@@ -392,22 +392,77 @@ fn tui_loop(
             let inner = outer.inner(area);
             frame.render_widget(outer, area);
 
-            let det_h = detail_height as u16;
+            // Compression order as the terminal shrinks:
+            //   1. Detail waveforms compress evenly: detail_height → DET_MIN
+            //   2. Overview waveforms compress evenly: OV_MAX → OV_MIN
+            //   3. No further compression — elements fall off the bottom
+            //
+            // Row heights are pre-computed and sum exactly to inner.height so the
+            // cassowary solver never receives an infeasible system and proportionally
+            // shrinks things it shouldn't.
+            const DET_MIN: u16 = 4;
+            const OV_MAX:  u16 = 4;
+            const OV_MIN:  u16 = 2;
+            let det_max = detail_height as u16;
+            let ih = inner.height;
+
+            // Compute a unified pool for each waveform type so both decks always
+            // get the same height (no sequential-allocation asymmetry).
+            // Phase 1: detail compresses; overviews stay at OV_MAX.
+            // Phase 2: overviews compress; detail stays at DET_MIN.
+            // Phase 3: items fall off bottom (heights stay at minimums).
+            let fixed = 6_u16; // global + detail-info + notif×2 + info×2
+            let total_variable = ih.saturating_sub(fixed);
+            let det_full = det_max * 2;
+            let ov_full  = OV_MAX * 2;
+
+            let (both_det, both_ov) = if total_variable >= det_full + ov_full {
+                (det_full, ov_full)
+            } else if total_variable >= DET_MIN * 2 + ov_full {
+                (total_variable - ov_full, ov_full)
+            } else if total_variable >= DET_MIN * 2 + OV_MIN * 2 {
+                (DET_MIN * 2, total_variable - DET_MIN * 2)
+            } else {
+                let d = total_variable.min(DET_MIN * 2);
+                (d, total_variable.saturating_sub(d))
+            };
+
+            // Clamp to minimums: the pool calculation drives compression through
+            // the normal phase range; below minimum, take_h handles falloff.
+            let effective_det_h = (both_det / 2).max(DET_MIN).min(det_max);
+            let effective_ov_h  = (both_ov  / 2).clamp(OV_MIN, OV_MAX);
+
+            // Allocate rows top-to-bottom using take_exact for all waveform rows:
+            // each waveform shows at its computed height or disappears entirely.
+            // This prevents partial heights below the minimum (e.g. a 3-row
+            // detail area where the tick rows leave only 1 waveform row).
+            let mut rem = ih;
+            // take: allocate up to n rows (partial ok — used for 1-row fixed items).
+            // take_consume: show at full height or not at all, but always consume
+            //   up to n rows so freed space cannot cause lower items to reappear.
+            let take         = |rem: &mut u16, n: u16| -> u16 { let h = (*rem).min(n); *rem -= h; h };
+            let take_consume = |rem: &mut u16, n: u16| -> u16 {
+                let actual = if *rem >= n { n } else { 0 };
+                *rem = rem.saturating_sub(n);
+                actual
+            };
+            let hh = [
+                take(&mut rem, 1),                      // 0: global bar
+                take(&mut rem, 1),                      // 1: detail info bar
+                take_consume(&mut rem, effective_det_h), // 2: detail A
+                take_consume(&mut rem, effective_det_h), // 3: detail B
+                take(&mut rem, 1),                      // 4: notif A
+                take(&mut rem, 1),                      // 5: info A
+                take_consume(&mut rem, effective_ov_h),  // 6: overview A
+                take(&mut rem, 1),                      // 7: notif B
+                take(&mut rem, 1),                      // 8: info B
+                take_consume(&mut rem, effective_ov_h),  // 9: overview B
+                rem,                                    // 10: spacer (leftover)
+            ];
+
             let c = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(1),    // 0: global bar
-                    Constraint::Length(1),    // 1: detail info bar
-                    Constraint::Length(det_h),// 2: detail A
-                    Constraint::Length(det_h),// 3: detail B
-                    Constraint::Length(1),    // 4: notif A
-                    Constraint::Length(1),    // 5: info A
-                    Constraint::Length(4),    // 6: overview A
-                    Constraint::Length(1),    // 7: notif B
-                    Constraint::Length(1),    // 8: info B
-                    Constraint::Length(4),    // 9: overview B
-                    Constraint::Min(0),       // 10: spacer
-                ])
+                .constraints(hh.map(Constraint::Length))
                 .split(inner);
             let (area_detail_info, area_detail_a, area_detail_b,
                  area_notif_a, area_info_a, area_overview_a,
