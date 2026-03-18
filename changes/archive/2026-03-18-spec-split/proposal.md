@@ -1,5 +1,5 @@
 # Proposal: Split SPEC.md into SPEC/ folder
-**Status: Draft**
+**Status: Implemented**
 
 ## Problem
 

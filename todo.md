@@ -1,1 +1,0 @@
-- When no BPM is known for the track, tapping does set it, but it stays red and no ticks appear until the end of the tapping session. When we start a tapping session on a track with a pre-existing BPM, after we exceed 8 taps we start getting realtime changes to the ticks.
