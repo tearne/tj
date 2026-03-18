@@ -402,7 +402,7 @@ fn tui_loop(
             // cassowary solver never receives an infeasible system and proportionally
             // shrinks things it shouldn't.
             const DET_MIN: u16 = 4;
-            const OV_MAX:  u16 = 4;
+            const OV_MAX:  u16 = 3;
             const OV_MIN:  u16 = 2;
             let det_max = detail_height as u16;
             let ih = inner.height;
@@ -2008,11 +2008,11 @@ fn render_detail_empty(
     let h = area.height as usize;
     if w == 0 || h == 0 { return; }
 
-    let waveform_rows = h.saturating_sub(2);
     let centre_col = ((w as f64 * display_cfg.playhead_position as f64 / 100.0) as usize)
         .clamp(0, w.saturating_sub(1));
 
-    // Flat braille grid.
+    // One dedicated tick row at centre; waveform rows fill the rest.
+    let waveform_rows = h.saturating_sub(1);
     let peaks: Vec<(f32, f32)> = vec![(0.0f32, 0.0f32); w];
     let braille = if waveform_rows > 0 {
         render_braille(&peaks, waveform_rows, w, false)
@@ -2055,7 +2055,6 @@ fn render_detail_empty(
             let buf_r = r - 1;
             if buf_r < braille.len() { &braille[buf_r] } else { &tick_row }
         };
-
         let mut spans: Vec<Span<'static>> = Vec::new();
         let mut run = String::new();
         let mut run_color = Color::Reset;
@@ -2206,8 +2205,6 @@ fn render_detail_waveform(
             let mut run_color = Color::Reset;
             for (c, &byte) in row.iter().enumerate() {
                 let (color, ch) = if c == centre_col && cue_screen_col == Some(c) {
-                    // Overlap: cue wins at the top and bottom rows so the cue line
-                    // remains visible; playhead fills the interior rows.
                     if r == 0 || r + 1 == detail_panel_rows {
                         (Color::Green, '\u{28FF}')
                     } else {

@@ -83,4 +83,4 @@ deck2_cue_play          = "D"
 [display]
 playhead_position = 20        # 0–100, percentage from left edge of detail panel
 warning_threshold_secs = 30   # seconds before end to activate bar-marker flash warning
-detail_height = 6             # total rows per detail waveform (including 2-row tick area; min 3)
+detail_height = 6             # total rows per detail waveform (including 2-row tick area; min 4)
