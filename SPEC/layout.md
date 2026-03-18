@@ -34,10 +34,10 @@ A single row pinned to the bottom of the UI. Content priority:
   - **Left group**: play/pause icon (`▶`/`⏸`), BPM, `♪` in red when metronome is active, phase offset. Tap count (`tap:N`) appended transiently while a tap session is active.
   - **Right group**: nudge mode (`nudge:jump` / `nudge:warp`, fixed width), level (`level:▕N▏` — single eighth-block character in dark yellow, in a bracketed indicator with mid-grey brackets), `lat:Xms` (shown only when `audio_latency_ms > 0`), spectrum strip.
 - The nudge mode field is always present and fixed-width so toggling between `jump` and `warp` does not shift anything to its right.
-- When no tempo adjustment is active, the detected BPM is shown to two decimal places (e.g. `120.00`) and receives a soft amber beat-flash. When a `f`/`v` adjustment is active, the detected BPM is shown plain and the adjusted tempo is shown alongside in parentheses (e.g. `120.00 (124.40)`), with only the adjusted number receiving the beat-flash.
+- When no tempo adjustment is active, the detected BPM is shown to two decimal places (e.g. `120.00`) and receives a soft amber beat-flash. When a per-deck BPM adjustment is active, the detected BPM is shown plain and the adjusted tempo is shown alongside in parentheses (e.g. `120.00 (124.40)`), with only the adjusted number receiving the beat-flash.
 - Pressing `?` opens a modal key binding reference overlay; any key dismisses it.
 - During BPM analysis the BPM field shows an animated spinner. When a confirmation is pending, the prompt appears in the notification bar (see [transport.md](transport.md)); the right group is always rendered normally.
-- A BPM is considered "established" once it has been loaded from cache, set by tap, or adjusted with `f`/`v`/`F`/`V`. Only established BPM triggers confirmation on new detection.
+- A BPM is considered "established" once it has been loaded from cache, set by tap, or adjusted via the per-deck BPM keys. Only established BPM triggers confirmation on new detection.
 
 ## Empty Deck Panels
 

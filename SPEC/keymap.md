@@ -16,8 +16,6 @@
 | `C` / `D` | Toggle nudge mode: `jump` (10ms seek) / `warp` (±10% speed) |
 | `-` / `=` | Zoom in / out |
 | `{` / `}` | Detail height decrease / increase |
-| `v` / `f` | BPM +0.01 / −0.01 |
-| `V` / `F` | Base BPM +0.01 / −0.01 |
 | `b` | Tap BPM detection |
 | `'` | Toggle metronome |
 | `@` | Trigger manual BPM re-detection |
@@ -31,6 +29,10 @@
 | `Space+u` / `Space+7` | Deck A snap filter to flat |
 | `k` / `,` | Deck B level up / down |
 | `i` / `8` | Deck B filter sweep: `i` toward LPF, `8` toward HPF |
+| `x` / `s` | Deck A BPM +0.01 / −0.01 |
+| `X` / `S` | Deck A base BPM +0.01 / −0.01 |
+| `v` / `f` | Deck B BPM +0.01 / −0.01 |
+| `V` / `F` | Deck B base BPM +0.01 / −0.01 |
 
 **Global controls** (not deck-specific):
 | Key | Action |
