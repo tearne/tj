@@ -345,9 +345,10 @@ fn tui_loop(
         // Compute render state for both decks.
         let render: [Option<DeckRenderState>; 2] = std::array::from_fn(|slot| {
             let d = decks[slot].as_ref()?;
-            let display_samp = (d.display.smooth_display_samp
-                - audio_latency_ms as f64 * d.audio.sample_rate as f64 / 1000.0)
-                .max(0.0);
+            // Latency correction only applies during playback — when paused there is
+            // no buffer fill ahead, so the raw position is the heard position.
+            let latency_correction = if d.audio.player.is_paused() { 0.0 } else { audio_latency_ms as f64 * d.audio.sample_rate as f64 / 1000.0 };
+            let display_samp = (d.display.smooth_display_samp - latency_correction).max(0.0);
             let display_pos_samp = display_samp as usize;
             let pos_interleaved  = display_pos_samp * d.audio.seek_handle.channels as usize;
             if slot == 0 {
@@ -684,6 +685,54 @@ Esc                  close this / quit";
                             }
                         }
                     }
+                    // Cue handlers come before nudge so that Space+nudge-key resolves to
+                    // cue (via SpaceChord lookup) rather than nudge.
+                    // Press guard requires space_held to avoid firing on bare nudge-key presses.
+                    KeyEventKind::Press
+                        if space_held && keymap.get(&KeyBinding::SpaceChord(key.code)) == Some(&Action::Deck1Cue) =>
+                    {
+                        if let Some(ref mut d) = decks[0] {
+                            let raw_samp = d.display.smooth_display_samp as usize;
+                            if d.audio.player.is_paused() {
+                                // Paused: set cue at current position. With no buffer fill
+                                // ahead, the raw position is the heard position.
+                                d.cue_sample = Some(raw_samp);
+                            } else if let Some(target) = d.cue_sample {
+                                // Playing: jump to existing cue and pause.
+                                d.audio.player.pause();
+                                d.audio.seek_handle.seek_direct(target as f64 / d.audio.sample_rate as f64);
+                                d.display.smooth_display_samp = target as f64;
+                            }
+                            if let Some(ref hash) = d.tempo.analysis_hash.clone() {
+                                let entry = cache.get(hash.as_str()).cloned()
+                                    .unwrap_or(CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: None });
+                                cache.set(hash.clone(), CacheEntry { cue_sample: d.cue_sample, ..entry });
+                                cache.save();
+                            }
+                            space_held = false;
+                        }
+                    }
+                    KeyEventKind::Press
+                        if space_held && keymap.get(&KeyBinding::SpaceChord(key.code)) == Some(&Action::Deck2Cue) =>
+                    {
+                        if let Some(ref mut d) = decks[1] {
+                            let raw_samp = d.display.smooth_display_samp as usize;
+                            if d.audio.player.is_paused() {
+                                d.cue_sample = Some(raw_samp);
+                            } else if let Some(target) = d.cue_sample {
+                                d.audio.player.pause();
+                                d.audio.seek_handle.seek_direct(target as f64 / d.audio.sample_rate as f64);
+                                d.display.smooth_display_samp = target as f64;
+                            }
+                            if let Some(ref hash) = d.tempo.analysis_hash.clone() {
+                                let entry = cache.get(hash.as_str()).cloned()
+                                    .unwrap_or(CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: None });
+                                cache.set(hash.clone(), CacheEntry { cue_sample: d.cue_sample, ..entry });
+                                cache.save();
+                            }
+                            space_held = false;
+                        }
+                    }
                     // Deck 1 nudge
                     KeyEventKind::Press | KeyEventKind::Repeat
                         if keymap.get(&KeyBinding::Key(key.code)) == Some(&Action::Deck1NudgeBackward) =>
@@ -840,7 +889,7 @@ Esc                  close this / quit";
                                     d.tempo.bpm_established = true;
                                     d.audio.player.set_speed(1.0);
                                     shared_renderer.store_speed_ratio(slot, d.tempo.bpm, d.tempo.base_bpm);
-                                    cache.set(hash.clone(), CacheEntry { bpm: d.tempo.bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone() });
+                                    cache.set(hash.clone(), CacheEntry { bpm: d.tempo.bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: d.cue_sample });
                                     cache.save();
                                     d.tempo.analysis_hash = Some(hash);
                                 }
@@ -1059,6 +1108,26 @@ Esc                  close this / quit";
                     }
                     Some(Action::Deck1OffsetIncrease) => {
                         if let Some(ref mut d) = decks[0] {
+                            if d.cue_sample.is_some() {
+                                if d.cue_offset_pending.map_or(false, |t| t.elapsed().as_secs_f64() < 5.0) {
+                                    d.cue_sample = None;
+                                    d.cue_offset_pending = None;
+                                    if let Some(ref hash) = d.tempo.analysis_hash.clone() {
+                                        let entry = cache.get(hash.as_str()).cloned()
+                                            .unwrap_or(CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: None });
+                                        cache.set(hash.clone(), CacheEntry { cue_sample: None, ..entry });
+                                        cache.save();
+                                    }
+                                } else {
+                                    d.cue_offset_pending = Some(Instant::now());
+                                    d.active_notification = Some(Notification {
+                                        message: "Offset change will clear the cue — press again to confirm".to_string(),
+                                        style: NotificationStyle::Warning,
+                                        expires: Instant::now() + Duration::from_secs(5),
+                                    });
+                                    continue 'tui;
+                                }
+                            }
                             d.tempo.offset_ms += 10;
                             let period = (60_000.0 / d.tempo.base_bpm as f64 / 10.0).round() as i64 * 10;
                             d.tempo.offset_ms = d.tempo.offset_ms.rem_euclid(period);
@@ -1066,6 +1135,26 @@ Esc                  close this / quit";
                     }
                     Some(Action::Deck1OffsetDecrease) => {
                         if let Some(ref mut d) = decks[0] {
+                            if d.cue_sample.is_some() {
+                                if d.cue_offset_pending.map_or(false, |t| t.elapsed().as_secs_f64() < 5.0) {
+                                    d.cue_sample = None;
+                                    d.cue_offset_pending = None;
+                                    if let Some(ref hash) = d.tempo.analysis_hash.clone() {
+                                        let entry = cache.get(hash.as_str()).cloned()
+                                            .unwrap_or(CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: None });
+                                        cache.set(hash.clone(), CacheEntry { cue_sample: None, ..entry });
+                                        cache.save();
+                                    }
+                                } else {
+                                    d.cue_offset_pending = Some(Instant::now());
+                                    d.active_notification = Some(Notification {
+                                        message: "Offset change will clear the cue — press again to confirm".to_string(),
+                                        style: NotificationStyle::Warning,
+                                        expires: Instant::now() + Duration::from_secs(5),
+                                    });
+                                    continue 'tui;
+                                }
+                            }
                             d.tempo.offset_ms -= 10;
                             let period = (60_000.0 / d.tempo.base_bpm as f64 / 10.0).round() as i64 * 10;
                             d.tempo.offset_ms = d.tempo.offset_ms.rem_euclid(period);
@@ -1073,6 +1162,26 @@ Esc                  close this / quit";
                     }
                     Some(Action::Deck2OffsetIncrease) => {
                         if let Some(ref mut d) = decks[1] {
+                            if d.cue_sample.is_some() {
+                                if d.cue_offset_pending.map_or(false, |t| t.elapsed().as_secs_f64() < 5.0) {
+                                    d.cue_sample = None;
+                                    d.cue_offset_pending = None;
+                                    if let Some(ref hash) = d.tempo.analysis_hash.clone() {
+                                        let entry = cache.get(hash.as_str()).cloned()
+                                            .unwrap_or(CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: None });
+                                        cache.set(hash.clone(), CacheEntry { cue_sample: None, ..entry });
+                                        cache.save();
+                                    }
+                                } else {
+                                    d.cue_offset_pending = Some(Instant::now());
+                                    d.active_notification = Some(Notification {
+                                        message: "Offset change will clear the cue — press again to confirm".to_string(),
+                                        style: NotificationStyle::Warning,
+                                        expires: Instant::now() + Duration::from_secs(5),
+                                    });
+                                    continue 'tui;
+                                }
+                            }
                             d.tempo.offset_ms += 10;
                             let period = (60_000.0 / d.tempo.base_bpm as f64 / 10.0).round() as i64 * 10;
                             d.tempo.offset_ms = d.tempo.offset_ms.rem_euclid(period);
@@ -1080,6 +1189,26 @@ Esc                  close this / quit";
                     }
                     Some(Action::Deck2OffsetDecrease) => {
                         if let Some(ref mut d) = decks[1] {
+                            if d.cue_sample.is_some() {
+                                if d.cue_offset_pending.map_or(false, |t| t.elapsed().as_secs_f64() < 5.0) {
+                                    d.cue_sample = None;
+                                    d.cue_offset_pending = None;
+                                    if let Some(ref hash) = d.tempo.analysis_hash.clone() {
+                                        let entry = cache.get(hash.as_str()).cloned()
+                                            .unwrap_or(CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: None });
+                                        cache.set(hash.clone(), CacheEntry { cue_sample: None, ..entry });
+                                        cache.save();
+                                    }
+                                } else {
+                                    d.cue_offset_pending = Some(Instant::now());
+                                    d.active_notification = Some(Notification {
+                                        message: "Offset change will clear the cue — press again to confirm".to_string(),
+                                        style: NotificationStyle::Warning,
+                                        expires: Instant::now() + Duration::from_secs(5),
+                                    });
+                                    continue 'tui;
+                                }
+                            }
                             d.tempo.offset_ms -= 10;
                             let period = (60_000.0 / d.tempo.base_bpm as f64 / 10.0).round() as i64 * 10;
                             d.tempo.offset_ms = d.tempo.offset_ms.rem_euclid(period);
@@ -1095,6 +1224,7 @@ Esc                  close this / quit";
                             d.tempo.bpm_established = true;
                             d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm);
                             shared_renderer.store_speed_ratio(0, d.tempo.bpm, d.tempo.base_bpm);
+                            anchor_beat_grid_to_cue(d);
                         }
                     }
                     Some(Action::Deck1BpmDecrease) => {
@@ -1103,6 +1233,7 @@ Esc                  close this / quit";
                             d.tempo.bpm_established = true;
                             d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm);
                             shared_renderer.store_speed_ratio(0, d.tempo.bpm, d.tempo.base_bpm);
+                            anchor_beat_grid_to_cue(d);
                         }
                     }
                     Some(Action::Deck2BpmIncrease) => {
@@ -1111,6 +1242,7 @@ Esc                  close this / quit";
                             d.tempo.bpm_established = true;
                             d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm);
                             shared_renderer.store_speed_ratio(1, d.tempo.bpm, d.tempo.base_bpm);
+                            anchor_beat_grid_to_cue(d);
                         }
                     }
                     Some(Action::Deck2BpmDecrease) => {
@@ -1119,6 +1251,7 @@ Esc                  close this / quit";
                             d.tempo.bpm_established = true;
                             d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm);
                             shared_renderer.store_speed_ratio(1, d.tempo.bpm, d.tempo.base_bpm);
+                            anchor_beat_grid_to_cue(d);
                         }
                     }
                     Some(Action::Deck1BaseBpmIncrease) => {
@@ -1128,6 +1261,7 @@ Esc                  close this / quit";
                             d.tempo.bpm_established = true;
                             d.audio.player.set_speed(1.0);
                             shared_renderer.store_speed_ratio(0, d.tempo.bpm, d.tempo.base_bpm);
+                            anchor_beat_grid_to_cue(d);
                             if let Some(ref hash) = d.tempo.analysis_hash {
                                 if let Some(entry) = cache.get(hash.as_str()).cloned() {
                                     cache.set(hash.clone(), CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, ..entry });
@@ -1143,6 +1277,7 @@ Esc                  close this / quit";
                             d.tempo.bpm_established = true;
                             d.audio.player.set_speed(1.0);
                             shared_renderer.store_speed_ratio(0, d.tempo.bpm, d.tempo.base_bpm);
+                            anchor_beat_grid_to_cue(d);
                             if let Some(ref hash) = d.tempo.analysis_hash {
                                 if let Some(entry) = cache.get(hash.as_str()).cloned() {
                                     cache.set(hash.clone(), CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, ..entry });
@@ -1158,6 +1293,7 @@ Esc                  close this / quit";
                             d.tempo.bpm_established = true;
                             d.audio.player.set_speed(1.0);
                             shared_renderer.store_speed_ratio(1, d.tempo.bpm, d.tempo.base_bpm);
+                            anchor_beat_grid_to_cue(d);
                             if let Some(ref hash) = d.tempo.analysis_hash {
                                 if let Some(entry) = cache.get(hash.as_str()).cloned() {
                                     cache.set(hash.clone(), CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, ..entry });
@@ -1173,6 +1309,7 @@ Esc                  close this / quit";
                             d.tempo.bpm_established = true;
                             d.audio.player.set_speed(1.0);
                             shared_renderer.store_speed_ratio(1, d.tempo.bpm, d.tempo.base_bpm);
+                            anchor_beat_grid_to_cue(d);
                             if let Some(ref hash) = d.tempo.analysis_hash {
                                 if let Some(entry) = cache.get(hash.as_str()).cloned() {
                                     cache.set(hash.clone(), CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, ..entry });
@@ -1213,6 +1350,27 @@ Esc                  close this / quit";
                     }
                     Some(Action::Deck1BpmTap) => {
                         if let Some(ref mut d) = decks[0] {
+                            if d.cue_sample.is_some() {
+                                if d.cue_tap_pending.map_or(false, |t| t.elapsed().as_secs_f64() < 5.0) {
+                                    d.cue_sample = None;
+                                    d.cue_tap_pending = None;
+                                    if let Some(ref hash) = d.tempo.analysis_hash.clone() {
+                                        let entry = cache.get(hash.as_str()).cloned()
+                                            .unwrap_or(CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: None });
+                                        cache.set(hash.clone(), CacheEntry { cue_sample: None, ..entry });
+                                        cache.save();
+                                    }
+                                    // fall through to tap logic
+                                } else {
+                                    d.cue_tap_pending = Some(Instant::now());
+                                    d.active_notification = Some(Notification {
+                                        message: "BPM tap will clear the cue point — tap again to confirm".to_string(),
+                                        style: NotificationStyle::Warning,
+                                        expires: Instant::now() + Duration::from_secs(5),
+                                    });
+                                    continue 'tui;
+                                }
+                            }
                             let now = Instant::now();
                             if let Some(last) = d.tap.last_tap_wall {
                                 if now.duration_since(last).as_secs_f64() > 2.0 { d.tap.tap_times.clear(); }
@@ -1227,6 +1385,7 @@ Esc                  close this / quit";
                                 d.tempo.base_bpm = tapped_bpm;
                                 d.tempo.bpm = (d.tempo.base_bpm * speed_ratio).clamp(40.0, 240.0);
                                 d.tempo.offset_ms = tapped_offset;
+                                d.tempo.bpm_established = true;
                                 d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm);
                                 shared_renderer.store_speed_ratio(0, d.tempo.bpm, d.tempo.base_bpm);
                             }
@@ -1234,6 +1393,27 @@ Esc                  close this / quit";
                     }
                     Some(Action::Deck2BpmTap) => {
                         if let Some(ref mut d) = decks[1] {
+                            if d.cue_sample.is_some() {
+                                if d.cue_tap_pending.map_or(false, |t| t.elapsed().as_secs_f64() < 5.0) {
+                                    d.cue_sample = None;
+                                    d.cue_tap_pending = None;
+                                    if let Some(ref hash) = d.tempo.analysis_hash.clone() {
+                                        let entry = cache.get(hash.as_str()).cloned()
+                                            .unwrap_or(CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: None });
+                                        cache.set(hash.clone(), CacheEntry { cue_sample: None, ..entry });
+                                        cache.save();
+                                    }
+                                    // fall through to tap logic
+                                } else {
+                                    d.cue_tap_pending = Some(Instant::now());
+                                    d.active_notification = Some(Notification {
+                                        message: "BPM tap will clear the cue point — tap again to confirm".to_string(),
+                                        style: NotificationStyle::Warning,
+                                        expires: Instant::now() + Duration::from_secs(5),
+                                    });
+                                    continue 'tui;
+                                }
+                            }
                             let now = Instant::now();
                             if let Some(last) = d.tap.last_tap_wall {
                                 if now.duration_since(last).as_secs_f64() > 2.0 { d.tap.tap_times.clear(); }
@@ -1248,8 +1428,32 @@ Esc                  close this / quit";
                                 d.tempo.base_bpm = tapped_bpm;
                                 d.tempo.bpm = (d.tempo.base_bpm * speed_ratio).clamp(40.0, 240.0);
                                 d.tempo.offset_ms = tapped_offset;
+                                d.tempo.bpm_established = true;
                                 d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm);
                                 shared_renderer.store_speed_ratio(1, d.tempo.bpm, d.tempo.base_bpm);
+                            }
+                        }
+                    }
+                    Some(Action::Deck1Cue) | Some(Action::Deck2Cue) => {}
+                    Some(Action::Deck1CuePlay) => {
+                        if let Some(ref mut d) = decks[0] {
+                            if let Some(cue_samp) = d.cue_sample {
+                                // Seek to the exact cue position. Pre-load smooth_display_samp
+                                // to cue + latency so display = cue immediately once playing.
+                                let latency_samps = (audio_latency_ms as f64 * d.audio.sample_rate as f64 / 1000.0) as usize;
+                                d.audio.seek_handle.seek_direct(cue_samp as f64 / d.audio.sample_rate as f64);
+                                d.display.smooth_display_samp = (cue_samp + latency_samps) as f64;
+                                d.audio.player.play();
+                            }
+                        }
+                    }
+                    Some(Action::Deck2CuePlay) => {
+                        if let Some(ref mut d) = decks[1] {
+                            if let Some(cue_samp) = d.cue_sample {
+                                let latency_samps = (audio_latency_ms as f64 * d.audio.sample_rate as f64 / 1000.0) as usize;
+                                d.audio.seek_handle.seek_direct(cue_samp as f64 / d.audio.sample_rate as f64);
+                                d.display.smooth_display_samp = (cue_samp + latency_samps) as f64;
+                                d.audio.player.play();
                             }
                         }
                     }
@@ -1288,6 +1492,19 @@ fn service_deck_frame(
         }
     }
 
+    // Expire cue confirmation pending flags.
+    if d.cue_tap_pending.map_or(false, |t| t.elapsed().as_secs_f64() >= 5.0) {
+        d.cue_tap_pending = None;
+    }
+    if d.cue_offset_pending.map_or(false, |t| t.elapsed().as_secs_f64() >= 5.0) {
+        d.cue_offset_pending = None;
+    }
+
+    // Expire per-deck active notification.
+    if d.active_notification.as_ref().map_or(false, |n| Instant::now() >= n.expires) {
+        d.active_notification = None;
+    }
+
     // Poll BPM detection results.
     if let Ok((hash, new_bpm, new_offset, is_fresh)) = d.tempo.bpm_rx.try_recv() {
         if !is_fresh || !d.tempo.bpm_established {
@@ -1295,7 +1512,9 @@ fn service_deck_frame(
             d.tempo.base_bpm = new_bpm;
             shared_renderer.store_speed_ratio(slot, d.tempo.bpm, d.tempo.base_bpm);
             d.tempo.offset_ms = (new_offset as f64 / 10.0).round() as i64 * 10;
-            cache.set(hash.clone(), CacheEntry { bpm: d.tempo.bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone() });
+            // Restore cue_sample from cache if present.
+            d.cue_sample = cache.get(hash.as_str()).and_then(|e| e.cue_sample);
+            cache.set(hash.clone(), CacheEntry { bpm: d.tempo.bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: d.cue_sample });
             cache.save();
             d.tempo.analysis_hash      = Some(hash);
             d.tempo.redetecting        = false;
@@ -1402,7 +1621,7 @@ fn service_deck_frame(
         d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm);
         shared_renderer.store_speed_ratio(slot, d.tempo.bpm, d.tempo.base_bpm);
         if let Some(ref hash) = d.tempo.analysis_hash {
-            cache.set(hash.clone(), CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone() });
+            cache.set(hash.clone(), CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: d.cue_sample });
             cache.save();
         }
     }
@@ -1415,9 +1634,8 @@ fn service_deck_frame(
     let chars_due   = d.spectrum.last_update.map_or(true,    |t| t.elapsed() >= half_period);
     let bg_due      = d.spectrum.last_bg_update.map_or(true, |t| t.elapsed() >= bar_period);
     if chars_due || bg_due {
-        let display_pos_samp = (d.display.smooth_display_samp
-            - audio_latency_ms as f64 * d.audio.sample_rate as f64 / 1000.0)
-            .max(0.0) as usize;
+        let latency_correction = if d.audio.player.is_paused() { 0.0 } else { audio_latency_ms as f64 * d.audio.sample_rate as f64 / 1000.0 };
+        let display_pos_samp = (d.display.smooth_display_samp - latency_correction).max(0.0) as usize;
         let (new_chars, new_bg) = compute_spectrum(&d.audio.mono, display_pos_samp, d.audio.sample_rate, d.filter_offset);
         if chars_due {
             d.spectrum.chars = new_chars;
@@ -1429,6 +1647,21 @@ fn service_deck_frame(
             d.spectrum.bg_accum = [false; 16];
             d.spectrum.last_bg_update = Some(Instant::now());
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-deck helpers
+// ---------------------------------------------------------------------------
+
+/// After a BPM change, re-anchor `offset_ms` so the beat grid stays aligned to
+/// the cue position. With no cue set this is a no-op.
+fn anchor_beat_grid_to_cue(d: &mut Deck) {
+    if let Some(cue_samp) = d.cue_sample {
+        let cue_ms = cue_samp as f64 / d.audio.sample_rate as f64 * 1000.0;
+        let beat_period_ms = 60_000.0 / d.tempo.base_bpm as f64;
+        let raw = cue_ms.rem_euclid(beat_period_ms);
+        d.tempo.offset_ms = (raw / 10.0).round() as i64 * 10;
     }
 }
 
@@ -1614,6 +1847,12 @@ fn overview_for_deck(
     };
     let playhead_col = ((playhead_frac * overview_width as f64).round() as usize)
         .min(overview_width.saturating_sub(1));
+    let cue_col: Option<usize> = deck.cue_sample.map(|samp| {
+        let frac = (samp as f64 / deck.audio.sample_rate as f64
+            / deck.total_duration.as_secs_f64()).clamp(0.0, 1.0);
+        ((frac * overview_width as f64).round() as usize)
+            .min(overview_width.saturating_sub(1))
+    });
 
     let (ov_peaks_hires, ov_bass_hires): (Vec<(f32, f32)>, Vec<f32>) = (0..overview_width * 2)
         .map(|col| {
@@ -1651,8 +1890,16 @@ fn overview_for_deck(
                 let (color, ch) = if r == 0 && c >= legend_start && !legend.is_empty() {
                     let lch = legend.chars().nth(c - legend_start).unwrap_or(' ');
                     (Color::DarkGray, lch)
+                } else if c == playhead_col && cue_col == Some(c) {
+                    if r == 0 || r + 1 == overview_height {
+                        (Color::Green, '\u{28FF}')
+                    } else {
+                        (Color::White, '\u{28FF}')
+                    }
                 } else if c == playhead_col {
                     (Color::White, '\u{28FF}')
+                } else if cue_col == Some(c) {
+                    (Color::Green, '\u{28FF}')
                 } else if bar_cols.contains(&c) {
                     if warn_beat_on {
                         (Color::Rgb(120, 60, 60), '│')
@@ -1875,6 +2122,29 @@ fn render_detail_waveform(
         None
     };
 
+    // Compute view_start so both tick and cue column calculations share it.
+    let detail_view_start: f64 = if buf.samples_per_col > 0 {
+        let samples_per_col = buf.samples_per_col as f64;
+        let visual_centre = buf.anchor_sample as f64 + delta_half_global as f64 * half_col_samp_global;
+        visual_centre - centre_col as f64 * samples_per_col
+    } else {
+        0.0
+    };
+
+    let cue_screen_col: Option<usize> = if buf.samples_per_col > 0 {
+        deck.cue_sample.and_then(|samp| {
+            let disp_half = ((samp as f64 - detail_view_start) / half_col_samp_global).round() as i64;
+            if disp_half >= 0 {
+                let col = (disp_half / 2) as usize;
+                if col < detail_width { Some(col) } else { None }
+            } else {
+                None
+            }
+        })
+    } else {
+        None
+    };
+
     let tick_display: Vec<u8> = {
         let analysing = deck.tempo.analysis_hash.is_none() || !deck.tempo.bpm_established;
         if !analysing && buf.samples_per_col > 0 {
@@ -1883,8 +2153,7 @@ fn render_detail_waveform(
             let half_samples_per_col = half_col_samp_global;
             let beat_period_samp = 60.0 / deck.tempo.base_bpm as f64 * deck.audio.sample_rate as f64;
             let offset_samp = deck.tempo.offset_ms as f64 / 1000.0 * deck.audio.sample_rate as f64;
-            let visual_centre = buf.anchor_sample as f64 + delta_half_global as f64 * half_samples_per_col;
-            let view_start = visual_centre - centre_col as f64 * samples_per_col;
+            let view_start = detail_view_start;
             let view_end = view_start + detail_width as f64 * samples_per_col;
             let n_start = ((view_start - offset_samp) / beat_period_samp).floor() as i64 - 1;
             let mut t_samp = offset_samp + n_start as f64 * beat_period_samp;
@@ -1936,8 +2205,18 @@ fn render_detail_waveform(
             let mut run = String::new();
             let mut run_color = Color::Reset;
             for (c, &byte) in row.iter().enumerate() {
-                let (color, ch) = if c == centre_col {
+                let (color, ch) = if c == centre_col && cue_screen_col == Some(c) {
+                    // Overlap: cue wins at the top and bottom rows so the cue line
+                    // remains visible; playhead fills the interior rows.
+                    if r == 0 || r + 1 == detail_panel_rows {
+                        (Color::Green, '\u{28FF}')
+                    } else {
+                        (Color::White, '\u{28FF}')
+                    }
+                } else if c == centre_col {
                     (Color::White, '\u{28FF}')
+                } else if cue_screen_col == Some(c) {
+                    (Color::Green, '\u{28FF}')
                 } else if is_tick_row {
                     (Color::Gray, char::from_u32(0x2800 | byte as u32).unwrap_or(' '))
                 } else {
@@ -2313,6 +2592,9 @@ struct Deck {
     metronome_mode: bool,
     last_metro_beat: Option<i128>,
     active_notification: Option<Notification>,
+    cue_sample: Option<usize>,
+    cue_tap_pending: Option<Instant>,
+    cue_offset_pending: Option<Instant>,
 
     audio: DeckAudio,
     tempo: TempoState,
@@ -2340,6 +2622,9 @@ impl Deck {
             metronome_mode: false,
             last_metro_beat: None,
             active_notification: None,
+            cue_sample: None,
+            cue_tap_pending: None,
+            cue_offset_pending: None,
             audio,
             tempo: TempoState {
                 bpm: 120.0,
@@ -2414,6 +2699,7 @@ enum Action {
     Deck1JumpForward8b, Deck1JumpBackward8b,
     Deck1JumpForward1bt, Deck1JumpBackward1bt,
     Deck1JumpForward4bt, Deck1JumpBackward4bt,
+    Deck1Cue, Deck1CuePlay,
     // Deck 2
     Deck2PlayPause, Deck2OpenBrowser,
     Deck2LevelUp, Deck2LevelDown, Deck2LevelMax, Deck2LevelMin,
@@ -2427,6 +2713,7 @@ enum Action {
     Deck2JumpForward8b, Deck2JumpBackward8b,
     Deck2JumpForward1bt, Deck2JumpBackward1bt,
     Deck2JumpForward4bt, Deck2JumpBackward4bt,
+    Deck2Cue, Deck2CuePlay,
 }
 
 static ACTION_NAMES: &[(&str, Action)] = &[
@@ -2472,6 +2759,8 @@ static ACTION_NAMES: &[(&str, Action)] = &[
     ("deck1_jump_backward_1bt", Action::Deck1JumpBackward1bt),
     ("deck1_jump_forward_4bt",  Action::Deck1JumpForward4bt),
     ("deck1_jump_backward_4bt", Action::Deck1JumpBackward4bt),
+    ("deck1_cue",               Action::Deck1Cue),
+    ("deck1_cue_play",          Action::Deck1CuePlay),
     // Deck 2
     ("deck2_play_pause",        Action::Deck2PlayPause),
     ("deck2_open_browser",      Action::Deck2OpenBrowser),
@@ -2502,6 +2791,8 @@ static ACTION_NAMES: &[(&str, Action)] = &[
     ("deck2_jump_backward_1bt", Action::Deck2JumpBackward1bt),
     ("deck2_jump_forward_4bt",  Action::Deck2JumpForward4bt),
     ("deck2_jump_backward_4bt", Action::Deck2JumpBackward4bt),
+    ("deck2_cue",               Action::Deck2Cue),
+    ("deck2_cue_play",          Action::Deck2CuePlay),
 ];
 
 #[derive(Hash, Eq, PartialEq)]
@@ -3395,6 +3686,8 @@ struct CacheEntry {
     offset_ms: i64,
     /// Filename at time of first detection — informational only, not used as key.
     name: String,
+    #[serde(default)]
+    cue_sample: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, Default)]

@@ -1,15 +1,4 @@
-# Proposal: Tap BPM Realtime Ticks
-**Status: Draft**
-
-## Problem
-
-Tapping on a track with no established BPM gives no visual feedback during the session:
-
-- The BPM/ticks stay red (`unconfirmed` style) throughout.
-- Beat tick marks don't appear in the detail waveform.
-- Both resolve only at the **end** of the tapping session (after the 2-second timeout).
-
-On a track with a pre-existing BPM this doesn't happen — after 8 taps, the ticks update in realtime on every subsequent tap.
+# Design: Tap BPM Realtime Ticks
 
 ## Root Cause
 
@@ -41,11 +30,11 @@ The tick marks and BPM colour both gate on `bpm_established`:
 - `analysing = spinner_active || !d.tempo.bpm_established` — controls tick visibility in the detail waveform.
 - `unconfirmed = !d.tempo.bpm_established` — controls the red/normal BPM colour in the info bar.
 
-So until the session ends and `service_deck_frame` sets `bpm_established = true`, the realtime BPM updates are applied to `base_bpm`/`offset_ms` (and the audio is correct) but the render treats the deck as still-analysing.
+Until the session ends and `service_deck_frame` sets `bpm_established = true`, the realtime BPM updates are applied to `base_bpm`/`offset_ms` (audio is correct) but the render treats the deck as still-analysing.
 
-## Fix
+## Change
 
-Set `bpm_established = true` in the realtime tap path, alongside the existing updates:
+Add `d.tempo.bpm_established = true` in the realtime tap path:
 
 ```rust
 if d.tap.tap_times.len() >= 8 {
@@ -59,15 +48,4 @@ if d.tap.tap_times.len() >= 8 {
 }
 ```
 
-Same one-line addition in both the Deck 1 and Deck 2 tap handlers.
-
-## Effect
-
-- From the 8th tap onward, tick marks appear and update in realtime on every tap.
-- The BPM value renders in normal (confirmed) colour immediately.
-- Behaviour on tracks with a pre-existing BPM is unchanged (already worked).
-- The session-end path in `service_deck_frame` already sets `bpm_established = true` — now redundant for the `>= 8` case, but harmless to leave in place.
-
-## Risk
-
-Very low. One-line addition in two symmetric blocks. No data structure changes.
+Same addition in both the Deck 1 and Deck 2 tap handlers.

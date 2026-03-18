@@ -1,29 +1,28 @@
 # Proposal: Cue Points
-**Status: Approved**
+\*\*Status: Implemented — v0.5.89\*\*
 
 ## Keys
 
-- `Space+A` — Deck 1 cue
-- `Space+D` — Deck 2 cue
+| Key | Deck | Action |
+|-----|------|--------|
+| `Space+A` | 1 | Cue |
+| `Space+D` | 2 | Cue |
+| `A` | 1 | Jump to cue and play |
+| `D` | 2 | Jump to cue and play |
 
 ## Behaviour
 
-Modelled on CDJ cue behaviour, adapted for keyboard (press/release events available via `REPORT_EVENT_TYPES`).
-
-### While playing — tap cue
-Pause and snap to the cue point. The position where playback stops becomes the new cue point.
-
-### While paused — hold cue
-Play from the cue point for as long as the key is held. On release, pause and snap back to the cue point. This is the CDJ "preview" behaviour.
-
-### While paused — tap cue (no cue point set)
+### While paused
 Set the cue point at the current position.
 
-### Setting a new cue point manually
-`Shift+cue key` sets the cue point at the current position regardless of playback state, without affecting playback.
+### While playing — cue exists
+Jump to cue and pause.
 
-- Deck 1: `Shift+A`
-- Deck 2: `Shift+D`
+### While playing — no cue
+No-op.
+
+### Jump to cue and play (`A` / `D`)
+Seek to the cue point and resume playback regardless of current state. No-op if no cue is set.
 
 ## Interaction with BPM and Offset
 
@@ -50,14 +49,14 @@ The cue point (sample position) is saved to the JSON cache alongside BPM and off
 
 ## Implementation Notes
 
-- Hold-to-play uses `KeyEventKind::Press` to begin and `KeyEventKind::Release` to end — the same pattern as nudge. `REPORT_EVENT_TYPES` is already active.
-- A "cue active" flag is needed per deck to track whether the key is currently held, so the release event knows to return to cue rather than just stop.
-- Snapping to cue uses the existing seek mechanism.
+- `cue_sample` is stored as the raw `smooth_display_samp` (buffer fill position). Display position subtracts latency only while playing; when paused there is no buffer fill ahead so the raw position equals the heard position.
+- Seek targets use `cue_sample` directly — no latency offset in the seek call.
+- `CuePlay` pre-loads `smooth_display_samp` to `cue_sample + latency_samps` so the display is immediately correct once the buffer fills.
 - BPM anchoring: on each BPM change, recalculate `offset_ms` so that `cue_sample / sample_rate` lands on a beat boundary at the new BPM.
 
 ## Visual Markers
 
-Both the detail and overview waveforms show a vertical green line at the cue position, overlaid on the waveform similarly to existing tick marks. The marker is visible regardless of playback state or which deck is active.
+Both the detail and overview waveforms show a solid green braille block (`⣿`) at the cue position. When the cue column coincides with the playhead column, the top and bottom rows show the cue colour so the cue line remains visible at both edges.
 
 ## Out of Scope
 
