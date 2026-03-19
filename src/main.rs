@@ -1517,10 +1517,10 @@ fn service_deck_frame(
             cache.set(hash.clone(), CacheEntry { bpm: d.tempo.bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: d.cue_sample });
             cache.save();
             d.tempo.analysis_hash      = Some(hash);
+            if !is_fresh || d.tempo.redetecting { d.tempo.bpm_established = true; }
             d.tempo.redetecting        = false;
             d.tempo.redetect_saved_hash = None;
             d.tempo.background_rx      = None;
-            if !is_fresh { d.tempo.bpm_established = true; }
         } else {
             d.tempo.analysis_hash      = Some(hash.clone());
             d.tempo.redetecting        = false;
