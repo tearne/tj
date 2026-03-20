@@ -214,12 +214,14 @@ fn load_deck(
     };
 
     let filter_offset_shared = Arc::new(AtomicI32::new(0));
+    let filter_state_reset = Arc::new(AtomicBool::new(false));
     let player = Player::connect_new(mixer);
     player.append(FilterSource::new(
         TrackingSource::new(
             samples, position, fade_remaining, fade_len, pending_target, sample_rate, channels,
         ),
         Arc::clone(&filter_offset_shared),
+        Arc::clone(&filter_state_reset),
     ));
     player.pause();
 
@@ -256,6 +258,7 @@ fn load_deck(
             waveform,
             sample_rate,
             filter_offset_shared,
+            filter_state_reset,
         },
         bpm_rx,
     )))
@@ -976,12 +979,26 @@ Esc                  close this / quit";
                     }
                     Some(Action::Deck1PlayPause) => {
                         if let Some(ref d) = decks[0] {
-                            if d.audio.player.is_paused() { d.audio.player.play(); } else { d.audio.player.pause(); }
+                            if d.audio.player.is_paused() {
+                                if d.filter_offset != 0 {
+                                    d.audio.filter_state_reset.store(true, Ordering::Relaxed);
+                                }
+                                d.audio.player.play();
+                            } else {
+                                d.audio.player.pause();
+                            }
                         }
                     }
                     Some(Action::Deck2PlayPause) => {
                         if let Some(ref d) = decks[1] {
-                            if d.audio.player.is_paused() { d.audio.player.play(); } else { d.audio.player.pause(); }
+                            if d.audio.player.is_paused() {
+                                if d.filter_offset != 0 {
+                                    d.audio.filter_state_reset.store(true, Ordering::Relaxed);
+                                }
+                                d.audio.player.play();
+                            } else {
+                                d.audio.player.pause();
+                            }
                         }
                     }
                     Some(Action::Deck1LevelUp)   => { if let Some(ref mut d) = decks[0] { d.volume = (d.volume + 0.05).min(1.0); d.audio.player.set_volume(d.volume); } }
@@ -1131,6 +1148,11 @@ Esc                  close this / quit";
                             d.tempo.offset_ms += 10;
                             let period = (60_000.0 / d.tempo.base_bpm as f64 / 10.0).round() as i64 * 10;
                             d.tempo.offset_ms = d.tempo.offset_ms.rem_euclid(period);
+                            if d.audio.player.is_paused() {
+                                let delta = 10.0 / 1000.0 * d.audio.sample_rate as f64;
+                                d.display.smooth_display_samp = (d.display.smooth_display_samp + delta).max(0.0);
+                                d.audio.seek_handle.set_position(d.display.smooth_display_samp / d.audio.sample_rate as f64);
+                            }
                         }
                     }
                     Some(Action::Deck1OffsetDecrease) => {
@@ -1158,6 +1180,11 @@ Esc                  close this / quit";
                             d.tempo.offset_ms -= 10;
                             let period = (60_000.0 / d.tempo.base_bpm as f64 / 10.0).round() as i64 * 10;
                             d.tempo.offset_ms = d.tempo.offset_ms.rem_euclid(period);
+                            if d.audio.player.is_paused() {
+                                let delta = 10.0 / 1000.0 * d.audio.sample_rate as f64;
+                                d.display.smooth_display_samp = (d.display.smooth_display_samp - delta).max(0.0);
+                                d.audio.seek_handle.set_position(d.display.smooth_display_samp / d.audio.sample_rate as f64);
+                            }
                         }
                     }
                     Some(Action::Deck2OffsetIncrease) => {
@@ -1185,6 +1212,11 @@ Esc                  close this / quit";
                             d.tempo.offset_ms += 10;
                             let period = (60_000.0 / d.tempo.base_bpm as f64 / 10.0).round() as i64 * 10;
                             d.tempo.offset_ms = d.tempo.offset_ms.rem_euclid(period);
+                            if d.audio.player.is_paused() {
+                                let delta = 10.0 / 1000.0 * d.audio.sample_rate as f64;
+                                d.display.smooth_display_samp = (d.display.smooth_display_samp + delta).max(0.0);
+                                d.audio.seek_handle.set_position(d.display.smooth_display_samp / d.audio.sample_rate as f64);
+                            }
                         }
                     }
                     Some(Action::Deck2OffsetDecrease) => {
@@ -1212,6 +1244,11 @@ Esc                  close this / quit";
                             d.tempo.offset_ms -= 10;
                             let period = (60_000.0 / d.tempo.base_bpm as f64 / 10.0).round() as i64 * 10;
                             d.tempo.offset_ms = d.tempo.offset_ms.rem_euclid(period);
+                            if d.audio.player.is_paused() {
+                                let delta = 10.0 / 1000.0 * d.audio.sample_rate as f64;
+                                d.display.smooth_display_samp = (d.display.smooth_display_samp - delta).max(0.0);
+                                d.audio.seek_handle.set_position(d.display.smooth_display_samp / d.audio.sample_rate as f64);
+                            }
                         }
                     }
                     Some(Action::ZoomOut) => { if zoom_idx > 0 { zoom_idx -= 1; } }
@@ -1443,6 +1480,9 @@ Esc                  close this / quit";
                                 let latency_samps = (audio_latency_ms as f64 * d.audio.sample_rate as f64 / 1000.0) as usize;
                                 d.audio.seek_handle.seek_direct(cue_samp as f64 / d.audio.sample_rate as f64);
                                 d.display.smooth_display_samp = (cue_samp + latency_samps) as f64;
+                                if d.filter_offset != 0 {
+                                    d.audio.filter_state_reset.store(true, Ordering::Relaxed);
+                                }
                                 d.audio.player.play();
                             }
                         }
@@ -1453,6 +1493,9 @@ Esc                  close this / quit";
                                 let latency_samps = (audio_latency_ms as f64 * d.audio.sample_rate as f64 / 1000.0) as usize;
                                 d.audio.seek_handle.seek_direct(cue_samp as f64 / d.audio.sample_rate as f64);
                                 d.display.smooth_display_samp = (cue_samp + latency_samps) as f64;
+                                if d.filter_offset != 0 {
+                                    d.audio.filter_state_reset.store(true, Ordering::Relaxed);
+                                }
                                 d.audio.player.play();
                             }
                         }
@@ -2098,14 +2141,12 @@ fn render_detail_waveform(
         .clamp(0, detail_width.saturating_sub(1));
 
     let mut sub_col = false;
-    let mut delta_half_global: i64 = 0;
     let mut half_col_samp_global: f64 = 1.0;
     let viewport_start: Option<usize> = if buf.buf_cols >= detail_width && buf.samples_per_col > 0 {
         let delta = display_pos_samp as i64 - buf.anchor_sample as i64;
         let half_col_samp = buf.samples_per_col as f64 / 2.0;
         let delta_half = (delta as f64 / half_col_samp).round() as i64;
         sub_col = delta_half % 2 != 0;
-        delta_half_global = delta_half;
         half_col_samp_global = half_col_samp;
         let delta_cols = delta_half.div_euclid(2);
         let viewport_offset = buf.buf_cols as i64 / 2 + delta_cols - centre_col as i64;
@@ -2121,11 +2162,12 @@ fn render_detail_waveform(
         None
     };
 
-    // Compute view_start so both tick and cue column calculations share it.
+    // Compute view_start for tick/cue rendering from the exact display position,
+    // not the half-column-quantized waveform anchor. This prevents quantization
+    // residuals from flipping a tick's disp_half by 1 on each offset keypress.
     let detail_view_start: f64 = if buf.samples_per_col > 0 {
         let samples_per_col = buf.samples_per_col as f64;
-        let visual_centre = buf.anchor_sample as f64 + delta_half_global as f64 * half_col_samp_global;
-        visual_centre - centre_col as f64 * samples_per_col
+        display_pos_samp as f64 - centre_col as f64 * samples_per_col
     } else {
         0.0
     };
@@ -2283,6 +2325,7 @@ struct DeckAudio {
     waveform: Arc<WaveformData>,
     sample_rate: u32,
     filter_offset_shared: Arc<AtomicI32>,
+    filter_state_reset: Arc<AtomicBool>,
 }
 
 struct TempoState {
@@ -3390,6 +3433,10 @@ fn butterworth_biquad(fc: f64, sample_rate: u32, is_lpf: bool) -> (f32, f32, f32
 struct FilterSource<S: Source<Item = f32>> {
     inner: S,
     filter_offset: Arc<AtomicI32>,
+    filter_state_reset: Arc<AtomicBool>,
+    /// Counts down from FADE_SAMPLES to 0 after a state reset; output is scaled
+    /// by an ascending ramp so any IIR settling transient is inaudible.
+    output_fade_remaining: u32,
     last_offset: i32,
     channels: u16,
     sample_rate: u32,
@@ -3403,13 +3450,15 @@ struct FilterSource<S: Source<Item = f32>> {
 }
 
 impl<S: Source<Item = f32>> FilterSource<S> {
-    fn new(inner: S, filter_offset: Arc<AtomicI32>) -> Self {
+    fn new(inner: S, filter_offset: Arc<AtomicI32>, filter_state_reset: Arc<AtomicBool>) -> Self {
         let channels = inner.channels().get() as u16;
         let sample_rate = inner.sample_rate().get();
         let n = channels as usize;
         FilterSource {
             inner,
             filter_offset,
+            filter_state_reset,
+            output_fade_remaining: 0,
             last_offset: 0,
             channels,
             sample_rate,
@@ -3440,6 +3489,13 @@ impl<S: Source<Item = f32>> FilterSource<S> {
 impl<S: Source<Item = f32>> Iterator for FilterSource<S> {
     type Item = f32;
     fn next(&mut self) -> Option<f32> {
+        if self.filter_state_reset.swap(false, Ordering::Relaxed) {
+            for v in self.x1.iter_mut().chain(&mut self.x2).chain(&mut self.y1).chain(&mut self.y2) {
+                *v = 0.0;
+            }
+            self.last_offset = 0; // force recompute_coefficients on next sample
+            self.output_fade_remaining = FADE_SAMPLES as u32;
+        }
         let x = self.inner.next()?;
         let offset = self.filter_offset.load(Ordering::Relaxed);
         if offset != self.last_offset {
@@ -3449,13 +3505,21 @@ impl<S: Source<Item = f32>> Iterator for FilterSource<S> {
         let ch = self.ch_idx;
         self.ch_idx = (ch + 1) % self.channels as usize;
         if offset == 0 {
+            self.output_fade_remaining = 0; // cancel pending fade when filter is bypassed
             return Some(x);
         }
         let y = self.b0 * x + self.b1 * self.x1[ch] + self.b2 * self.x2[ch]
               - self.a1 * self.y1[ch] - self.a2 * self.y2[ch];
         self.x2[ch] = self.x1[ch]; self.x1[ch] = x;
         self.y2[ch] = self.y1[ch]; self.y1[ch] = y;
-        Some(y)
+        if self.output_fade_remaining > 0 {
+            let n = FADE_SAMPLES as u32 - self.output_fade_remaining;
+            let t = n as f32 / FADE_SAMPLES as f32;
+            self.output_fade_remaining -= 1;
+            Some(y * t)
+        } else {
+            Some(y)
+        }
     }
 }
 
