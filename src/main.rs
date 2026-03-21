@@ -1,7 +1,7 @@
 use std::io;
 use color_eyre::Result as EyreResult;
 use std::num::NonZero;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
@@ -20,7 +20,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Terminal;
 
 use rodio::stream::DeviceSinkBuilder;
@@ -108,16 +108,12 @@ fn main() {
     };
     let mixer = handle.mixer();
 
-    let initial_deck: Option<Deck> = if start.is_file() {
-        match load_deck(&start, &mixer, &mut cache, &mut terminal) {
-            Ok(Some(d)) => Some(d),
-            Ok(None) => { cleanup_terminal(); return; }
-            Err(e) => { cleanup_terminal(); eprintln!("Load error: {e}"); std::process::exit(1); }
-        }
+    let initial_load: Option<PendingLoad> = if start.is_file() {
+        Some(start_load(&start))
     } else {
         None
     };
-    if let Err(e) = tui_loop(&mut terminal, initial_deck, &mut cache, &mut browser_dir, &mixer) {
+    if let Err(e) = tui_loop(&mut terminal, initial_load, &mut cache, &mut browser_dir, &mixer) {
         cleanup_terminal();
         eprintln!("TUI error: {e}");
         std::process::exit(1);
@@ -126,82 +122,53 @@ fn main() {
     cleanup_terminal();
 }
 
-fn load_deck(
-    path: &std::path::Path,
-    mixer: &rodio::mixer::Mixer,
-    cache: &mut Cache,
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-) -> io::Result<Option<Deck>> {
+struct PendingLoad {
+    filename: String,
+    path:     PathBuf,
+    rx:       mpsc::Receiver<Result<(Vec<f32>, Vec<f32>, u32, u16), String>>,
+    decoded:  Arc<AtomicUsize>,
+    total:    Arc<AtomicUsize>,
+}
+
+fn start_load(path: &Path) -> PendingLoad {
     let path_str = path.to_string_lossy().to_string();
-    let decoded_samples = Arc::new(AtomicUsize::new(0));
-    let estimated_total = Arc::new(AtomicUsize::new(0));
-    let (decode_tx, decode_rx) = mpsc::channel::<Result<(Vec<f32>, Vec<f32>, u32, u16), String>>();
-    {
-        let path_clone = path_str.clone();
-        let decoded_samples_for_thread = Arc::clone(&decoded_samples);
-        let estimated_total_for_thread = Arc::clone(&estimated_total);
-        thread::spawn(move || {
-            let _ = decode_tx.send(decode_audio(&path_clone, decoded_samples_for_thread, estimated_total_for_thread).map_err(|e| e.to_string()));
-        });
-    }
-
-    let decode_result = loop {
-        let done = decoded_samples.load(Ordering::Relaxed);
-        let total = estimated_total.load(Ordering::Relaxed);
-        let ratio = if total > 0 { (done as f64 / total as f64).min(1.0) } else { 0.0 };
-
-        let _ = terminal.draw(|frame| {
-            let area = frame.area();
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Min(0)])
-                .split(area);
-            frame.render_widget(
-                Paragraph::new(format!("Loading {}…", path_str))
-                    .style(Style::default().fg(Color::DarkGray)),
-                chunks[0],
-            );
-            let label = if total > 0 { format!("{:.0}%", ratio * 100.0) } else { String::new() };
-            frame.render_widget(Gauge::default().ratio(ratio).label(label), chunks[1]);
-        })?;
-
-        if let Ok(result) = decode_rx.try_recv() {
-            break result;
-        }
-
-        if event::poll(Duration::from_millis(30))? {
-            if let Ok(Event::Key(key)) = event::read() {
-                if key.code == KeyCode::Char('q') {
-                    return Ok(None);
-                }
-            }
-        }
-    };
-
-    let (mono, stereo, sample_rate, channels) = match decode_result {
-        Ok(v) => v,
-        Err(e) => {
-            cleanup_terminal();
-            eprintln!("Decode error: {e}");
-            std::process::exit(1);
-        }
-    };
-
     let filename = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(&path_str)
         .to_string();
+    let decoded = Arc::new(AtomicUsize::new(0));
+    let total   = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = mpsc::channel::<Result<(Vec<f32>, Vec<f32>, u32, u16), String>>();
+    {
+        let decoded_for_thread = Arc::clone(&decoded);
+        let total_for_thread   = Arc::clone(&total);
+        thread::spawn(move || {
+            let _ = tx.send(decode_audio(&path_str, decoded_for_thread, total_for_thread).map_err(|e| e.to_string()));
+        });
+    }
+    PendingLoad { filename, path: path.to_path_buf(), rx, decoded, total }
+}
 
-    let track_name = read_track_name(&path_str);
+fn build_deck(
+    path:        &Path,
+    filename:    String,
+    mono:        Vec<f32>,
+    stereo:      Vec<f32>,
+    sample_rate: u32,
+    channels:    u16,
+    mixer:       &rodio::mixer::Mixer,
+    cache:       &Cache,
+) -> Deck {
+    let track_name     = read_track_name(&path.to_string_lossy());
     let total_duration = Duration::from_secs(mono.len() as u64 / sample_rate as u64);
-    let mono = Arc::new(mono);
-    let waveform = Arc::new(WaveformData::compute(Arc::clone(&mono), sample_rate));
+    let mono           = Arc::new(mono);
+    let waveform       = Arc::new(WaveformData::compute(Arc::clone(&mono), sample_rate));
 
-    let samples = Arc::new(stereo);
-    let position = Arc::new(AtomicUsize::new(0));
+    let samples        = Arc::new(stereo);
+    let position       = Arc::new(AtomicUsize::new(0));
     let fade_remaining = Arc::new(AtomicI64::new(0));
-    let fade_len = Arc::new(AtomicI64::new(FADE_SAMPLES));
+    let fade_len       = Arc::new(AtomicI64::new(FADE_SAMPLES));
     let pending_target = Arc::new(AtomicUsize::new(usize::MAX));
     let seek_handle = SeekHandle {
         samples: Arc::clone(&samples),
@@ -214,7 +181,7 @@ fn load_deck(
     };
 
     let filter_offset_shared = Arc::new(AtomicI32::new(0));
-    let filter_state_reset = Arc::new(AtomicBool::new(false));
+    let filter_state_reset   = Arc::new(AtomicBool::new(false));
     let player = Player::connect_new(mixer);
     player.append(FilterSource::new(
         TrackingSource::new(
@@ -235,7 +202,7 @@ fn load_deck(
             // is_fresh=true  → applied immediately only when bpm_established is false, leaves it false (unconfirmed).
             let (bpm, offset_ms, is_fresh) = if let Some(entry) = entries.get(&hash) {
                 let snapped = (entry.offset_ms as f64 / 10.0).round() as i64 * 10;
-                let period = (60_000.0 / entry.bpm as f64 / 10.0).round() as i64 * 10;
+                let period  = (60_000.0 / entry.bpm as f64 / 10.0).round() as i64 * 10;
                 let snapped = snapped.rem_euclid(period);
                 (entry.bpm, snapped, false)
             } else {
@@ -247,7 +214,7 @@ fn load_deck(
         });
     }
 
-    Ok(Some(Deck::new(
+    Deck::new(
         filename,
         track_name,
         total_duration,
@@ -261,12 +228,12 @@ fn load_deck(
             filter_state_reset,
         },
         bpm_rx,
-    )))
+    )
 }
 
 fn tui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    initial_deck: Option<Deck>,
+    initial_load: Option<PendingLoad>,
     cache: &mut Cache,
     browser_dir: &mut std::path::PathBuf,
     mixer: &rodio::mixer::Mixer,
@@ -290,24 +257,24 @@ fn tui_loop(
             expires: Instant::now() + Duration::from_secs(8),
         });
     }
-    if initial_deck.is_none() && global_notification.is_none() {
+    let mut decks: [Option<Deck>; 2] = [None, None];
+    let mut pending_loads: [Option<PendingLoad>; 2] = [initial_load, None];
+    if pending_loads[0].is_none() && global_notification.is_none() {
         global_notification = Some(Notification {
             message: "No track loaded — press z to open the file browser".to_string(),
             style: NotificationStyle::Info,
             expires: Instant::now() + Duration::from_secs(60),
         });
     }
-    let mut decks: [Option<Deck>; 2] = [initial_deck, None];
+    const DET_MIN: u16 = 3;
     let mut audio_latency_ms: i64 = ((cache.get_latency() as f64 / 10.0).round() as i64 * 10).clamp(0, 250);
     let mut zoom_idx: usize = DEFAULT_ZOOM_IDX;
     let shared_renderer = SharedDetailRenderer::new(zoom_idx);
-    if let Some(ref d) = decks[0] {
-        shared_renderer.set_deck(0, Arc::clone(&d.audio.waveform), d.audio.seek_handle.channels, d.audio.sample_rate);
-    }
-    let mut detail_height: usize = display_cfg.detail_height;
+    let mut detail_height: usize = display_cfg.detail_height.max(DET_MIN as usize);
     let mut frame_count: usize = 0;
     let mut last_render = Instant::now();
     let mut help_open = false;
+    let mut max_det_h: usize = usize::MAX;
     let mut space_held = false;
     // After a chord fires, suppress further Space-Press events until at least one frame
     // passes with no Space activity. Crossterm decodes Kitty key-repeats as Press events,
@@ -354,6 +321,30 @@ fn tui_loop(
         if global_notification.as_ref().map_or(false, |n| frame_start >= n.expires) {
             global_notification = None;
         }
+        // Complete any pending loads.
+        for slot in 0..2 {
+            if pending_loads[slot].is_none() { continue; }
+            let recv = pending_loads[slot].as_ref().unwrap().rx.try_recv();
+            match recv {
+                Ok(Ok((mono, stereo, sample_rate, channels))) => {
+                    let pending = pending_loads[slot].take().unwrap();
+                    let new_deck = build_deck(&pending.path, pending.filename, mono, stereo, sample_rate, channels, mixer, cache);
+                    shared_renderer.set_deck(slot, Arc::clone(&new_deck.audio.waveform), new_deck.audio.seek_handle.channels, new_deck.audio.sample_rate);
+                    decks[slot] = Some(new_deck);
+                }
+                Ok(Err(e)) => {
+                    global_notification = Some(Notification {
+                        message: format!("Load failed: {e}"),
+                        style: NotificationStyle::Error,
+                        expires: Instant::now() + Duration::from_secs(10),
+                    });
+                    pending_loads[slot] = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => { pending_loads[slot] = None; }
+            }
+        }
+
         // Service both decks: BPM results, position, metronome, tap timeout, spectrum.
         for slot in 0..2 {
             service_deck_frame(slot, &mut decks, col_secs, frame_dur, elapsed, mixer, &shared_renderer, cache, audio_latency_ms);
@@ -402,6 +393,15 @@ fn tui_loop(
         let mut d0 = decks[0].take();
         let mut d1 = decks[1].take();
 
+        // Compute loading labels for slots that have a pending load but no deck.
+        let loading_label: [Option<String>; 2] = std::array::from_fn(|slot| {
+            let p = pending_loads[slot].as_ref()?;
+            let done  = p.decoded.load(Ordering::Relaxed);
+            let total = p.total.load(Ordering::Relaxed);
+            let pct   = if total > 0 { format!(" {}%", (done * 100 / total).min(100)) } else { String::new() };
+            Some(format!("Loading {}…{}", p.filename, pct))
+        });
+
         terminal.draw(|frame| {
             let area = frame.area();
             let outer = Block::default()
@@ -418,18 +418,21 @@ fn tui_loop(
             // Row heights are pre-computed and sum exactly to inner.height so the
             // cassowary solver never receives an infeasible system and proportionally
             // shrinks things it shouldn't.
-            const DET_MIN: u16 = 4;
             const OV_MAX:  u16 = 3;
             const OV_MIN:  u16 = 2;
             let det_max = detail_height as u16;
             let ih = inner.height;
+            let fixed = 6_u16; // global + detail-info + notif×2 + info×2
+
+            // Cap detail_height to what the current terminal can actually display,
+            // so HeightIncrease never outruns the screen.
+            max_det_h = (ih.saturating_sub(fixed + OV_MIN * 2) / 2) as usize;
 
             // Compute a unified pool for each waveform type so both decks always
             // get the same height (no sequential-allocation asymmetry).
             // Phase 1: detail compresses; overviews stay at OV_MAX.
             // Phase 2: overviews compress; detail stays at DET_MIN.
             // Phase 3: items fall off bottom (heights stay at minimums).
-            let fixed = 6_u16; // global + detail-info + notif×2 + info×2
             let total_variable = ih.saturating_sub(fixed);
             let det_full = det_max * 2;
             let ov_full  = OV_MAX * 2;
@@ -532,7 +535,11 @@ fn tui_loop(
                 render_detail_waveform(frame, &buf_a, deck, area_detail_a, &display_cfg, rs.display_pos_samp);
             } else {
                 let mut spans = vec![Span::styled("A ", label_style)];
-                spans.extend(notification_line_empty().spans);
+                if let Some(ref s) = loading_label[0] {
+                    spans.push(Span::styled(s.clone(), Style::default().fg(Color::DarkGray)));
+                } else {
+                    spans.extend(notification_line_empty().spans);
+                }
                 frame.render_widget(Paragraph::new(Line::from(spans)).style(notif_bg), area_notif_a);
                 frame.render_widget(Paragraph::new(info_line_empty(area_info_a.width)), area_info_a);
                 frame.render_widget(Paragraph::new(overview_empty(area_overview_a)), area_overview_a);
@@ -555,7 +562,11 @@ fn tui_loop(
                 render_detail_waveform(frame, &buf_b, deck, area_detail_b, &display_cfg, rs.display_pos_samp);
             } else {
                 let mut spans = vec![Span::styled("B ", label_style)];
-                spans.extend(notification_line_empty().spans);
+                if let Some(ref s) = loading_label[1] {
+                    spans.push(Span::styled(s.clone(), Style::default().fg(Color::DarkGray)));
+                } else {
+                    spans.extend(notification_line_empty().spans);
+                }
                 frame.render_widget(Paragraph::new(Line::from(spans)).style(notif_bg), area_notif_b);
                 frame.render_widget(Paragraph::new(info_line_empty(area_info_b.width)), area_info_b);
                 frame.render_widget(Paragraph::new(overview_empty(area_overview_b)), area_overview_b);
@@ -990,17 +1001,13 @@ Esc                  close this / quit";
                                 *browser_dir = cwd;
                                 cache.set_last_browser_path(browser_dir);
                                 cache.save();
-                                // Stop the outgoing deck now that we are definitely replacing it.
+                                // Stop and drop the outgoing deck.
                                 if let Some(ref d) = decks[target] {
                                     d.audio.player.stop();
                                 }
-                                match load_deck(&path, mixer, cache, terminal)? {
-                                    None => return Ok(()),
-                                    Some(new_deck) => {
-                                        shared_renderer.set_deck(target, Arc::clone(&new_deck.audio.waveform), new_deck.audio.seek_handle.channels, new_deck.audio.sample_rate);
-                                        decks[target] = Some(new_deck);
-                                    }
-                                }
+                                decks[target] = None;
+                                // Cancel any in-progress load for this slot and start the new one.
+                                pending_loads[target] = Some(start_load(&path));
                             }
                             (BrowserResult::Quit, cwd) => {
                                 *browser_dir = cwd;
@@ -1260,8 +1267,8 @@ Esc                  close this / quit";
                     }
                     Some(Action::ZoomOut) => { if zoom_idx > 0 { zoom_idx -= 1; } }
                     Some(Action::ZoomIn)  => { if zoom_idx + 1 < ZOOM_LEVELS.len() { zoom_idx += 1; } }
-                    Some(Action::HeightDecrease) => { if detail_height > 1 { detail_height -= 1; } }
-                    Some(Action::HeightIncrease) => { detail_height += 1; }
+                    Some(Action::HeightDecrease) => { if detail_height > DET_MIN as usize { detail_height -= 1; } }
+                    Some(Action::HeightIncrease) => { if detail_height < max_det_h { detail_height += 1; } }
                     Some(Action::Deck1BpmIncrease) => {
                         if let Some(ref mut d) = decks[0] {
                             d.tempo.bpm = (d.tempo.bpm + 0.01).min(240.0);
@@ -2159,14 +2166,12 @@ fn render_detail_waveform(
     let centre_col = ((detail_width as f64 * display_cfg.playhead_position as f64 / 100.0) as usize)
         .clamp(0, detail_width.saturating_sub(1));
 
+    let half_col_samp_global: f64 = buf.samples_per_col as f64 / 2.0;
     let mut sub_col = false;
-    let mut half_col_samp_global: f64 = 1.0;
     let viewport_start: Option<usize> = if buf.buf_cols >= detail_width && buf.samples_per_col > 0 {
         let delta = display_pos_samp as i64 - buf.anchor_sample as i64;
-        let half_col_samp = buf.samples_per_col as f64 / 2.0;
-        let delta_half = (delta as f64 / half_col_samp).round() as i64;
+        let delta_half = (delta as f64 / half_col_samp_global).round() as i64;
         sub_col = delta_half % 2 != 0;
-        half_col_samp_global = half_col_samp;
         let delta_cols = delta_half.div_euclid(2);
         let viewport_offset = buf.buf_cols as i64 / 2 + delta_cols - centre_col as i64;
         let need = if sub_col { detail_width + 1 } else { detail_width };
