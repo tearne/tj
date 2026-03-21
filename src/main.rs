@@ -309,6 +309,13 @@ fn tui_loop(
     let mut last_render = Instant::now();
     let mut help_open = false;
     let mut space_held = false;
+    // After a chord fires, suppress further Space-Press events until at least one frame
+    // passes with no Space activity. Crossterm decodes Kitty key-repeats as Press events,
+    // so without this guard the repeat stream re-arms space_held immediately after the
+    // post-chord reset, leaving the modifier stuck until the repeats stop — which never
+    // happens via a Release event (those also don't arrive in crossterm 0.29 + Kitty).
+    let mut space_repeat_suppressed = false;
+    let mut space_saw_event_this_frame = false;
     let mut pending_quit = false;
     // When Esc dismisses an overlay, suppress the next Quit action for a short window.
     // This absorbs the duplicate Esc event that Kitty injects after the first one.
@@ -316,6 +323,13 @@ fn tui_loop(
 
     'tui: loop {
         frame_count += 1;
+
+        // Clear the repeat-suppression latch once a full frame passes with no Space events,
+        // indicating the key has been physically released.
+        if space_repeat_suppressed && !space_saw_event_this_frame {
+            space_repeat_suppressed = false;
+        }
+        space_saw_event_this_frame = false;
 
         // Frame timing — computed once and shared by both decks.
         let dc = shared_renderer.cols.load(Ordering::Relaxed);
@@ -486,7 +500,7 @@ fn tui_loop(
             // Detail info bar
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(
-                    format!("  zoom:{}s  lat:{}ms", zoom_secs, audio_latency_ms),
+                    format!("  zoom:{}s  lat:{}ms{}", zoom_secs, audio_latency_ms, if space_held { "  [SPC]" } else { "" }),
                     Style::default().fg(Color::Rgb(60, 60, 60)),
                 ))),
                 area_detail_info,
@@ -661,10 +675,15 @@ Esc                  close this / quit";
                 }
                 // Space modifier: track held state for chords.
                 if key.code == KeyCode::Char(' ') {
+                    space_saw_event_this_frame = true;
                     match key.kind {
-                        KeyEventKind::Press   => { space_held = true; }
-                        KeyEventKind::Release => { space_held = false; }
-                        _ => {}
+                        KeyEventKind::Press | KeyEventKind::Repeat => {
+                            if !space_repeat_suppressed { space_held = true; }
+                        }
+                        KeyEventKind::Release => {
+                            space_held = false;
+                            space_repeat_suppressed = false;
+                        }
                     }
                 }
                 // Nudge and mode toggle — handled for all key kinds (Release must be detected).
@@ -713,6 +732,7 @@ Esc                  close this / quit";
                                 cache.save();
                             }
                             space_held = false;
+                            space_repeat_suppressed = true;
                         }
                     }
                     KeyEventKind::Press
@@ -734,6 +754,7 @@ Esc                  close this / quit";
                                 cache.save();
                             }
                             space_held = false;
+                            space_repeat_suppressed = true;
                         }
                     }
                     // Deck 1 nudge
@@ -907,6 +928,7 @@ Esc                  close this / quit";
                     let action = if space_held && key.code != KeyCode::Char(' ') {
                         if let Some(a) = keymap.get(&KeyBinding::SpaceChord(key.code)) {
                             space_held = false;
+                            space_repeat_suppressed = true;
                             Some(a)
                         } else {
                             keymap.get(&KeyBinding::Key(key.code))
@@ -940,8 +962,10 @@ Esc                  close this / quit";
                     }
                     Some(Action::Deck1OpenBrowser) | Some(Action::Deck2OpenBrowser) => {
                         let target = if action == Some(&Action::Deck1OpenBrowser) { 0 } else { 1 };
+                        // Save cache state but leave the player running — the deck continues
+                        // playing while the browser is open. stop() is deferred to the
+                        // Selected branch; returning without selecting leaves the deck intact.
                         if let Some(ref d) = decks[target] {
-                            d.audio.player.stop();
                             if let Some(ref hash) = d.tempo.analysis_hash {
                                 if let Some(entry) = cache.get(hash.as_str()).cloned() {
                                     cache.set(hash.clone(), CacheEntry { offset_ms: d.tempo.offset_ms, ..entry });
@@ -959,6 +983,10 @@ Esc                  close this / quit";
                                 *browser_dir = cwd;
                                 cache.set_last_browser_path(browser_dir);
                                 cache.save();
+                                // Stop the outgoing deck now that we are definitely replacing it.
+                                if let Some(ref d) = decks[target] {
+                                    d.audio.player.stop();
+                                }
                                 match load_deck(&path, mixer, cache, terminal)? {
                                     None => return Ok(()),
                                     Some(new_deck) => {
@@ -1145,14 +1173,7 @@ Esc                  close this / quit";
                                     continue 'tui;
                                 }
                             }
-                            d.tempo.offset_ms += 10;
-                            let period = (60_000.0 / d.tempo.base_bpm as f64 / 10.0).round() as i64 * 10;
-                            d.tempo.offset_ms = d.tempo.offset_ms.rem_euclid(period);
-                            if d.audio.player.is_paused() {
-                                let delta = 10.0 / 1000.0 * d.audio.sample_rate as f64;
-                                d.display.smooth_display_samp = (d.display.smooth_display_samp + delta).max(0.0);
-                                d.audio.seek_handle.set_position(d.display.smooth_display_samp / d.audio.sample_rate as f64);
-                            }
+                            apply_offset_step(d, 10);
                         }
                     }
                     Some(Action::Deck1OffsetDecrease) => {
@@ -1177,14 +1198,7 @@ Esc                  close this / quit";
                                     continue 'tui;
                                 }
                             }
-                            d.tempo.offset_ms -= 10;
-                            let period = (60_000.0 / d.tempo.base_bpm as f64 / 10.0).round() as i64 * 10;
-                            d.tempo.offset_ms = d.tempo.offset_ms.rem_euclid(period);
-                            if d.audio.player.is_paused() {
-                                let delta = 10.0 / 1000.0 * d.audio.sample_rate as f64;
-                                d.display.smooth_display_samp = (d.display.smooth_display_samp - delta).max(0.0);
-                                d.audio.seek_handle.set_position(d.display.smooth_display_samp / d.audio.sample_rate as f64);
-                            }
+                            apply_offset_step(d, -10);
                         }
                     }
                     Some(Action::Deck2OffsetIncrease) => {
@@ -1209,14 +1223,7 @@ Esc                  close this / quit";
                                     continue 'tui;
                                 }
                             }
-                            d.tempo.offset_ms += 10;
-                            let period = (60_000.0 / d.tempo.base_bpm as f64 / 10.0).round() as i64 * 10;
-                            d.tempo.offset_ms = d.tempo.offset_ms.rem_euclid(period);
-                            if d.audio.player.is_paused() {
-                                let delta = 10.0 / 1000.0 * d.audio.sample_rate as f64;
-                                d.display.smooth_display_samp = (d.display.smooth_display_samp + delta).max(0.0);
-                                d.audio.seek_handle.set_position(d.display.smooth_display_samp / d.audio.sample_rate as f64);
-                            }
+                            apply_offset_step(d, 10);
                         }
                     }
                     Some(Action::Deck2OffsetDecrease) => {
@@ -1241,14 +1248,7 @@ Esc                  close this / quit";
                                     continue 'tui;
                                 }
                             }
-                            d.tempo.offset_ms -= 10;
-                            let period = (60_000.0 / d.tempo.base_bpm as f64 / 10.0).round() as i64 * 10;
-                            d.tempo.offset_ms = d.tempo.offset_ms.rem_euclid(period);
-                            if d.audio.player.is_paused() {
-                                let delta = 10.0 / 1000.0 * d.audio.sample_rate as f64;
-                                d.display.smooth_display_samp = (d.display.smooth_display_samp - delta).max(0.0);
-                                d.audio.seek_handle.set_position(d.display.smooth_display_samp / d.audio.sample_rate as f64);
-                            }
+                            apply_offset_step(d, -10);
                         }
                     }
                     Some(Action::ZoomOut) => { if zoom_idx > 0 { zoom_idx -= 1; } }
@@ -1708,6 +1708,23 @@ fn anchor_beat_grid_to_cue(d: &mut Deck) {
     }
 }
 
+/// Apply a ±10ms offset step and keep the display position in sync when paused.
+///
+/// The display delta uses the raw `delta_ms` step — never `new_offset - old_offset`.
+/// Those two values differ when `rem_euclid` wraps the offset across a beat boundary,
+/// which would shift `smooth_display_samp` by nearly a full period and trigger a
+/// spurious waveform rerender.
+fn apply_offset_step(d: &mut Deck, delta_ms: i64) {
+    d.tempo.offset_ms += delta_ms;
+    let period = (60_000.0 / d.tempo.base_bpm as f64 / 10.0).round() as i64 * 10;
+    d.tempo.offset_ms = d.tempo.offset_ms.rem_euclid(period);
+    if d.audio.player.is_paused() {
+        let delta_samp = delta_ms as f64 / 1000.0 * d.audio.sample_rate as f64;
+        d.display.smooth_display_samp = (d.display.smooth_display_samp + delta_samp).max(0.0);
+        d.audio.seek_handle.set_position(d.display.smooth_display_samp / d.audio.sample_rate as f64);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-deck render helpers (free functions used by terminal.draw closures)
 // ---------------------------------------------------------------------------
@@ -2162,10 +2179,11 @@ fn render_detail_waveform(
         None
     };
 
-    // Compute view_start for tick/cue rendering from the exact display position,
-    // not the half-column-quantized waveform anchor. This prevents quantization
-    // residuals from flipping a tick's disp_half by 1 on each offset keypress.
-    let detail_view_start: f64 = if buf.samples_per_col > 0 {
+    // Marker positions (ticks, cue) are computed from the exact display position.
+    // viewport_start uses the half-column-quantized anchor (correct for the discrete
+    // buffer grid); using that quantized value here would leave a residual that flips
+    // disp_half by 1 whenever the display position moves — visible as marker wobble.
+    let marker_view_start: f64 = if buf.samples_per_col > 0 {
         let samples_per_col = buf.samples_per_col as f64;
         display_pos_samp as f64 - centre_col as f64 * samples_per_col
     } else {
@@ -2174,7 +2192,7 @@ fn render_detail_waveform(
 
     let cue_screen_col: Option<usize> = if buf.samples_per_col > 0 {
         deck.cue_sample.and_then(|samp| {
-            let disp_half = ((samp as f64 - detail_view_start) / half_col_samp_global).round() as i64;
+            let disp_half = ((samp as f64 - marker_view_start) / half_col_samp_global).round() as i64;
             if disp_half >= 0 {
                 let col = (disp_half / 2) as usize;
                 if col < detail_width { Some(col) } else { None }
@@ -2194,7 +2212,7 @@ fn render_detail_waveform(
             let half_samples_per_col = half_col_samp_global;
             let beat_period_samp = 60.0 / deck.tempo.base_bpm as f64 * deck.audio.sample_rate as f64;
             let offset_samp = deck.tempo.offset_ms as f64 / 1000.0 * deck.audio.sample_rate as f64;
-            let view_start = detail_view_start;
+            let view_start = marker_view_start;
             let view_end = view_start + detail_width as f64 * samples_per_col;
             let n_start = ((view_start - offset_samp) / beat_period_samp).floor() as i64 - 1;
             let mut t_samp = offset_samp + n_start as f64 * beat_period_samp;
