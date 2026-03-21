@@ -498,13 +498,20 @@ fn tui_loop(
             }
 
             // Detail info bar
-            frame.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    format!("  zoom:{}s  lat:{}ms{}", zoom_secs, audio_latency_ms, if space_held { "  [SPC]" } else { "" }),
-                    Style::default().fg(Color::Rgb(60, 60, 60)),
-                ))),
-                area_detail_info,
-            );
+            {
+                let nudge_label = match d0.as_ref().or(d1.as_ref()).map(|d| d.nudge_mode) {
+                    Some(NudgeMode::Warp) => "  [WARP]",
+                    _ => "  [JUMP]",
+                };
+                let spc_label = if space_held { "  [SPC]" } else { "" };
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::styled(
+                        format!("  zoom:{}s  lat:{}ms{}{}", zoom_secs, audio_latency_ms, nudge_label, spc_label),
+                        Style::default().fg(Color::Rgb(60, 60, 60)),
+                    ))),
+                    area_detail_info,
+                );
+            }
 
             let label_style = Style::default().fg(Color::Rgb(40, 60, 100));
             let notif_bg    = Style::default().bg(Color::Rgb(20, 20, 38));
@@ -1770,10 +1777,6 @@ fn info_line_for_deck(
 ) -> Line<'static> {
     const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let play_icon = if deck.audio.player.is_paused() { "⏸" } else { "▶" };
-    let mode_str = match deck.nudge_mode {
-        NudgeMode::Jump => "jump",
-        NudgeMode::Warp => "warp",
-    };
     let nudge_str = match deck.nudge {
         1  => "  ▶nudge",
         -1 => "  ◀nudge",
@@ -1837,7 +1840,6 @@ fn info_line_for_deck(
     if !nudge_str.is_empty() {
         right_spans.push(Span::styled(nudge_str.to_string(), dim));
     }
-    right_spans.push(Span::styled(format!("  nudge:{}", mode_str), dim));
     const LEVEL_BARS: [char; 8] = ['▁','▂','▃','▄','▅','▆','▇','█'];
     let level_char = LEVEL_BARS[((deck.volume * 7.0).round() as usize).min(7)];
     let bracket_style = Style::default().fg(Color::Rgb(140, 140, 140));
