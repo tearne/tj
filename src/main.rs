@@ -496,7 +496,7 @@ fn tui_loop(
                 let h = area_detail_a.height as usize;
                 if w > 0 && h > 0 {
                     shared_renderer.cols.store(w, Ordering::Relaxed);
-                    shared_renderer.rows.store(h.saturating_sub(2), Ordering::Relaxed);
+                    shared_renderer.rows.store(h.saturating_sub(1), Ordering::Relaxed);
                 }
             }
 
@@ -519,6 +519,25 @@ fn tui_loop(
             let label_style = Style::default().fg(Color::Rgb(40, 60, 100));
             let notif_bg    = Style::default().bg(Color::Rgb(20, 20, 38));
 
+            // Pre-compute shared tick row: separate beat grids for deck A and deck B.
+            let (shared_tick_a, shared_tick_b): (Vec<u8>, Vec<u8>) = {
+                let w = area_detail_a.width as usize;
+                let centre_col = ((w as f64 * display_cfg.playhead_position as f64 / 100.0) as usize)
+                    .clamp(0, w.saturating_sub(1));
+                let tick_for = |buf: &Arc<BrailleBuffer>, deck: Option<&Deck>, pos: usize| -> Vec<u8> {
+                    let Some(deck) = deck else { return vec![0u8; w]; };
+                    let analysing = deck.tempo.analysis_hash.is_none() || !deck.tempo.bpm_established;
+                    let mvs = if buf.samples_per_col > 0 {
+                        pos as f64 - centre_col as f64 * buf.samples_per_col as f64
+                    } else { 0.0 };
+                    compute_tick_display(w, buf.samples_per_col, mvs, analysing,
+                        deck.tempo.base_bpm, deck.audio.sample_rate, deck.tempo.offset_ms)
+                };
+                let pos_a = render[0].as_ref().map(|rs| rs.display_pos_samp).unwrap_or(0);
+                let pos_b = render[1].as_ref().map(|rs| rs.display_pos_samp).unwrap_or(0);
+                (tick_for(&buf_a, d0.as_ref(), pos_a), tick_for(&buf_b, d1.as_ref(), pos_b))
+            };
+
             // ---- Deck A ----
             if let (Some(deck), Some(rs)) = (&mut d0, &render[0]) {
                 let content = notification_line_for_deck(deck);
@@ -532,7 +551,7 @@ fn tui_loop(
                 deck.display.last_bar_cols  = bar_cols;
                 deck.display.last_bar_times = bar_times;
                 frame.render_widget(Paragraph::new(ov), area_overview_a);
-                render_detail_waveform(frame, &buf_a, deck, area_detail_a, &display_cfg, rs.display_pos_samp);
+                render_detail_waveform(frame, &buf_a, deck, area_detail_a, &display_cfg, rs.display_pos_samp, Some((&shared_tick_a, &shared_tick_b)));
             } else {
                 let mut spans = vec![Span::styled("A ", label_style)];
                 if let Some(ref s) = loading_label[0] {
@@ -543,7 +562,7 @@ fn tui_loop(
                 frame.render_widget(Paragraph::new(Line::from(spans)).style(notif_bg), area_notif_a);
                 frame.render_widget(Paragraph::new(info_line_empty(area_info_a.width)), area_info_a);
                 frame.render_widget(Paragraph::new(overview_empty(area_overview_a)), area_overview_a);
-                render_detail_empty(frame, area_detail_a, &display_cfg);
+                render_detail_empty(frame, area_detail_a, &display_cfg, Some((&shared_tick_a, &shared_tick_b)));
             }
 
             // ---- Deck B ----
@@ -559,7 +578,7 @@ fn tui_loop(
                 deck.display.last_bar_cols  = bar_cols;
                 deck.display.last_bar_times = bar_times;
                 frame.render_widget(Paragraph::new(ov), area_overview_b);
-                render_detail_waveform(frame, &buf_b, deck, area_detail_b, &display_cfg, rs.display_pos_samp);
+                render_detail_waveform(frame, &buf_b, deck, area_detail_b, &display_cfg, rs.display_pos_samp, None);
             } else {
                 let mut spans = vec![Span::styled("B ", label_style)];
                 if let Some(ref s) = loading_label[1] {
@@ -570,7 +589,7 @@ fn tui_loop(
                 frame.render_widget(Paragraph::new(Line::from(spans)).style(notif_bg), area_notif_b);
                 frame.render_widget(Paragraph::new(info_line_empty(area_info_b.width)), area_info_b);
                 frame.render_widget(Paragraph::new(overview_empty(area_overview_b)), area_overview_b);
-                render_detail_empty(frame, area_detail_b, &display_cfg);
+                render_detail_empty(frame, area_detail_b, &display_cfg, None);
             }
 
             // ---- Global status bar ----
@@ -2072,6 +2091,7 @@ fn render_detail_empty(
     frame: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
     display_cfg: &DisplayConfig,
+    shared_tick: Option<(&[u8], &[u8])>,
 ) {
     let w = area.width as usize;
     let h = area.height as usize;
@@ -2080,58 +2100,18 @@ fn render_detail_empty(
     let centre_col = ((w as f64 * display_cfg.playhead_position as f64 / 100.0) as usize)
         .clamp(0, w.saturating_sub(1));
 
-    // One dedicated tick row at centre; waveform rows fill the rest.
-    let waveform_rows = h.saturating_sub(1);
-    let peaks: Vec<(f32, f32)> = vec![(0.0f32, 0.0f32); w];
-    let braille = if waveform_rows > 0 {
-        render_braille(&peaks, waveform_rows, w, false)
-    } else {
-        vec![]
-    };
-
-    // Tick marks at 120 BPM centred on position 0.
-    let sample_rate = 44100.0f64;
-    let bpm         = 120.0f64;
-    let zoom_secs   = 4.0f64;
-    let spc         = zoom_secs * sample_rate / w as f64;
-    let half_spc    = spc / 2.0;
-    let beat_samp   = 60.0 / bpm * sample_rate;
-    let view_start  = -(centre_col as f64 * spc);
-    let view_end    = view_start + w as f64 * spc;
-    let n_start     = (view_start / beat_samp).floor() as i64 - 1;
-    let mut tick_row = vec![0u8; w];
-    let mut t = n_start as f64 * beat_samp;
-    while t <= view_end {
-        let dh = ((t - view_start) / half_spc).round() as i64;
-        if dh >= 0 {
-            let col = (dh / 2) as usize;
-            if col < w {
-                tick_row[col] = if dh % 2 != 0 { 0xB8 } else { 0x47 };
-            }
-        }
-        t += beat_samp;
-    }
-
+    let waveform_rows = if shared_tick.is_some() { h.saturating_sub(1) } else { h };
     let wave_color   = Color::Rgb(35, 35, 55);
-    let tick_color   = Color::Rgb(60, 60, 60);
     let centre_color = Color::Rgb(60, 60, 60);
 
-    let lines: Vec<Line<'static>> = (0..h).map(|r| {
-        let is_tick_row = r == 0 || r + 1 == h;
-        let row_bytes: &[u8] = if is_tick_row {
-            &tick_row
-        } else {
-            let buf_r = r - 1;
-            if buf_r < braille.len() { &braille[buf_r] } else { &tick_row }
-        };
+    let empty_row = vec![0u8; w];
+    let mut lines: Vec<Line<'static>> = (0..waveform_rows).map(|_r| {
         let mut spans: Vec<Span<'static>> = Vec::new();
         let mut run = String::new();
         let mut run_color = Color::Reset;
-        for (c, &byte) in row_bytes.iter().enumerate() {
+        for (c, &byte) in empty_row.iter().enumerate() {
             let (color, ch) = if c == centre_col {
                 (centre_color, '⣿')
-            } else if is_tick_row {
-                (tick_color, char::from_u32(0x2800 | byte as u32).unwrap_or(' '))
             } else {
                 (wave_color, char::from_u32(0x2800 | byte as u32).unwrap_or(' '))
             };
@@ -2149,7 +2129,102 @@ fn render_detail_empty(
         Line::from(spans)
     }).collect();
 
+    // Shared tick row (only for deck A slot).
+    if let Some((tick_a, tick_b)) = shared_tick {
+        let tick_color = Color::Rgb(60, 60, 60);
+        let display_row = compose_shared_tick_row(tick_a, tick_b, w);
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut run = String::new();
+        let mut run_color = Color::Reset;
+        for c in 0..w {
+            let byte = display_row[c];
+            let (color, ch) = if c == centre_col {
+                (centre_color, '⣿')
+            } else if byte != 0 {
+                (tick_color, char::from_u32(0x2800 | byte as u32).unwrap_or(' '))
+            } else {
+                (tick_color, ' ')
+            };
+            if color != run_color {
+                if !run.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut run), Style::default().fg(run_color)));
+                }
+                run_color = color;
+            }
+            run.push(ch);
+        }
+        if !run.is_empty() {
+            spans.push(Span::styled(run, Style::default().fg(run_color)));
+        }
+        lines.push(Line::from(spans));
+    }
+
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+// Compose the braille display row for the shared tick strip.
+// Each tick occupies two adjacent characters: a main char at column c and a spillover into c+1.
+// Deck A (up): 1 tip dot (row 1, sub-col position) + 3-wide base (row 2).
+// Deck B (down): 3-wide base (row 3) + 1 tip dot (row 4, sub-col position).
+// Left/right sub-column is determined by bit 0 of the raw tick byte (0x47=left, 0xB8=right).
+fn compose_shared_tick_row(tick_a: &[u8], tick_b: &[u8], width: usize) -> Vec<u8> {
+    let mut row = vec![0u8; width];
+    for c in 0..width {
+        let a = tick_a.get(c).copied().unwrap_or(0);
+        let b = tick_b.get(c).copied().unwrap_or(0);
+        if a != 0 {
+            let (c_pat, c1_pat): (u8, u8) = if a & 0x01 != 0 {
+                (0x1A, 0x02) // left sub-col: tip=row1-col1, base=row2 cols 0,1 + col0 of c+1
+            } else {
+                (0x10, 0x13) // right sub-col: base=row2 col1 + cols 0,1 of c+1, tip=row1-col0 of c+1
+            };
+            row[c] |= c_pat;
+            if c + 1 < width { row[c + 1] |= c1_pat; }
+        }
+        if b != 0 {
+            let (c_pat, c1_pat): (u8, u8) = if b & 0x01 != 0 {
+                (0xA4, 0x04) // left sub-col: base=row3 cols 0,1 + col0 of c+1, tip=row4-col1
+            } else {
+                (0x20, 0x64) // right sub-col: base=row3 col1 + cols 0,1 of c+1, tip=row4-col0 of c+1
+            };
+            row[c] |= c_pat;
+            if c + 1 < width { row[c + 1] |= c1_pat; }
+        }
+    }
+    row
+}
+
+fn compute_tick_display(
+    detail_width:    usize,
+    samples_per_col: usize,
+    marker_view_start: f64,
+    analysing:       bool,
+    base_bpm:        f32,
+    sample_rate:     u32,
+    offset_ms:       i64,
+) -> Vec<u8> {
+    if analysing || samples_per_col == 0 {
+        return vec![0u8; detail_width];
+    }
+    let mut row = vec![0u8; detail_width];
+    let samples_per_col    = samples_per_col as f64;
+    let half_samples_per_col = samples_per_col / 2.0;
+    let beat_period_samp   = 60.0 / base_bpm as f64 * sample_rate as f64;
+    let offset_samp        = offset_ms as f64 / 1000.0 * sample_rate as f64;
+    let view_end           = marker_view_start + detail_width as f64 * samples_per_col;
+    let n_start            = ((marker_view_start - offset_samp) / beat_period_samp).floor() as i64 - 1;
+    let mut t_samp         = offset_samp + n_start as f64 * beat_period_samp;
+    while t_samp <= view_end {
+        let disp_half = ((t_samp - marker_view_start) / half_samples_per_col).round() as i64;
+        if disp_half >= 0 {
+            let col = (disp_half / 2) as usize;
+            if col < detail_width {
+                row[col] = if disp_half % 2 != 0 { 0xB8 } else { 0x47 };
+            }
+        }
+        t_samp += beat_period_samp;
+    }
+    row
 }
 
 fn render_detail_waveform(
@@ -2159,6 +2234,7 @@ fn render_detail_waveform(
     detail_area: ratatui::layout::Rect,
     display_cfg: &DisplayConfig,
     display_pos_samp: usize,
+    shared_tick: Option<(&[u8], &[u8])>,
 ) {
     let detail_width      = detail_area.width  as usize;
     let detail_panel_rows = detail_area.height as usize;
@@ -2186,13 +2262,12 @@ fn render_detail_waveform(
         None
     };
 
-    // Marker positions (ticks, cue) are computed from the exact display position.
+    // Marker positions (cue) are computed from the exact display position.
     // viewport_start uses the half-column-quantized anchor (correct for the discrete
     // buffer grid); using that quantized value here would leave a residual that flips
     // disp_half by 1 whenever the display position moves — visible as marker wobble.
     let marker_view_start: f64 = if buf.samples_per_col > 0 {
-        let samples_per_col = buf.samples_per_col as f64;
-        display_pos_samp as f64 - centre_col as f64 * samples_per_col
+        display_pos_samp as f64 - centre_col as f64 * buf.samples_per_col as f64
     } else {
         0.0
     };
@@ -2211,58 +2286,33 @@ fn render_detail_waveform(
         None
     };
 
-    let tick_display: Vec<u8> = {
-        let analysing = deck.tempo.analysis_hash.is_none() || !deck.tempo.bpm_established;
-        if !analysing && buf.samples_per_col > 0 {
-            let mut row = vec![0u8; detail_width];
-            let samples_per_col = buf.samples_per_col as f64;
-            let half_samples_per_col = half_col_samp_global;
-            let beat_period_samp = 60.0 / deck.tempo.base_bpm as f64 * deck.audio.sample_rate as f64;
-            let offset_samp = deck.tempo.offset_ms as f64 / 1000.0 * deck.audio.sample_rate as f64;
-            let view_start = marker_view_start;
-            let view_end = view_start + detail_width as f64 * samples_per_col;
-            let n_start = ((view_start - offset_samp) / beat_period_samp).floor() as i64 - 1;
-            let mut t_samp = offset_samp + n_start as f64 * beat_period_samp;
-            while t_samp <= view_end {
-                let disp_half = ((t_samp - view_start) / half_samples_per_col).round() as i64;
-                if disp_half >= 0 {
-                    let col = (disp_half / 2) as usize;
-                    if col < detail_width {
-                        row[col] = if disp_half % 2 != 0 { 0xB8 } else { 0x47 };
-                    }
-                }
-                t_samp += beat_period_samp;
-            }
-            row
-        } else {
-            vec![]
-        }
+    // Waveform rows occupy the full panel minus the shared tick row (if present).
+    let waveform_rows = if shared_tick.is_some() {
+        detail_panel_rows.saturating_sub(1)
+    } else {
+        detail_panel_rows
     };
 
-    let detail_lines: Vec<Line<'static>> = (0..detail_panel_rows)
+    let mut detail_lines: Vec<Line<'static>> = (0..waveform_rows)
         .map(|r| {
-            let is_tick_row = r == 0 || r + 1 == detail_panel_rows;
+            // buf_r maps directly: row 0 → buffer row 0 (no top tick row to skip).
+            let buf_r = r;
             let shifted: Option<Vec<u8>>;
             let row_slice: Option<&[u8]>;
-            if is_tick_row {
-                shifted = None;
-                row_slice = if tick_display.len() == detail_width { Some(&tick_display) } else { None };
-            } else {
-                let buf_r = r - 1;
-                shifted = if sub_col {
-                    viewport_start.and_then(|start| {
-                        buf.grid.get(buf_r).map(|row| {
-                            (0..detail_width).map(|c| shift_braille_half(row[start + c], row[start + c + 1])).collect()
-                        })
+            shifted = if sub_col {
+                viewport_start.and_then(|start| {
+                    buf.grid.get(buf_r).map(|row| {
+                        (0..detail_width).map(|c| shift_braille_half(row[start + c], row[start + c + 1])).collect()
                     })
-                } else { None };
-                row_slice = if sub_col {
-                    shifted.as_deref()
-                } else {
-                    viewport_start.and_then(|start| buf.grid.get(buf_r).map(|row| &row[start..start + detail_width]))
-                };
-            }
+                })
+            } else { None };
+            row_slice = if sub_col {
+                shifted.as_deref()
+            } else {
+                viewport_start.and_then(|start| buf.grid.get(buf_r).map(|row| &row[start..start + detail_width]))
+            };
             let _ = &shifted;
+            let is_edge_row = r == 0 || r + 1 == waveform_rows;
             let row = match row_slice {
                 None => return Line::from(Span::raw("\u{2800}".repeat(detail_width))),
                 Some(s) => s,
@@ -2272,7 +2322,7 @@ fn render_detail_waveform(
             let mut run_color = Color::Reset;
             for (c, &byte) in row.iter().enumerate() {
                 let (color, ch) = if c == centre_col && cue_screen_col == Some(c) {
-                    if r == 0 || r + 1 == detail_panel_rows {
+                    if is_edge_row {
                         (Color::Green, '\u{28FF}')
                     } else {
                         (Color::White, '\u{28FF}')
@@ -2281,8 +2331,6 @@ fn render_detail_waveform(
                     (Color::White, '\u{28FF}')
                 } else if cue_screen_col == Some(c) {
                     (Color::Green, '\u{28FF}')
-                } else if is_tick_row {
-                    (Color::Gray, char::from_u32(0x2800 | byte as u32).unwrap_or(' '))
                 } else {
                     (Color::Cyan, char::from_u32(0x2800 | byte as u32).unwrap_or(' '))
                 };
@@ -2300,6 +2348,39 @@ fn render_detail_waveform(
             Line::from(spans)
         })
         .collect();
+
+    // Shared tick row (bottom of deck A panel only).
+    if let Some((tick_a, tick_b)) = shared_tick {
+        let display_row = compose_shared_tick_row(tick_a, tick_b, detail_width);
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut run = String::new();
+        let mut run_color = Color::Reset;
+        for c in 0..detail_width {
+            let byte = display_row[c];
+            let (color, ch) = if c == centre_col && cue_screen_col == Some(c) {
+                (Color::Green, '\u{28FF}')
+            } else if c == centre_col {
+                (Color::White, '\u{28FF}')
+            } else if cue_screen_col == Some(c) {
+                (Color::Green, '\u{28FF}')
+            } else if byte != 0 {
+                (Color::Gray, char::from_u32(0x2800 | byte as u32).unwrap_or(' '))
+            } else {
+                (Color::Gray, ' ')
+            };
+            if color != run_color {
+                if !run.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut run), Style::default().fg(run_color)));
+                }
+                run_color = color;
+            }
+            run.push(ch);
+        }
+        if !run.is_empty() {
+            spans.push(Span::styled(run, Style::default().fg(run_color)));
+        }
+        detail_lines.push(Line::from(spans));
+    }
 
     frame.render_widget(Paragraph::new(detail_lines), detail_area);
 }

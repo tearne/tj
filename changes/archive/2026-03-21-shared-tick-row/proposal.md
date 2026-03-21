@@ -1,5 +1,5 @@
 # Proposal: Shared Tick Row
-**Status: Draft**
+**Status: Approved**
 
 ## Problem
 
