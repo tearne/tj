@@ -29,10 +29,14 @@
 | `Space+u` / `Space+7` | Deck A snap filter to flat |
 | `k` / `,` | Deck B level up / down |
 | `i` / `8` | Deck B filter sweep: `i` toward LPF, `8` toward HPF |
-| `x` / `s` | Deck A BPM +0.01 / −0.01 |
+| `x` / `s` | Deck A BPM +0.1 / −0.1 |
 | `X` / `S` | Deck A base BPM +0.01 / −0.01 |
-| `v` / `f` | Deck B BPM +0.01 / −0.01 |
+| `v` / `f` | Deck B BPM +0.1 / −0.1 |
 | `V` / `F` | Deck B base BPM +0.01 / −0.01 |
+| `Space+A` | Deck A cue play (jump to cue; maintain play state) |
+| `A` | Deck A cue set (paused only; snaps beat grid to cue position) |
+| `Space+D` | Deck B cue play |
+| `D` | Deck B cue set |
 
 **Global controls** (not deck-specific):
 | Key | Action |
@@ -63,9 +67,9 @@ The diagram below shows all default bindings across the keyboard. Each cell list
  Sp    │1-1Bt│1-4Bt│2-1Bt│2-4Bt│1 F= │2 F= │     │     │     │     │
 ── HOME ROW ───────────────────────────────────────────────────
  keys  │  a  │  s  │  d  │  f  │  j  │  k  │  '  │  #  │
- Sh    │     │1 bm-│     │2 bm-│     │     │1 T= │2 T= │
+ Sh    │1 CUE│1 bm-│2 CUE│2 bm-│     │     │1 T= │2 T= │
  --    │1 N> │1 BM-│2 N> │2 BM-│1 LV+│2 LV+│1 DET│2 DET│
- Sp    │1 CUE│     │2 CUE│     │1 MAX│2 MAX│     │     │
+ Sp    │1 CPL│     │2 CPL│     │1 MAX│2 MAX│     │     │
 ── BOTTOM ROW ─────────────────────────────────────────────────
  keys  │  z  │  x  │  c  │  v  │  b  │  n  │  m  │  ,  │
  Sh    │1 BRW│1 bm+│2 BRW│2 bm+│1 MTR│2 MTR│     │     │

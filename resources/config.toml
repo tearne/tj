@@ -44,8 +44,8 @@ deck1_jump_forward_1bt  = "space+1"
 deck1_jump_backward_1bt = "space+q"
 deck1_jump_forward_4bt  = "space+2"
 deck1_jump_backward_4bt = "space+w"
-deck1_cue               = "space+a"
-deck1_cue_play          = "A"
+deck1_cue               = "A"
+deck1_cue_play          = "space+a"
 
 # Deck 2
 deck2_play_pause        = "space+c"
@@ -77,8 +77,8 @@ deck2_jump_forward_1bt  = "space+3"
 deck2_jump_backward_1bt = "space+e"
 deck2_jump_forward_4bt  = "space+4"
 deck2_jump_backward_4bt = "space+r"
-deck2_cue               = "space+d"
-deck2_cue_play          = "D"
+deck2_cue               = "D"
+deck2_cue_play          = "space+d"
 
 [display]
 playhead_position = 20        # 0–100, percentage from left edge of detail panel
