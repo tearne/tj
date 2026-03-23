@@ -41,13 +41,50 @@ const OVERVIEW_RESOLUTION: usize = 4000;
 const ZOOM_LEVELS: &[f32] = &[1.0, 2.0, 4.0, 8.0, 16.0, 32.0];
 const DEFAULT_ZOOM_IDX: usize = 2; // 4 seconds
 const FADE_SAMPLES: i64 = 256;       // ~5.8ms at 44100 Hz — fade-out then fade-in around each seek
-/// Spectral colour palettes: (name, bass_rgb, treble_rgb).
-const SPECTRAL_PALETTES: &[(&str, (u8,u8,u8), (u8,u8,u8))] = &[
-    ("amber/cyan", (255, 140,   0), (  0, 200, 200)),
-    ("soft",       (200, 130,  50), ( 50, 190, 200)),
-    ("spectrum",   ( 80, 110, 220), (220, 200,  60)),
-    ("green",      (120, 200,  60), ( 60, 200, 170)),
+type Rgb = (u8, u8, u8);
+/// Four-stop spectral palette: (treble, mid-treble, mid-bass, bass).
+/// Stops are ordered from treble (bass_ratio=0) to bass (bass_ratio=1).
+type SpecPalette = (Rgb, Rgb, Rgb, Rgb);
+
+/// Colour schemes: (name, deck_a_palette, deck_b_palette).
+/// The first scheme is the default; cycling rotates through all.
+const PALETTE_SCHEMES: &[(&str, SpecPalette, SpecPalette)] = &[
+    ("amber/cyan",
+     ((  0, 255, 255), (  0, 255, 120), (220, 255,   0), (255, 120,   0)),  // cyan → teal → gold → amber
+     ((  0, 255, 255), (  0, 255, 120), (220, 255,   0), (255, 120,   0))), // B: same
+    ("warm-rainbow",
+     (( 60, 255,   0), (220, 255,   0), (255, 140,   0), (255,  20,   0)),  // lime → yellow → orange → red
+     (( 60, 255,   0), (220, 255,   0), (255, 140,   0), (255,  20,   0))), // B: same
+    ("sunset",
+     ((220, 220,   0), (255, 140,   0), (255,  20,  80), (180,   0, 200)),  // gold → orange → crimson → violet
+     ((220, 220,   0), (255, 140,   0), (255,  20,  80), (180,   0, 200))), // B: same
+    ("ember",
+     ((220, 200,   0), (255, 120,   0), (200,  20,   0), ( 80,   0,   0)),  // gold → orange → red → deep-red
+     ((220, 200,   0), (255, 120,   0), (200,  20,   0), ( 80,   0,   0))), // B: same
 ];
+
+/// Interpolate a four-stop spectral palette at `bass` ∈ [0,1] and scale by `brightness`.
+/// The interpolated colour is normalised so its dominant channel is always 255 before
+/// brightness is applied — this preserves full saturation at all bass ratios and ensures
+/// the hue is clearly identifiable even at low brightness.
+fn spectral_color(pal: SpecPalette, bass: f32, brightness: f32) -> ratatui::style::Color {
+    let stops = [pal.0, pal.1, pal.2, pal.3];
+    let t = (bass * 3.0).clamp(0.0, 3.0);
+    let seg = (t.floor() as usize).min(stops.len() - 2);
+    let f   = t.fract();
+    let (a, b) = (stops[seg], stops[seg + 1]);
+    let r = a.0 as f32 + f * (b.0 as f32 - a.0 as f32);
+    let g = a.1 as f32 + f * (b.1 as f32 - a.1 as f32);
+    let b_ = a.2 as f32 + f * (b.2 as f32 - a.2 as f32);
+    // Normalise to max channel = 255 so saturation is always 1.0 before dimming.
+    let max_ch = r.max(g).max(b_).max(1.0);
+    let norm = 255.0 / max_ch * brightness;
+    ratatui::style::Color::Rgb(
+        (r  * norm).round().clamp(0.0, 255.0) as u8,
+        (g  * norm).round().clamp(0.0, 255.0) as u8,
+        (b_ * norm).round().clamp(0.0, 255.0) as u8,
+    )
+}
 
 fn cleanup_terminal() {
     let _ = disable_raw_mode();
@@ -161,7 +198,7 @@ fn build_deck(
     cache:       &Cache,
 ) -> Deck {
     let track_name     = read_track_name(&path.to_string_lossy());
-    let total_duration = Duration::from_secs(mono.len() as u64 / sample_rate as u64);
+    let total_duration = mono.len() as f64 / sample_rate as f64;
     let mono           = Arc::new(mono);
     let waveform       = Arc::new(WaveformData::compute(Arc::clone(&mono), sample_rate));
 
@@ -268,6 +305,7 @@ fn tui_loop(
     }
     const DET_MIN: u16 = 3;
     let mut audio_latency_ms: i64 = ((cache.get_latency() as f64 / 10.0).round() as i64 * 10).clamp(0, 250);
+    let mut scheme_idx: usize = 0;
     let mut zoom_idx: usize = DEFAULT_ZOOM_IDX;
     let shared_renderer = SharedDetailRenderer::new(zoom_idx);
     let mut detail_height: usize = display_cfg.detail_height.max(DET_MIN as usize);
@@ -331,6 +369,9 @@ fn tui_loop(
                     let new_deck = build_deck(&pending.path, pending.filename, mono, stereo, sample_rate, channels, mixer, cache);
                     shared_renderer.set_deck(slot, Arc::clone(&new_deck.audio.waveform), new_deck.audio.seek_handle.channels, new_deck.audio.sample_rate);
                     decks[slot] = Some(new_deck);
+                    if let Some(ref mut d) = decks[slot] {
+                        d.display.palette = if slot == 0 { PALETTE_SCHEMES[scheme_idx].1 } else { PALETTE_SCHEMES[scheme_idx].2 };
+                    }
                 }
                 Ok(Err(e)) => {
                     global_notification = Some(Notification {
@@ -375,9 +416,9 @@ fn tui_loop(
             let audio_pos_samp = d.audio.seek_handle.position.load(Ordering::Relaxed)
                 / d.audio.seek_handle.channels as usize;
             let pos_dur        = Duration::from_secs_f64(audio_pos_samp as f64 / d.audio.sample_rate as f64);
-            let remaining      = d.total_duration.saturating_sub(pos_dur);
+            let remaining_secs = d.total_duration - pos_dur.as_secs_f64();
             let warning_active = !d.audio.player.is_paused()
-                && remaining < Duration::from_secs_f32(display_cfg.warning_threshold_secs);
+                && remaining_secs < display_cfg.warning_threshold_secs as f64;
             let beat_index     = smooth_pos_ns.div_euclid(beat_period.as_nanos() as i128);
             let warn_beat_on   = warning_active && (beat_index % 2 == 0);
             Some(DeckRenderState { display_samp, display_pos_samp, analysing, spinner_active, beat_on, warning_active, warn_beat_on })
@@ -496,7 +537,7 @@ fn tui_loop(
                 let h = area_detail_a.height as usize;
                 if w > 0 && h > 0 {
                     shared_renderer.cols.store(w, Ordering::Relaxed);
-                    shared_renderer.rows.store(h.saturating_sub(1), Ordering::Relaxed);
+                    shared_renderer.rows.store(h, Ordering::Relaxed);
                 }
             }
 
@@ -509,7 +550,7 @@ fn tui_loop(
                 let spc_label = if space_held { "  [SPC]" } else { "" };
                 frame.render_widget(
                     Paragraph::new(Line::from(Span::styled(
-                        format!("  zoom:{}s  lat:{}ms{}{}", zoom_secs, audio_latency_ms, nudge_label, spc_label),
+                        format!("  zoom:{}s  lat:{}ms{}{}  palette:{}", zoom_secs, audio_latency_ms, nudge_label, spc_label, PALETTE_SCHEMES[scheme_idx].0),
                         Style::default().fg(Color::Rgb(60, 60, 60)),
                     ))),
                     area_detail_info,
@@ -551,7 +592,7 @@ fn tui_loop(
                 deck.display.last_bar_cols  = bar_cols;
                 deck.display.last_bar_times = bar_times;
                 frame.render_widget(Paragraph::new(ov), area_overview_a);
-                render_detail_waveform(frame, &buf_a, deck, area_detail_a, &display_cfg, rs.display_pos_samp, Some((&shared_tick_a, &shared_tick_b)));
+                render_detail_waveform(frame, &buf_a, deck, area_detail_a, &display_cfg, rs.display_pos_samp, Some((&shared_tick_a, &shared_tick_b)), deck.display.palette);
             } else {
                 let mut spans = vec![Span::styled("A ", label_style)];
                 if let Some(ref s) = loading_label[0] {
@@ -578,7 +619,7 @@ fn tui_loop(
                 deck.display.last_bar_cols  = bar_cols;
                 deck.display.last_bar_times = bar_times;
                 frame.render_widget(Paragraph::new(ov), area_overview_b);
-                render_detail_waveform(frame, &buf_b, deck, area_detail_b, &display_cfg, rs.display_pos_samp, None);
+                render_detail_waveform(frame, &buf_b, deck, area_detail_b, &display_cfg, rs.display_pos_samp, None, deck.display.palette);
             } else {
                 let mut spans = vec![Span::styled("B ", label_style)];
                 if let Some(ref s) = loading_label[1] {
@@ -752,15 +793,13 @@ Esc                  close this / quit";
                     {
                         if let Some(ref mut d) = decks[0] {
                             if let Some(cue_samp) = d.cue_sample {
-                                let was_playing = !d.audio.player.is_paused();
-                                d.audio.seek_handle.seek_direct(cue_samp as f64 / d.audio.sample_rate as f64);
-                                if was_playing {
-                                    let latency_samps = (audio_latency_ms as f64 * d.audio.sample_rate as f64 / 1000.0) as usize;
-                                    d.display.smooth_display_samp = (cue_samp + latency_samps) as f64;
-                                    if d.filter_offset != 0 { d.audio.filter_state_reset.store(true, Ordering::Relaxed); }
-                                    d.audio.player.play();
-                                } else {
+                                if d.audio.player.is_paused() {
+                                    d.audio.seek_handle.seek_direct(cue_samp as f64 / d.audio.sample_rate as f64);
                                     d.display.smooth_display_samp = cue_samp as f64;
+                                } else {
+                                    let latency_samps = (audio_latency_ms as f64 * d.audio.sample_rate as f64 / 1000.0) as usize;
+                                    let target_samp = (cue_samp + latency_samps).min(d.audio.seek_handle.samples.len() / d.audio.seek_handle.channels as usize);
+                                    d.audio.seek_handle.seek_to(target_samp as f64 / d.audio.sample_rate as f64);
                                 }
                             }
                             space_held = false;
@@ -772,15 +811,13 @@ Esc                  close this / quit";
                     {
                         if let Some(ref mut d) = decks[1] {
                             if let Some(cue_samp) = d.cue_sample {
-                                let was_playing = !d.audio.player.is_paused();
-                                d.audio.seek_handle.seek_direct(cue_samp as f64 / d.audio.sample_rate as f64);
-                                if was_playing {
-                                    let latency_samps = (audio_latency_ms as f64 * d.audio.sample_rate as f64 / 1000.0) as usize;
-                                    d.display.smooth_display_samp = (cue_samp + latency_samps) as f64;
-                                    if d.filter_offset != 0 { d.audio.filter_state_reset.store(true, Ordering::Relaxed); }
-                                    d.audio.player.play();
-                                } else {
+                                if d.audio.player.is_paused() {
+                                    d.audio.seek_handle.seek_direct(cue_samp as f64 / d.audio.sample_rate as f64);
                                     d.display.smooth_display_samp = cue_samp as f64;
+                                } else {
+                                    let latency_samps = (audio_latency_ms as f64 * d.audio.sample_rate as f64 / 1000.0) as usize;
+                                    let target_samp = (cue_samp + latency_samps).min(d.audio.seek_handle.samples.len() / d.audio.seek_handle.channels as usize);
+                                    d.audio.seek_handle.seek_to(target_samp as f64 / d.audio.sample_rate as f64);
                                 }
                             }
                             space_held = false;
@@ -817,7 +854,7 @@ Esc                  close this / quit";
                             match d.nudge_mode {
                                 NudgeMode::Jump => {
                                     let current = d.audio.seek_handle.current_pos().as_secs_f64();
-                                    let target = (current + 0.010).min(d.total_duration.as_secs_f64());
+                                    let target = (current + 0.010).min(d.total_duration);
                                     d.audio.seek_handle.set_position(target);
                                     d.display.smooth_display_samp += (target - current) * d.audio.sample_rate as f64;
                                     if d.audio.player.is_paused() {
@@ -873,7 +910,7 @@ Esc                  close this / quit";
                             match d.nudge_mode {
                                 NudgeMode::Jump => {
                                     let current = d.audio.seek_handle.current_pos().as_secs_f64();
-                                    let target = (current + 0.010).min(d.total_duration.as_secs_f64());
+                                    let target = (current + 0.010).min(d.total_duration);
                                     d.audio.seek_handle.set_position(target);
                                     d.display.smooth_display_samp += (target - current) * d.audio.sample_rate as f64;
                                     if d.audio.player.is_paused() {
@@ -1170,11 +1207,11 @@ Esc                  close this / quit";
                         shared_renderer.style.store(1 - s, Ordering::Relaxed);
                     }
                     Some(Action::PaletteCycle) => {
-                        let next = decks.iter().flatten().next()
-                            .map(|d| (d.display.palette_idx + 1) % SPECTRAL_PALETTES.len())
-                            .unwrap_or(0);
+                        scheme_idx = (scheme_idx + 1) % PALETTE_SCHEMES.len();
                         for slot in 0..2 {
-                            if let Some(ref mut d) = decks[slot] { d.display.palette_idx = next; }
+                            if let Some(ref mut d) = decks[slot] {
+                                d.display.palette = if slot == 0 { PALETTE_SCHEMES[scheme_idx].1 } else { PALETTE_SCHEMES[scheme_idx].2 };
+                            }
                         }
                     }
                     Some(Action::Deck1OffsetIncrease) => {
@@ -1408,15 +1445,13 @@ Esc                  close this / quit";
                     Some(Action::Deck1CuePlay) => {
                         if let Some(ref mut d) = decks[0] {
                             if let Some(cue_samp) = d.cue_sample {
-                                let was_playing = !d.audio.player.is_paused();
-                                d.audio.seek_handle.seek_direct(cue_samp as f64 / d.audio.sample_rate as f64);
-                                if was_playing {
-                                    let latency_samps = (audio_latency_ms as f64 * d.audio.sample_rate as f64 / 1000.0) as usize;
-                                    d.display.smooth_display_samp = (cue_samp + latency_samps) as f64;
-                                    if d.filter_offset != 0 { d.audio.filter_state_reset.store(true, Ordering::Relaxed); }
-                                    d.audio.player.play();
-                                } else {
+                                if d.audio.player.is_paused() {
+                                    d.audio.seek_handle.seek_direct(cue_samp as f64 / d.audio.sample_rate as f64);
                                     d.display.smooth_display_samp = cue_samp as f64;
+                                } else {
+                                    let latency_samps = (audio_latency_ms as f64 * d.audio.sample_rate as f64 / 1000.0) as usize;
+                                    let target_samp = (cue_samp + latency_samps).min(d.audio.seek_handle.samples.len() / d.audio.seek_handle.channels as usize);
+                                    d.audio.seek_handle.seek_to(target_samp as f64 / d.audio.sample_rate as f64);
                                 }
                             }
                         }
@@ -1424,15 +1459,13 @@ Esc                  close this / quit";
                     Some(Action::Deck2CuePlay) => {
                         if let Some(ref mut d) = decks[1] {
                             if let Some(cue_samp) = d.cue_sample {
-                                let was_playing = !d.audio.player.is_paused();
-                                d.audio.seek_handle.seek_direct(cue_samp as f64 / d.audio.sample_rate as f64);
-                                if was_playing {
-                                    let latency_samps = (audio_latency_ms as f64 * d.audio.sample_rate as f64 / 1000.0) as usize;
-                                    d.display.smooth_display_samp = (cue_samp + latency_samps) as f64;
-                                    if d.filter_offset != 0 { d.audio.filter_state_reset.store(true, Ordering::Relaxed); }
-                                    d.audio.player.play();
-                                } else {
+                                if d.audio.player.is_paused() {
+                                    d.audio.seek_handle.seek_direct(cue_samp as f64 / d.audio.sample_rate as f64);
                                     d.display.smooth_display_samp = cue_samp as f64;
+                                } else {
+                                    let latency_samps = (audio_latency_ms as f64 * d.audio.sample_rate as f64 / 1000.0) as usize;
+                                    let target_samp = (cue_samp + latency_samps).min(d.audio.seek_handle.samples.len() / d.audio.seek_handle.channels as usize);
+                                    d.audio.seek_handle.seek_to(target_samp as f64 / d.audio.sample_rate as f64);
                                 }
                             }
                         }
@@ -1682,11 +1715,9 @@ fn notification_line_for_deck(deck: &Deck) -> Line<'static> {
         };
         Line::from(Span::styled(n.message.clone(), Style::default().fg(color)))
     } else {
-        let (_, _, (tr, tg, tb)) = SPECTRAL_PALETTES[deck.display.palette_idx];
-        let muted = |c: u8| (c as f32 * 0.55) as u8;
         Line::from(Span::styled(
             deck.track_name.clone(),
-            Style::default().fg(Color::Rgb(muted(tr), muted(tg), muted(tb))),
+            Style::default().fg(spectral_color(deck.display.palette, 0.0, 0.55)),
         ))
     }
 }
@@ -1826,16 +1857,16 @@ fn overview_for_deck(
     let overview_width  = rect.width  as usize;
     let overview_height = rect.height as usize;
     let total_peaks = deck.audio.waveform.peaks.len();
-    let playhead_frac = if deck.total_duration.is_zero() {
+    let playhead_frac = if deck.total_duration == 0.0 {
         0.0
     } else {
-        (display_samp / deck.audio.sample_rate as f64 / deck.total_duration.as_secs_f64()).clamp(0.0, 1.0)
+        (display_samp / deck.audio.sample_rate as f64 / deck.total_duration).clamp(0.0, 1.0)
     };
     let playhead_col = ((playhead_frac * overview_width as f64).round() as usize)
         .min(overview_width.saturating_sub(1));
     let cue_col: Option<usize> = deck.cue_sample.map(|samp| {
         let frac = (samp as f64 / deck.audio.sample_rate as f64
-            / deck.total_duration.as_secs_f64()).clamp(0.0, 1.0);
+            / deck.total_duration).clamp(0.0, 1.0);
         ((frac * overview_width as f64).round() as usize)
             .min(overview_width.saturating_sub(1))
     });
@@ -1854,7 +1885,7 @@ fn overview_for_deck(
         .map(|c| (ov_bass_hires[c * 2] + ov_bass_hires[c * 2 + 1]) / 2.0)
         .collect();
     let (bar_cols, bar_times, bars_per_tick): (Vec<usize>, Vec<f64>, u32) = if !analysing {
-        bar_tick_cols(deck.tempo.base_bpm as f64, deck.tempo.offset_ms, deck.total_duration.as_secs_f64(), overview_width)
+        bar_tick_cols(deck.tempo.base_bpm as f64, deck.tempo.offset_ms, deck.total_duration, overview_width)
     } else {
         (Vec::new(), Vec::new(), 4)
     };
@@ -1878,14 +1909,14 @@ fn overview_for_deck(
                     (Color::DarkGray, lch)
                 } else if c == playhead_col && cue_col == Some(c) {
                     if r == 0 || r + 1 == overview_height {
-                        (Color::Green, '\u{28FF}')
+                        (Color::Rgb(255, 0, 255), '\u{28FF}')
                     } else {
-                        (Color::White, '\u{28FF}')
+                        (Color::Rgb(255, 255, 255), '\u{28FF}')
                     }
                 } else if c == playhead_col {
-                    (Color::White, '\u{28FF}')
+                    (Color::Rgb(255, 255, 255), '\u{28FF}')
                 } else if cue_col == Some(c) {
-                    (Color::Green, '\u{28FF}')
+                    (Color::Rgb(255, 0, 255), '\u{28FF}')
                 } else if bar_cols.contains(&c) {
                     if warn_beat_on {
                         (Color::Rgb(120, 60, 60), '│')
@@ -1895,13 +1926,7 @@ fn overview_for_deck(
                         (Color::DarkGray, '│')
                     }
                 } else {
-                    let r_val = ov_bass[c];
-                    let (_, (br, bg, bb), (tr, tg, tb)) = SPECTRAL_PALETTES[deck.display.palette_idx];
-                    let spectral = Color::Rgb(
-                        (br as f32 * r_val + tr as f32 * (1.0 - r_val)) as u8,
-                        (bg as f32 * r_val + tg as f32 * (1.0 - r_val)) as u8,
-                        (bb as f32 * r_val + tb as f32 * (1.0 - r_val)) as u8,
-                    );
+                    let spectral = spectral_color(deck.display.palette, ov_bass[c], 0.8);
                     (spectral, char::from_u32(0x2800 | byte as u32).unwrap_or(' '))
                 };
                 if color != run_color {
@@ -2133,6 +2158,7 @@ fn render_detail_waveform(
     display_cfg: &DisplayConfig,
     display_pos_samp: usize,
     shared_tick: Option<(&[u8], &[u8])>,
+    palette: SpecPalette,
 ) {
     let detail_width      = detail_area.width  as usize;
     let detail_panel_rows = detail_area.height as usize;
@@ -2219,18 +2245,21 @@ fn render_detail_waveform(
             let mut run = String::new();
             let mut run_color = Color::Reset;
             for (c, &byte) in row.iter().enumerate() {
+                let buf_col  = viewport_start.unwrap_or(0) + c;
+                let bass     = buf.bass_ratio.get(buf_col).copied().unwrap_or(0.5);
+                let spectral = spectral_color(palette, bass, 1.0);
                 let (color, ch) = if c == centre_col && cue_screen_col == Some(c) {
                     if is_edge_row {
-                        (Color::Green, '\u{28FF}')
+                        (Color::Rgb(255, 0, 255), '\u{28FF}')
                     } else {
-                        (Color::White, '\u{28FF}')
+                        (Color::Rgb(255, 255, 255), '\u{28FF}')
                     }
                 } else if c == centre_col {
-                    (Color::White, '\u{28FF}')
+                    (Color::Rgb(255, 255, 255), '\u{28FF}')
                 } else if cue_screen_col == Some(c) {
-                    (Color::Green, '\u{28FF}')
+                    (Color::Rgb(255, 0, 255), '\u{28FF}')
                 } else {
-                    (Color::Cyan, char::from_u32(0x2800 | byte as u32).unwrap_or(' '))
+                    (spectral, char::from_u32(0x2800 | byte as u32).unwrap_or(' '))
                 };
                 if color != run_color {
                     if !run.is_empty() {
@@ -2256,11 +2285,11 @@ fn render_detail_waveform(
         for c in 0..detail_width {
             let byte = display_row[c];
             let (color, ch) = if c == centre_col && cue_screen_col == Some(c) {
-                (Color::Green, '\u{28FF}')
+                (Color::Rgb(255, 0, 255), '\u{28FF}')
             } else if c == centre_col {
-                (Color::White, '\u{28FF}')
+                (Color::Rgb(255, 255, 255), '\u{28FF}')
             } else if cue_screen_col == Some(c) {
-                (Color::Green, '\u{28FF}')
+                (Color::Rgb(255, 0, 255), '\u{28FF}')
             } else if byte != 0 {
                 (Color::Gray, char::from_u32(0x2800 | byte as u32).unwrap_or(' '))
             } else {
@@ -2292,6 +2321,7 @@ fn render_detail_waveform(
 /// a full recompute every time the playhead advances by one column.
 struct BrailleBuffer {
     grid:            Vec<Vec<u8>>, // rows × buf_cols braille bytes
+    bass_ratio:      Vec<f32>,     // per-column bass ratio in [0,1]: 1=bass, 0=treble
     buf_cols:        usize,        // total buffer width (= 3 × screen_cols)
     anchor_sample:   usize,        // mono-sample index at the buffer centre
     samples_per_col: usize,        // mono samples represented by each buffer column
@@ -2299,7 +2329,7 @@ struct BrailleBuffer {
 
 impl BrailleBuffer {
     fn empty() -> Self {
-        Self { grid: Vec::new(), buf_cols: 0, anchor_sample: 0, samples_per_col: 1 }
+        Self { grid: Vec::new(), bass_ratio: Vec::new(), buf_cols: 0, anchor_sample: 0, samples_per_col: 1 }
     }
 }
 
@@ -2358,7 +2388,7 @@ struct DisplayState {
     overview_rect: ratatui::layout::Rect,
     last_bar_cols: Vec<usize>,
     last_bar_times: Vec<f64>,
-    palette_idx: usize,
+    palette: SpecPalette,
 }
 
 struct SpectrumState {
@@ -2521,6 +2551,7 @@ impl SharedDetailRenderer {
                                 &peaks_for_slot(&wf_a, anchor_a, col_samp_a, buf_cols),
                                 rows, buf_cols, style == 1,
                             ),
+                            bass_ratio:      spectral_for_slot(&wf_a, anchor_a, col_samp_a, buf_cols, sr_a as u32),
                             buf_cols,
                             anchor_sample:   anchor_a,
                             samples_per_col: col_samp_a,
@@ -2530,6 +2561,7 @@ impl SharedDetailRenderer {
                                 &peaks_for_slot(&wf_b, anchor_b, col_samp_b, buf_cols),
                                 rows, buf_cols, style == 1,
                             ),
+                            bass_ratio:      spectral_for_slot(&wf_b, anchor_b, col_samp_b, buf_cols, sr_b as u32),
                             buf_cols,
                             anchor_sample:   anchor_b,
                             samples_per_col: col_samp_b,
@@ -2625,10 +2657,55 @@ fn peaks_for_slot(
     }).collect()
 }
 
+/// Compute per-column bass ratio directly from raw samples using an IIR low-pass,
+/// smoothed with a box filter to avoid sharp colour transitions at wide zoom.
+fn spectral_for_slot(
+    wf: &Option<Arc<WaveformData>>,
+    anchor: usize,
+    col_samp: usize,
+    buf_cols: usize,
+    sample_rate: u32,
+) -> Vec<f32> {
+    let Some(wf) = wf else {
+        return vec![0.5; buf_cols];
+    };
+    let mono  = &wf.mono;
+    let alpha = {
+        let rc = 1.0 / (2.0 * std::f32::consts::PI * 250.0);
+        let dt = 1.0 / sample_rate as f32;
+        dt / (rc + dt)
+    };
+    let bass_raw: Vec<f32> = (0..buf_cols).map(|c| {
+        let offset    = c as i64 - (buf_cols / 2) as i64;
+        let raw_start = anchor as i64 + offset * col_samp as i64;
+        if raw_start < 0 || raw_start as usize >= mono.len() {
+            return 0.5;
+        }
+        let samp_start = raw_start as usize;
+        let chunk = &mono[samp_start..(samp_start + col_samp).min(mono.len())];
+        if chunk.is_empty() { return 0.5; }
+        let total_energy: f32 = chunk.iter().map(|&s| s * s).sum::<f32>() / chunk.len() as f32;
+        let mut lp = 0.0f32;
+        let lp_energy: f32 = chunk.iter().map(|&s| { lp += alpha * (s - lp); lp * lp })
+            .sum::<f32>() / chunk.len() as f32;
+        (lp_energy / (total_energy + 1e-10)).clamp(0.0, 1.0)
+    }).collect();
+    box_smooth(&bass_raw, 3)
+}
+
+fn box_smooth(v: &[f32], radius: usize) -> Vec<f32> {
+    let n = v.len();
+    (0..n).map(|i| {
+        let lo = i.saturating_sub(radius);
+        let hi = (i + radius + 1).min(n);
+        v[lo..hi].iter().sum::<f32>() / (hi - lo) as f32
+    }).collect()
+}
+
 struct Deck {
     filename: String,
     track_name: String,
-    total_duration: Duration,
+    total_duration: f64,
     volume: f32,
     filter_offset: i32,
     nudge: i8,
@@ -2649,7 +2726,7 @@ impl Deck {
     fn new(
         filename: String,
         track_name: String,
-        total_duration: Duration,
+        total_duration: f64,
         audio: DeckAudio,
         bpm_rx: mpsc::Receiver<(String, f32, i64, bool)>,
     ) -> Self {
@@ -2690,7 +2767,7 @@ impl Deck {
                 overview_rect: ratatui::layout::Rect::default(),
                 last_bar_cols: Vec::new(),
                 last_bar_times: Vec::new(),
-                palette_idx: 0,
+                palette: PALETTE_SCHEMES[0].1, // corrected to slot-specific palette on load
             },
             spectrum: SpectrumState {
                 chars: ['\u{2800}'; 16],
@@ -3161,16 +3238,24 @@ fn compute_spectrum(mono: &[f32], pos: usize, sample_rate: u32, filter_offset: i
 }
 
 /// Beat-jump helper. Positive `beats` = forward, negative = backward.
-fn do_jump(seek_handle: &SeekHandle, player: &rodio::Player, bpm: f32, total_duration: std::time::Duration, beats: i32) {
-    let jump = beats.unsigned_abs() as f64 * 60.0 / bpm as f64;
+///
+/// While playing: swallow jumps that would hit either end-stop (preserves beat alignment).
+/// Forward guard keeps at least one jump-size from the end.
+/// While paused: clamp to boundaries so the user can navigate to the start or end deliberately.
+fn do_jump(seek_handle: &SeekHandle, player: &rodio::Player, bpm: f32, track_end: f64, beats: i32) {
+    let jump    = beats.unsigned_abs() as f64 * 60.0 / bpm as f64;
+    let current = seek_handle.current_pos().as_secs_f64();
+    let playing = !player.is_paused();
     if beats < 0 {
-        let target = (seek_handle.current_pos().as_secs_f64() - jump).max(0.0);
-        if player.is_paused() { seek_handle.seek_direct(target); } else { seek_handle.seek_to(target); }
+        let target = current - jump;
+        if playing && target < 0.0 { return; }
+        let clamped = target.max(0.0);
+        if playing { seek_handle.seek_to(clamped); } else { seek_handle.seek_direct(clamped); }
     } else {
-        let target = seek_handle.current_pos().as_secs_f64() + jump;
-        if target < total_duration.as_secs_f64() {
-            if player.is_paused() { seek_handle.seek_direct(target); } else { seek_handle.seek_to(target); }
-        }
+        let target = current + jump;
+        if playing && target + jump > track_end { return; }
+        let clamped = target.min(track_end);
+        if playing { seek_handle.seek_to(clamped); } else { seek_handle.seek_direct(clamped); }
     }
 }
 
@@ -3292,17 +3377,24 @@ impl WaveformData {
     fn compute(mono: Arc<Vec<f32>>, sample_rate: u32) -> Self {
         let n = mono.len();
         let chunk_size = (n / OVERVIEW_RESOLUTION).max(1);
-        // k: spectral rate at crossover (250 Hz); bass_ratio = 0.5 at this frequency.
-        let k = (2.0 * std::f32::consts::TAU * 250.0 / sample_rate as f32).max(1e-6);
+        // First-order IIR low-pass at 250 Hz; bass_ratio = lp_energy / total_energy.
+        let alpha = {
+            let rc = 1.0 / (2.0 * std::f32::consts::PI * 250.0);
+            let dt = 1.0 / sample_rate as f32;
+            dt / (rc + dt)
+        };
+        let mut lp = 0.0f32;
         let (peaks, bass_ratio) = mono
             .chunks(chunk_size)
             .map(|chunk| {
                 let min = chunk.iter().cloned().fold(f32::INFINITY, f32::min);
                 let max = chunk.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let total_energy: f32 = chunk.iter().map(|&s| s * s).sum::<f32>() / chunk.len() as f32;
-                let diff_energy: f32 = chunk.windows(2).map(|w| (w[1] - w[0]).powi(2)).sum::<f32>()
-                    / (chunk.len() as f32 - 1.0).max(1.0);
-                let bass = (1.0 - (diff_energy / (total_energy + 1e-10)).sqrt() / k).clamp(0.0, 1.0);
+                let lp_energy: f32 = chunk.iter().map(|&s| {
+                    lp += alpha * (s - lp);
+                    lp * lp
+                }).sum::<f32>() / chunk.len() as f32;
+                let bass = (lp_energy / (total_energy + 1e-10)).clamp(0.0, 1.0);
                 ((min.max(-1.0), max.min(1.0)), bass)
             })
             .unzip();
