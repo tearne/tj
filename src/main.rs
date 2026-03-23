@@ -2,7 +2,7 @@ use std::io;
 use color_eyre::Result as EyreResult;
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -91,8 +91,37 @@ fn cleanup_terminal() {
     let _ = io::stdout().execute(PopKeyboardEnhancementFlags).and_then(|s| s.execute(DisableMouseCapture)).and_then(|s| s.execute(LeaveAlternateScreen));
 }
 
+fn panic_log_path() -> std::path::PathBuf {
+    home_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join(".local/share/tj/panic.log")
+}
+
 fn main() {
     color_eyre::install().expect("color_eyre initialisation should succeed at startup");
+
+    // Chain a file-writing hook around color_eyre's hook so panics are preserved
+    // even when the terminal is in raw mode and stderr is invisible.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let log_path = panic_log_path();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let thread = std::thread::current();
+        let thread_name = thread.name().unwrap_or("<unnamed>");
+        let msg = format!(
+            "[{timestamp}] thread '{thread_name}' {info}\n",
+        );
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&log_path, &msg);
+        cleanup_terminal();
+        prev_hook(info);
+    }));
+
     let args: Vec<String> = std::env::args().collect();
 
     let arg = args.get(1).map(std::path::PathBuf::from);
@@ -322,6 +351,8 @@ fn tui_loop(
     let mut space_repeat_suppressed = false;
     let mut space_saw_event_this_frame = false;
     let mut pending_quit = false;
+    let mut bpm_ramp_started: Option<Instant> = None;
+    let mut bpm_ramp_last: Option<Instant> = None;
     // When Esc dismisses an overlay, suppress the next Quit action for a short window.
     // This absorbs the duplicate Esc event that Kitty injects after the first one.
     let mut suppress_quit_until: Option<Instant> = None;
@@ -537,8 +568,18 @@ fn tui_loop(
                 let h = area_detail_a.height as usize;
                 if w > 0 && h > 0 {
                     shared_renderer.cols.store(w, Ordering::Relaxed);
-                    shared_renderer.rows.store(h, Ordering::Relaxed);
+                    shared_renderer.rows.store(h.saturating_sub(1), Ordering::Relaxed);
                 }
+            }
+
+            // Update tempo and cue state for background buffer rendering.
+            for (slot, deck) in [(0usize, d0.as_ref()), (1, d1.as_ref())] {
+                let (base_bpm, offset_ms, analysing, cue_sample) = deck.map(|d| {
+                    let analysing = d.tempo.analysis_hash.is_none() || !d.tempo.bpm_established;
+                    (d.tempo.base_bpm, d.tempo.offset_ms, analysing, d.cue_sample)
+                }).unwrap_or((0.0, 0, true, None));
+                shared_renderer.store_tempo(slot, base_bpm, offset_ms, analysing);
+                shared_renderer.store_cue(slot, cue_sample);
             }
 
             // Detail info bar
@@ -551,7 +592,7 @@ fn tui_loop(
                 frame.render_widget(
                     Paragraph::new(Line::from(Span::styled(
                         format!("  zoom:{}s  lat:{}ms{}{}  palette:{}", zoom_secs, audio_latency_ms, nudge_label, spc_label, PALETTE_SCHEMES[scheme_idx].0),
-                        Style::default().fg(Color::Rgb(60, 60, 60)),
+                        Style::default().fg(Color::DarkGray),
                     ))),
                     area_detail_info,
                 );
@@ -560,23 +601,17 @@ fn tui_loop(
             let label_style = Style::default().fg(Color::Rgb(40, 60, 100));
             let notif_bg    = Style::default().bg(Color::Rgb(20, 20, 38));
 
-            // Pre-compute shared tick row: separate beat grids for deck A and deck B.
+            // Extract shared tick rows from pre-rendered buffer data.
             let (shared_tick_a, shared_tick_b): (Vec<u8>, Vec<u8>) = {
                 let w = area_detail_a.width as usize;
                 let centre_col = ((w as f64 * display_cfg.playhead_position as f64 / 100.0) as usize)
                     .clamp(0, w.saturating_sub(1));
-                let tick_for = |buf: &Arc<BrailleBuffer>, deck: Option<&Deck>, pos: usize| -> Vec<u8> {
-                    let Some(deck) = deck else { return vec![0u8; w]; };
-                    let analysing = deck.tempo.analysis_hash.is_none() || !deck.tempo.bpm_established;
-                    let mvs = if buf.samples_per_col > 0 {
-                        pos as f64 - centre_col as f64 * buf.samples_per_col as f64
-                    } else { 0.0 };
-                    compute_tick_display(w, buf.samples_per_col, mvs, analysing,
-                        deck.tempo.base_bpm, deck.audio.sample_rate, deck.tempo.offset_ms)
-                };
                 let pos_a = render[0].as_ref().map(|rs| rs.display_pos_samp).unwrap_or(0);
                 let pos_b = render[1].as_ref().map(|rs| rs.display_pos_samp).unwrap_or(0);
-                (tick_for(&buf_a, d0.as_ref(), pos_a), tick_for(&buf_b, d1.as_ref(), pos_b))
+                (
+                    extract_tick_viewport(&buf_a, pos_a, centre_col, w),
+                    extract_tick_viewport(&buf_b, pos_b, centre_col, w),
+                )
             };
 
             // ---- Deck A ----
@@ -651,10 +686,10 @@ fn tui_loop(
                 } else {
                     Line::from(Span::styled(
                         format!("  {}", browser_dir.display()),
-                        Style::default().fg(Color::Rgb(50, 50, 50)),
+                        Style::default().fg(Color::DarkGray),
                     ))
                 };
-                frame.render_widget(Paragraph::new(global_line), area_global);
+                frame.render_widget(Paragraph::new(global_line).style(notif_bg), area_global);
             }
 
             // Help popup
@@ -937,6 +972,43 @@ Esc                  close this / quit";
                         }
                     }
                     _ => {}
+                }
+                // Base BPM ramp — fires on Press and Repeat with time-based step size.
+                // The ramp resets only when no base-BPM key has been seen for >500 ms,
+                // so a quick release-and-repress continues at the current tier.
+                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                    && matches!(keymap.get(&KeyBinding::Key(key.code)),
+                        Some(&Action::Deck1BaseBpmIncrease) | Some(&Action::Deck1BaseBpmDecrease) |
+                        Some(&Action::Deck2BaseBpmIncrease) | Some(&Action::Deck2BaseBpmDecrease))
+                {
+                    let gap = bpm_ramp_last.map_or(Duration::MAX, |t| t.elapsed());
+                    if gap > Duration::from_millis(80) {
+                        bpm_ramp_started = Some(Instant::now());
+                    }
+                    bpm_ramp_last = Some(Instant::now());
+                    let elapsed = bpm_ramp_started.map_or(Duration::ZERO, |t| t.elapsed());
+                    let step: f32 = if elapsed >= Duration::from_secs(3) { 0.05 }
+                                    else { 0.01 };
+                    let action = keymap.get(&KeyBinding::Key(key.code));
+                    let (slot, sign) = match action {
+                        Some(&Action::Deck1BaseBpmIncrease) => (0,  1.0f32),
+                        Some(&Action::Deck1BaseBpmDecrease) => (0, -1.0f32),
+                        Some(&Action::Deck2BaseBpmIncrease) => (1,  1.0f32),
+                        _                                   => (1, -1.0f32),
+                    };
+                    if let Some(ref mut d) = decks[slot] {
+                        d.tempo.base_bpm = (d.tempo.base_bpm + sign * step).clamp(40.0, 240.0);
+                        d.tempo.bpm_established = true;
+                        d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm);
+                        shared_renderer.store_speed_ratio(slot, d.tempo.bpm, d.tempo.base_bpm);
+                        anchor_beat_grid_to_cue(d);
+                        if let Some(ref hash) = d.tempo.analysis_hash {
+                            if let Some(entry) = cache.get(hash.as_str()).cloned() {
+                                cache.set(hash.clone(), CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, ..entry });
+                                cache.save();
+                            }
+                        }
+                    }
                 }
                 // All other actions fire on Press only.
                 if key.kind == KeyEventKind::Press {
@@ -1274,70 +1346,6 @@ Esc                  close this / quit";
                             anchor_beat_grid_to_cue(d);
                         }
                     }
-                    Some(Action::Deck1BaseBpmIncrease) => {
-                        if let Some(ref mut d) = decks[0] {
-                            d.tempo.base_bpm = (d.tempo.base_bpm + 0.01).min(240.0);
-                            d.tempo.bpm = d.tempo.base_bpm;
-                            d.tempo.bpm_established = true;
-                            d.audio.player.set_speed(1.0);
-                            shared_renderer.store_speed_ratio(0, d.tempo.bpm, d.tempo.base_bpm);
-                            anchor_beat_grid_to_cue(d);
-                            if let Some(ref hash) = d.tempo.analysis_hash {
-                                if let Some(entry) = cache.get(hash.as_str()).cloned() {
-                                    cache.set(hash.clone(), CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, ..entry });
-                                    cache.save();
-                                }
-                            }
-                        }
-                    }
-                    Some(Action::Deck1BaseBpmDecrease) => {
-                        if let Some(ref mut d) = decks[0] {
-                            d.tempo.base_bpm = (d.tempo.base_bpm - 0.01).max(40.0);
-                            d.tempo.bpm = d.tempo.base_bpm;
-                            d.tempo.bpm_established = true;
-                            d.audio.player.set_speed(1.0);
-                            shared_renderer.store_speed_ratio(0, d.tempo.bpm, d.tempo.base_bpm);
-                            anchor_beat_grid_to_cue(d);
-                            if let Some(ref hash) = d.tempo.analysis_hash {
-                                if let Some(entry) = cache.get(hash.as_str()).cloned() {
-                                    cache.set(hash.clone(), CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, ..entry });
-                                    cache.save();
-                                }
-                            }
-                        }
-                    }
-                    Some(Action::Deck2BaseBpmIncrease) => {
-                        if let Some(ref mut d) = decks[1] {
-                            d.tempo.base_bpm = (d.tempo.base_bpm + 0.01).min(240.0);
-                            d.tempo.bpm = d.tempo.base_bpm;
-                            d.tempo.bpm_established = true;
-                            d.audio.player.set_speed(1.0);
-                            shared_renderer.store_speed_ratio(1, d.tempo.bpm, d.tempo.base_bpm);
-                            anchor_beat_grid_to_cue(d);
-                            if let Some(ref hash) = d.tempo.analysis_hash {
-                                if let Some(entry) = cache.get(hash.as_str()).cloned() {
-                                    cache.set(hash.clone(), CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, ..entry });
-                                    cache.save();
-                                }
-                            }
-                        }
-                    }
-                    Some(Action::Deck2BaseBpmDecrease) => {
-                        if let Some(ref mut d) = decks[1] {
-                            d.tempo.base_bpm = (d.tempo.base_bpm - 0.01).max(40.0);
-                            d.tempo.bpm = d.tempo.base_bpm;
-                            d.tempo.bpm_established = true;
-                            d.audio.player.set_speed(1.0);
-                            shared_renderer.store_speed_ratio(1, d.tempo.bpm, d.tempo.base_bpm);
-                            anchor_beat_grid_to_cue(d);
-                            if let Some(ref hash) = d.tempo.analysis_hash {
-                                if let Some(entry) = cache.get(hash.as_str()).cloned() {
-                                    cache.set(hash.clone(), CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, ..entry });
-                                    cache.save();
-                                }
-                            }
-                        }
-                    }
                     Some(Action::Deck1JumpForward4b)   => { if let Some(ref d) = decks[0] { do_jump(&d.audio.seek_handle, &d.audio.player, d.tempo.base_bpm, d.total_duration,  16); } }
                     Some(Action::Deck1JumpBackward4b)  => { if let Some(ref d) = decks[0] { do_jump(&d.audio.seek_handle, &d.audio.player, d.tempo.base_bpm, d.total_duration, -16); } }
                     Some(Action::Deck1JumpForward8b)   => { if let Some(ref d) = decks[0] { do_jump(&d.audio.seek_handle, &d.audio.player, d.tempo.base_bpm, d.total_duration,  32); } }
@@ -1370,45 +1378,49 @@ Esc                  close this / quit";
                     }
                     Some(Action::Deck1BpmTap) => {
                         if let Some(ref mut d) = decks[0] {
-                            let now = Instant::now();
-                            if let Some(last) = d.tap.last_tap_wall {
-                                if now.duration_since(last).as_secs_f64() > 2.0 { d.tap.tap_times.clear(); }
-                            }
-                            let display_samp = render[0].as_ref().map_or(d.display.smooth_display_samp, |rs| rs.display_samp);
-                            d.tap.tap_times.push(display_samp / d.audio.sample_rate as f64);
-                            d.tap.last_tap_wall = Some(now);
-                            if d.tap.tap_times.len() >= 8 {
-                                let (tapped_bpm, tapped_offset_raw) = compute_tap_bpm_offset(&d.tap.tap_times);
-                                let tapped_offset = (tapped_offset_raw as f64 / 10.0).round() as i64 * 10;
-                                let speed_ratio = d.tempo.bpm / d.tempo.base_bpm;
-                                d.tempo.base_bpm = tapped_bpm;
-                                d.tempo.bpm = (d.tempo.base_bpm * speed_ratio).clamp(40.0, 240.0);
-                                d.tempo.offset_ms = tapped_offset;
-                                d.tempo.bpm_established = true;
-                                d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm);
-                                shared_renderer.store_speed_ratio(0, d.tempo.bpm, d.tempo.base_bpm);
+                            if !d.audio.player.is_paused() {
+                                let now = Instant::now();
+                                if let Some(last) = d.tap.last_tap_wall {
+                                    if now.duration_since(last).as_secs_f64() > 2.0 { d.tap.tap_times.clear(); }
+                                }
+                                let display_samp = render[0].as_ref().map_or(d.display.smooth_display_samp, |rs| rs.display_samp);
+                                d.tap.tap_times.push(display_samp / d.audio.sample_rate as f64);
+                                d.tap.last_tap_wall = Some(now);
+                                if d.tap.tap_times.len() >= 8 {
+                                    let (tapped_bpm, tapped_offset_raw) = compute_tap_bpm_offset(&d.tap.tap_times);
+                                    let tapped_offset = (tapped_offset_raw as f64 / 10.0).round() as i64 * 10;
+                                    let speed_ratio = d.tempo.bpm / d.tempo.base_bpm;
+                                    d.tempo.base_bpm = tapped_bpm;
+                                    d.tempo.bpm = (d.tempo.base_bpm * speed_ratio).clamp(40.0, 240.0);
+                                    d.tempo.offset_ms = tapped_offset;
+                                    d.tempo.bpm_established = true;
+                                    d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm);
+                                    shared_renderer.store_speed_ratio(0, d.tempo.bpm, d.tempo.base_bpm);
+                                }
                             }
                         }
                     }
                     Some(Action::Deck2BpmTap) => {
                         if let Some(ref mut d) = decks[1] {
-                            let now = Instant::now();
-                            if let Some(last) = d.tap.last_tap_wall {
-                                if now.duration_since(last).as_secs_f64() > 2.0 { d.tap.tap_times.clear(); }
-                            }
-                            let display_samp = render[1].as_ref().map_or(d.display.smooth_display_samp, |rs| rs.display_samp);
-                            d.tap.tap_times.push(display_samp / d.audio.sample_rate as f64);
-                            d.tap.last_tap_wall = Some(now);
-                            if d.tap.tap_times.len() >= 8 {
-                                let (tapped_bpm, tapped_offset_raw) = compute_tap_bpm_offset(&d.tap.tap_times);
-                                let tapped_offset = (tapped_offset_raw as f64 / 10.0).round() as i64 * 10;
-                                let speed_ratio = d.tempo.bpm / d.tempo.base_bpm;
-                                d.tempo.base_bpm = tapped_bpm;
-                                d.tempo.bpm = (d.tempo.base_bpm * speed_ratio).clamp(40.0, 240.0);
-                                d.tempo.offset_ms = tapped_offset;
-                                d.tempo.bpm_established = true;
-                                d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm);
-                                shared_renderer.store_speed_ratio(1, d.tempo.bpm, d.tempo.base_bpm);
+                            if !d.audio.player.is_paused() {
+                                let now = Instant::now();
+                                if let Some(last) = d.tap.last_tap_wall {
+                                    if now.duration_since(last).as_secs_f64() > 2.0 { d.tap.tap_times.clear(); }
+                                }
+                                let display_samp = render[1].as_ref().map_or(d.display.smooth_display_samp, |rs| rs.display_samp);
+                                d.tap.tap_times.push(display_samp / d.audio.sample_rate as f64);
+                                d.tap.last_tap_wall = Some(now);
+                                if d.tap.tap_times.len() >= 8 {
+                                    let (tapped_bpm, tapped_offset_raw) = compute_tap_bpm_offset(&d.tap.tap_times);
+                                    let tapped_offset = (tapped_offset_raw as f64 / 10.0).round() as i64 * 10;
+                                    let speed_ratio = d.tempo.bpm / d.tempo.base_bpm;
+                                    d.tempo.base_bpm = tapped_bpm;
+                                    d.tempo.bpm = (d.tempo.base_bpm * speed_ratio).clamp(40.0, 240.0);
+                                    d.tempo.offset_ms = tapped_offset;
+                                    d.tempo.bpm_established = true;
+                                    d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm);
+                                    shared_renderer.store_speed_ratio(1, d.tempo.bpm, d.tempo.base_bpm);
+                                }
                             }
                         }
                     }
@@ -1472,7 +1484,9 @@ Esc                  close this / quit";
                     }
                     Some(Action::Deck1NudgeBackward) | Some(Action::Deck1NudgeForward)
                     | Some(Action::Deck2NudgeBackward) | Some(Action::Deck2NudgeForward)
-                    | Some(Action::NudgeModeToggle) => {}
+                    | Some(Action::NudgeModeToggle)
+                    | Some(Action::Deck1BaseBpmIncrease) | Some(Action::Deck1BaseBpmDecrease)
+                    | Some(Action::Deck2BaseBpmIncrease) | Some(Action::Deck2BaseBpmDecrease) => {}
                     None => {}
                     }
                 } // end if Press
@@ -1717,7 +1731,7 @@ fn notification_line_for_deck(deck: &Deck) -> Line<'static> {
     } else {
         Line::from(Span::styled(
             deck.track_name.clone(),
-            Style::default().fg(spectral_color(deck.display.palette, 0.0, 0.55)),
+            Style::default().fg(spectral_color(deck.display.palette, 0.0, 0.85)),
         ))
     }
 }
@@ -1739,6 +1753,8 @@ fn info_line_for_deck(
     };
     let tap_active = !deck.tap.tap_times.is_empty()
         && deck.tap.last_tap_wall.map_or(false, |t| t.elapsed().as_secs_f64() < 2.0);
+    let tap_flash_on = deck.tap.last_tap_wall
+        .map_or(false, |t| t.elapsed().as_millis() < 150);
     let tap_str = if tap_active {
         format!("  tap:{}", deck.tap.tap_times.len())
     } else {
@@ -1785,7 +1801,13 @@ fn info_line_for_deck(
         }
         spans.push(Span::styled(format!("  {:+}ms", deck.tempo.offset_ms), dim));
         if !tap_str.is_empty() {
-            spans.push(Span::styled(tap_str.clone(), dim));
+            if tap_flash_on {
+                let tap_flash_style = Style::default().fg(Color::Yellow).bg(Color::Rgb(60, 50, 0));
+                spans.push(Span::styled(" ", dim));
+                spans.push(Span::styled(format!(" tap:{} ", deck.tap.tap_times.len()), tap_flash_style));
+            } else {
+                spans.push(Span::styled(tap_str.clone(), dim));
+            }
         }
         spans
     };
@@ -1796,11 +1818,16 @@ fn info_line_for_deck(
         right_spans.push(Span::styled(nudge_str.to_string(), dim));
     }
     const LEVEL_BARS: [char; 8] = ['▁','▂','▃','▄','▅','▆','▇','█'];
-    let level_char = LEVEL_BARS[((deck.volume * 7.0).round() as usize).min(7)];
+    let level_idx = ((deck.volume * 7.0).round() as usize).min(7);
+    let level_char = LEVEL_BARS[level_idx];
+    let t = level_idx as f32 / 7.0;
+    let level_style = Style::default()
+        .fg(Color::Rgb((60.0 + 195.0 * t).round() as u8, (50.0 + 165.0 * t).round() as u8, 0))
+        .bg(Color::Rgb((40.0 * t).round() as u8, (33.0 * t).round() as u8, 0));
     let bracket_style = Style::default().fg(Color::Rgb(140, 140, 140));
     right_spans.push(Span::styled("  level:", dim));
     right_spans.push(Span::styled("\u{2595}", bracket_style));
-    right_spans.push(Span::styled(level_char.to_string(), Style::default().fg(Color::Rgb(120, 100, 0))));
+    right_spans.push(Span::styled(level_char.to_string(), level_style));
     right_spans.push(Span::styled("\u{258F}", bracket_style));
     {
         let stopband: Option<(bool, usize)> = if deck.filter_offset != 0 {
@@ -2117,6 +2144,47 @@ fn compose_shared_tick_row(tick_a: &[u8], tick_b: &[u8], width: usize) -> Vec<u8
     row
 }
 
+/// Extract a screen-width slice of tick data from a pre-rendered buffer, applying the
+/// same half-column viewport transform as the waveform so ticks stay locked to peaks.
+/// When `sub_col` is true (the viewport is offset by one half-column), tick bytes are
+/// shifted: right sub-col (0xB8) at buffer column c becomes left sub-col (0x47) at
+/// screen column c, and left sub-col (0x47) at buffer column c becomes right sub-col
+/// (0xB8) at screen column c−1.
+fn extract_tick_viewport(
+    buf:        &BrailleBuffer,
+    display_pos: usize,
+    centre_col: usize,
+    width:      usize,
+) -> Vec<u8> {
+    if buf.samples_per_col == 0 || buf.tick.is_empty() {
+        return vec![0u8; width];
+    }
+    let half_col      = buf.samples_per_col as f64 / 2.0;
+    let delta         = display_pos as i64 - buf.anchor_sample as i64;
+    let delta_half    = (delta as f64 / half_col).round() as i64;
+    let delta_cols    = delta_half.div_euclid(2);
+    let sub_col       = delta_half.rem_euclid(2) != 0;
+    let viewport_off  = buf.buf_cols as i64 / 2 + delta_cols - centre_col as i64;
+    let need          = if sub_col { width + 1 } else { width };
+    if viewport_off < 0 || (viewport_off as usize) + need > buf.buf_cols {
+        return vec![0u8; width];
+    }
+    let start = viewport_off as usize;
+    if !sub_col {
+        buf.tick[start..start + width].to_vec()
+    } else {
+        // With a half-column shift: 0xB8 (right) at buf col → 0x47 (left) at same screen col;
+        // 0x47 (left) at buf col → 0xB8 (right) at previous screen col.
+        let mut out = vec![0u8; width];
+        for c in 0..=width {
+            let b = buf.tick[start + c];
+            if b == 0xB8 && c < width { out[c]     = 0x47; }
+            if b == 0x47 && c > 0     { out[c - 1] = 0xB8; }
+        }
+        out
+    }
+}
+
 fn compute_tick_display(
     detail_width:    usize,
     samples_per_col: usize,
@@ -2166,11 +2234,11 @@ fn render_detail_waveform(
     let centre_col = ((detail_width as f64 * display_cfg.playhead_position as f64 / 100.0) as usize)
         .clamp(0, detail_width.saturating_sub(1));
 
-    let half_col_samp_global: f64 = buf.samples_per_col as f64 / 2.0;
+    let half_col_samp: f64 = buf.samples_per_col as f64 / 2.0;
     let mut sub_col = false;
     let viewport_start: Option<usize> = if buf.buf_cols >= detail_width && buf.samples_per_col > 0 {
         let delta = display_pos_samp as i64 - buf.anchor_sample as i64;
-        let delta_half = (delta as f64 / half_col_samp_global).round() as i64;
+        let delta_half = (delta as f64 / half_col_samp).round() as i64;
         sub_col = delta_half % 2 != 0;
         let delta_cols = delta_half.div_euclid(2);
         let viewport_offset = buf.buf_cols as i64 / 2 + delta_cols - centre_col as i64;
@@ -2186,29 +2254,14 @@ fn render_detail_waveform(
         None
     };
 
-    // Marker positions (cue) are computed from the exact display position.
-    // viewport_start uses the half-column-quantized anchor (correct for the discrete
-    // buffer grid); using that quantized value here would leave a residual that flips
-    // disp_half by 1 whenever the display position moves — visible as marker wobble.
-    let marker_view_start: f64 = if buf.samples_per_col > 0 {
-        display_pos_samp as f64 - centre_col as f64 * buf.samples_per_col as f64
-    } else {
-        0.0
-    };
-
-    let cue_screen_col: Option<usize> = if buf.samples_per_col > 0 {
-        deck.cue_sample.and_then(|samp| {
-            let disp_half = ((samp as f64 - marker_view_start) / half_col_samp_global).round() as i64;
-            if disp_half >= 0 {
-                let col = (disp_half / 2) as usize;
-                if col < detail_width { Some(col) } else { None }
-            } else {
-                None
-            }
+    // Cue column is pre-computed by the background thread in buffer space, using the
+    // same anchor and samples_per_col as the waveform and ticks. Map to screen here
+    // via viewport_start — identical to how ticks are handled.
+    let cue_screen_col: Option<usize> = viewport_start.and_then(|vs| {
+        buf.cue_buf_col.and_then(|cbc| {
+            if cbc >= vs && cbc < vs + detail_width { Some(cbc - vs) } else { None }
         })
-    } else {
-        None
-    };
+    });
 
     // Waveform rows occupy the full panel minus the shared tick row (if present).
     let waveform_rows = if shared_tick.is_some() {
@@ -2236,7 +2289,8 @@ fn render_detail_waveform(
                 viewport_start.and_then(|start| buf.grid.get(buf_r).map(|row| &row[start..start + detail_width]))
             };
             let _ = &shifted;
-            let is_edge_row = r == 0 || r + 1 == waveform_rows;
+            let actual_rows = buf.grid.len().min(waveform_rows);
+            let is_edge_row = r == 0 || r + 1 == actual_rows;
             let row = match row_slice {
                 None => return Line::from(Span::raw("\u{2800}".repeat(detail_width))),
                 Some(s) => s,
@@ -2284,13 +2338,7 @@ fn render_detail_waveform(
         let mut run_color = Color::Reset;
         for c in 0..detail_width {
             let byte = display_row[c];
-            let (color, ch) = if c == centre_col && cue_screen_col == Some(c) {
-                (Color::Rgb(255, 0, 255), '\u{28FF}')
-            } else if c == centre_col {
-                (Color::Rgb(255, 255, 255), '\u{28FF}')
-            } else if cue_screen_col == Some(c) {
-                (Color::Rgb(255, 0, 255), '\u{28FF}')
-            } else if byte != 0 {
+            let (color, ch) = if byte != 0 {
                 (Color::Gray, char::from_u32(0x2800 | byte as u32).unwrap_or(' '))
             } else {
                 (Color::Gray, ' ')
@@ -2322,6 +2370,8 @@ fn render_detail_waveform(
 struct BrailleBuffer {
     grid:            Vec<Vec<u8>>, // rows × buf_cols braille bytes
     bass_ratio:      Vec<f32>,     // per-column bass ratio in [0,1]: 1=bass, 0=treble
+    tick:            Vec<u8>,      // per-column tick byte: 0x47=left sub-col, 0xB8=right, 0=none
+    cue_buf_col:     Option<usize>,// buffer column of cue point, None if unset or out of range
     buf_cols:        usize,        // total buffer width (= 3 × screen_cols)
     anchor_sample:   usize,        // mono-sample index at the buffer centre
     samples_per_col: usize,        // mono samples represented by each buffer column
@@ -2329,7 +2379,7 @@ struct BrailleBuffer {
 
 impl BrailleBuffer {
     fn empty() -> Self {
-        Self { grid: Vec::new(), bass_ratio: Vec::new(), buf_cols: 0, anchor_sample: 0, samples_per_col: 1 }
+        Self { grid: Vec::new(), bass_ratio: Vec::new(), tick: Vec::new(), cue_buf_col: None, buf_cols: 0, anchor_sample: 0, samples_per_col: 1 }
     }
 }
 
@@ -2428,6 +2478,14 @@ struct SharedDetailRenderer {
     /// background thread to recompute immediately rather than waiting for drift.
     load_gen_a:     Arc<AtomicUsize>,
     load_gen_b:     Arc<AtomicUsize>,
+    /// `base_bpm` as f32 bits; 0 when analysing or unloaded.
+    bpm_a:          Arc<AtomicU32>,
+    bpm_b:          Arc<AtomicU32>,
+    offset_ms_a:    Arc<AtomicI64>,
+    offset_ms_b:    Arc<AtomicI64>,
+    /// Cue point in mono samples; -1 when unset.
+    cue_sample_a:   Arc<AtomicI64>,
+    cue_sample_b:   Arc<AtomicI64>,
     shared_a:       Arc<Mutex<Arc<BrailleBuffer>>>,
     shared_b:       Arc<Mutex<Arc<BrailleBuffer>>>,
     _stop_guard:    StopOnDrop,
@@ -2451,6 +2509,12 @@ impl SharedDetailRenderer {
         let channels_b     = Arc::new(AtomicUsize::new(1));
         let load_gen_a     = Arc::new(AtomicUsize::new(0));
         let load_gen_b     = Arc::new(AtomicUsize::new(0));
+        let bpm_a          = Arc::new(AtomicU32::new(0));
+        let bpm_b          = Arc::new(AtomicU32::new(0));
+        let offset_ms_a    = Arc::new(AtomicI64::new(0));
+        let offset_ms_b    = Arc::new(AtomicI64::new(0));
+        let cue_sample_a   = Arc::new(AtomicI64::new(-1));
+        let cue_sample_b   = Arc::new(AtomicI64::new(-1));
         let shared_a: Arc<Mutex<Arc<BrailleBuffer>>> =
             Arc::new(Mutex::new(Arc::new(BrailleBuffer::empty())));
         let shared_b: Arc<Mutex<Arc<BrailleBuffer>>> =
@@ -2475,6 +2539,12 @@ impl SharedDetailRenderer {
             let ch_b_bg      = Arc::clone(&channels_b);
             let gen_a_bg     = Arc::clone(&load_gen_a);
             let gen_b_bg     = Arc::clone(&load_gen_b);
+            let bpm_a_bg     = Arc::clone(&bpm_a);
+            let bpm_b_bg     = Arc::clone(&bpm_b);
+            let off_ms_a_bg  = Arc::clone(&offset_ms_a);
+            let off_ms_b_bg  = Arc::clone(&offset_ms_b);
+            let cue_a_bg     = Arc::clone(&cue_sample_a);
+            let cue_b_bg     = Arc::clone(&cue_sample_b);
             let shared_a_bg  = Arc::clone(&shared_a);
             let shared_b_bg  = Arc::clone(&shared_b);
             let stop_bg      = Arc::clone(&stop);
@@ -2490,6 +2560,12 @@ impl SharedDetailRenderer {
                 let mut last_anchor_b  = 0usize;
                 let mut last_gen_a     = usize::MAX;
                 let mut last_gen_b     = usize::MAX;
+                let mut last_bpm_a: u32  = 0;
+                let mut last_bpm_b: u32  = 0;
+                let mut last_off_a: i64  = 0;
+                let mut last_off_b: i64  = 0;
+                let mut last_cue_a: i64  = -1;
+                let mut last_cue_b: i64  = -1;
 
                 loop {
                     if stop_bg.load(Ordering::Relaxed) { break; }
@@ -2523,9 +2599,15 @@ impl SharedDetailRenderer {
                         pos_b.abs_diff(last_anchor_b) / last_col_samp_b
                     } else { usize::MAX };
 
-                    let style = style_bg.load(Ordering::Relaxed);
-                    let gen_a = gen_a_bg.load(Ordering::Relaxed);
-                    let gen_b = gen_b_bg.load(Ordering::Relaxed);
+                    let style    = style_bg.load(Ordering::Relaxed);
+                    let gen_a    = gen_a_bg.load(Ordering::Relaxed);
+                    let gen_b    = gen_b_bg.load(Ordering::Relaxed);
+                    let bpm_a_raw = bpm_a_bg.load(Ordering::Relaxed);
+                    let bpm_b_raw = bpm_b_bg.load(Ordering::Relaxed);
+                    let off_ms_a  = off_ms_a_bg.load(Ordering::Relaxed);
+                    let off_ms_b  = off_ms_b_bg.load(Ordering::Relaxed);
+                    let cue_raw_a = cue_a_bg.load(Ordering::Relaxed);
+                    let cue_raw_b = cue_b_bg.load(Ordering::Relaxed);
                     let must_recompute = cols != last_cols
                         || rows != last_rows
                         || zoom != last_zoom
@@ -2535,7 +2617,13 @@ impl SharedDetailRenderer {
                         || drift_a >= cols * 3 / 4
                         || drift_b >= cols * 3 / 4
                         || gen_a != last_gen_a
-                        || gen_b != last_gen_b;
+                        || gen_b != last_gen_b
+                        || bpm_a_raw != last_bpm_a
+                        || bpm_b_raw != last_bpm_b
+                        || off_ms_a != last_off_a
+                        || off_ms_b != last_off_b
+                        || cue_raw_a != last_cue_a
+                        || cue_raw_b != last_cue_b;
 
                     if must_recompute {
                         let buf_cols = cols * 5;
@@ -2546,12 +2634,23 @@ impl SharedDetailRenderer {
                         let anchor_a = (pos_a / col_samp_a) * col_samp_a;
                         let anchor_b = (pos_b / col_samp_b) * col_samp_b;
 
+                        let tick_view_start_a = anchor_a as f64 - (buf_cols / 2) as f64 * col_samp_a as f64;
+                        let tick_view_start_b = anchor_b as f64 - (buf_cols / 2) as f64 * col_samp_b as f64;
+                        let compute_cue_buf_col = |cue_raw: i64, anchor: usize, col_samp: usize| -> Option<usize> {
+                            if cue_raw < 0 || col_samp == 0 { return None; }
+                            let delta = cue_raw - anchor as i64;
+                            let col = buf_cols as i64 / 2 + delta.div_euclid(col_samp as i64);
+                            if col >= 0 && (col as usize) < buf_cols { Some(col as usize) } else { None }
+                        };
                         let buf_a = Arc::new(BrailleBuffer {
                             grid: render_braille(
                                 &peaks_for_slot(&wf_a, anchor_a, col_samp_a, buf_cols),
                                 rows, buf_cols, style == 1,
                             ),
                             bass_ratio:      spectral_for_slot(&wf_a, anchor_a, col_samp_a, buf_cols, sr_a as u32),
+                            tick:            compute_tick_display(buf_cols, col_samp_a, tick_view_start_a,
+                                                 bpm_a_raw == 0, f32::from_bits(bpm_a_raw), sr_a as u32, off_ms_a),
+                            cue_buf_col:     compute_cue_buf_col(cue_raw_a, anchor_a, col_samp_a),
                             buf_cols,
                             anchor_sample:   anchor_a,
                             samples_per_col: col_samp_a,
@@ -2562,6 +2661,9 @@ impl SharedDetailRenderer {
                                 rows, buf_cols, style == 1,
                             ),
                             bass_ratio:      spectral_for_slot(&wf_b, anchor_b, col_samp_b, buf_cols, sr_b as u32),
+                            tick:            compute_tick_display(buf_cols, col_samp_b, tick_view_start_b,
+                                                 bpm_b_raw == 0, f32::from_bits(bpm_b_raw), sr_b as u32, off_ms_b),
+                            cue_buf_col:     compute_cue_buf_col(cue_raw_b, anchor_b, col_samp_b),
                             buf_cols,
                             anchor_sample:   anchor_b,
                             samples_per_col: col_samp_b,
@@ -2580,6 +2682,12 @@ impl SharedDetailRenderer {
                         last_anchor_b   = anchor_b;
                         last_gen_a      = gen_a;
                         last_gen_b      = gen_b;
+                        last_bpm_a      = bpm_a_raw;
+                        last_bpm_b      = bpm_b_raw;
+                        last_off_a      = off_ms_a;
+                        last_off_b      = off_ms_b;
+                        last_cue_a      = cue_raw_a;
+                        last_cue_b      = cue_raw_b;
                     }
 
                     thread::sleep(Duration::from_millis(8));
@@ -2595,6 +2703,9 @@ impl SharedDetailRenderer {
             display_pos_a, display_pos_b,
             channels_a, channels_b,
             load_gen_a, load_gen_b,
+            bpm_a, bpm_b,
+            offset_ms_a, offset_ms_b,
+            cue_sample_a, cue_sample_b,
             shared_a, shared_b,
             _stop_guard: stop_guard,
         }
@@ -2624,6 +2735,28 @@ impl SharedDetailRenderer {
         match slot {
             0 => self.speed_ratio_a.store(ratio, Ordering::Relaxed),
             _ => self.speed_ratio_b.store(ratio, Ordering::Relaxed),
+        }
+    }
+
+    fn store_cue(&self, slot: usize, cue_sample: Option<usize>) {
+        let raw = cue_sample.map_or(-1, |s| s as i64);
+        match slot {
+            0 => self.cue_sample_a.store(raw, Ordering::Relaxed),
+            _ => self.cue_sample_b.store(raw, Ordering::Relaxed),
+        }
+    }
+
+    fn store_tempo(&self, slot: usize, base_bpm: f32, offset_ms: i64, analysing: bool) {
+        let bpm_raw = if analysing { 0.0f32 } else { base_bpm }.to_bits();
+        match slot {
+            0 => {
+                self.bpm_a.store(bpm_raw, Ordering::Relaxed);
+                self.offset_ms_a.store(offset_ms, Ordering::Relaxed);
+            }
+            _ => {
+                self.bpm_b.store(bpm_raw, Ordering::Relaxed);
+                self.offset_ms_b.store(offset_ms, Ordering::Relaxed);
+            }
         }
     }
 
@@ -3299,8 +3432,11 @@ fn render_braille(peaks: &[(f32, f32)], rows: usize, cols: usize, outline: bool)
         }
         // Map y ∈ [-1, 1] → dot row ∈ [0, total_dots); y=1 is top (row 0).
         let top_dot = ((1.0 - clamped_max) / 2.0 * total_dots as f32) as usize;
-        let bot_dot = (((1.0 - clamped_min) / 2.0 * total_dots as f32) as usize)
-            .min(total_dots - 1);
+        let bot_dot = {
+            let raw = (((1.0 - clamped_min) / 2.0 * total_dots as f32) as usize)
+                .min(total_dots - 1);
+            if raw > top_dot && raw + top_dot >= total_dots { raw - 1 } else { raw }
+        };
         if outline {
             // Bridge vertical gap to previous column so the outline is continuous.
             let top_from = prev_top.map(|p| p.min(top_dot)).unwrap_or(top_dot);

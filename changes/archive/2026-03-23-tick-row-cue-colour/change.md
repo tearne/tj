@@ -1,6 +1,6 @@
 # Tick Row Cue Colour
 **Type**: Fix
-**Status**: Draft
+**Status**: Approved
 
 ## Problem
 
@@ -24,3 +24,5 @@ else                →  (gray, space)
 No other changes needed — the waveform row loop above it is unaffected.
 
 ## Log
+
+Removed `cue_screen_col` branches from the tick row loop. Playhead (`centre_col`) stays white; all other columns render gray ticks or space.

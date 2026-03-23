@@ -1,6 +1,6 @@
 # Info Line: Level Saturation + Tap Flash
 **Type**: Fix
-**Status**: Draft
+**Status**: Approved
 
 ## Changes
 
@@ -32,3 +32,5 @@ let tap_flash_on = deck.tap.last_tap_wall
 Apply `beat_style` to the full tap string when `tap_flash_on` is true, `dim` otherwise.
 
 ## Log
+
+Implemented as designed. Tap flash uses a dedicated style constant rather than `beat_style` so it fires on actual taps independent of the BPM beat. Background highlight covers ` tap:N ` (one space each side).

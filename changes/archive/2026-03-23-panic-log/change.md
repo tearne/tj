@@ -1,6 +1,6 @@
 # Panic Log
 **Type**: Fix
-**Status**: Draft
+**Status**: Approved
 
 ## Problem
 
@@ -34,3 +34,5 @@ The default hook is chained so existing behaviour (printing to stderr) is preser
 The file write is best-effort — failure to write must not mask the original panic.
 
 ## Log
+
+Installed before `enable_raw_mode`. Chains to color_eyre's hook; calls `cleanup_terminal()` first to restore the shell. Write is best-effort.
