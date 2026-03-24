@@ -1,4 +1,4 @@
-# Keymap
+# Config
 
 ## Player Controls
 
@@ -16,9 +16,6 @@
 | `C` / `D` | Toggle nudge mode: `jump` (10ms seek) / `warp` (±10% speed) |
 | `-` / `=` | Zoom in / out |
 | `{` / `}` | Detail height decrease / increase |
-| `b` | Tap BPM detection |
-| `'` | Toggle metronome |
-| `@` | Trigger manual BPM re-detection |
 
 **Per-deck fixed controls** (always apply to the named deck, regardless of which is active):
 | Key | Action |
@@ -33,6 +30,10 @@
 | `X` / `S` | Deck A base BPM +0.01 / −0.01 |
 | `v` / `f` | Deck B BPM +0.1 / −0.1 |
 | `V` / `F` | Deck B base BPM +0.01 / −0.01 |
+| `b` / `n` | Deck A/B tap BPM |
+| `B` / `N` | Deck A/B metronome toggle |
+| `'` / `#` | Deck A/B BPM re-detect |
+| `@` / `~` | Deck A/B tempo reset |
 | `Space+A` | Deck A cue play (jump to cue; maintain play state) |
 | `A` | Deck A cue set (paused only; snaps beat grid to cue position) |
 | `Space+D` | Deck B cue play |

@@ -1,6 +1,6 @@
 [package]
 name = "tj"
-version = "0.5.193"
+version = "0.5.194"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 
@@ -15,3 +15,4 @@ stratum-dsp = "1.0.0"
 toml = "0.8"
 symphonia = { version = "0.5.5", features = ["all"] }
 color-eyre = "0.6.5"
+lofty = "0.22"

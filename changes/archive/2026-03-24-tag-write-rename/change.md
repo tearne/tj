@@ -1,6 +1,6 @@
 # Tag Write and File Rename
 **Type**: Proposal
-**Status**: Draft
+**Status**: Approved
 
 ## Intent
 
@@ -33,6 +33,10 @@ The filename-convention spike established the full UX workflow and left `rename_
 ## Test Fixtures
 
 Integration tests that operate on real audio files require a fixture directory supplied via the `TEST_AUDIO_DIR` environment variable. Tests skip silently when the variable is unset so that `cargo test` passes without fixtures present. The fixture directory for this project is `/root/test_tracks`, containing 122 files in MP3 and FLAC formats organised in year/letter subdirectories, scanned recursively.
+
+## Log
+
+Added `write_tags` to `src/tags/mod.rs` using lofty 0.22. Added `collision_error: Option<String>` to `TagEditorState`. Replaced the Enter handler: collision check → tag write → optional rename → path/filename/track_name update. Removed `rename_accepted` assignment (field retained in struct). Render updated to show red `⚠` error line when collision detected. Tests: `sanitise_all_illegal`, `sanitise_empty`, `sanitise_clean`, `propose_rename_stem_non_empty`, `tag_write_roundtrip` (MP3 + FLAC). All 14 tests pass including integration tests against `/root/test_tracks`.
 
 ## Scope
 
