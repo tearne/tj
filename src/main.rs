@@ -20,7 +20,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Terminal;
 
 use rodio::stream::DeviceSinkBuilder;
@@ -226,7 +226,15 @@ fn build_deck(
     mixer:       &rodio::mixer::Mixer,
     cache:       &Cache,
 ) -> Deck {
-    let track_name     = read_track_name(&path.to_string_lossy());
+    let track_name  = read_track_name(&path.to_string_lossy());
+    let rename_hint = {
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if stem.is_empty() || stem_conforms(stem) {
+            None
+        } else {
+            Some(propose_rename_stem(path))
+        }
+    };
     let total_duration = mono.len() as f64 / sample_rate as f64;
     let mono           = Arc::new(mono);
     let waveform       = Arc::new(WaveformData::compute(Arc::clone(&mono), sample_rate));
@@ -282,8 +290,10 @@ fn build_deck(
 
     Deck::new(
         filename,
+        path.to_path_buf(),
         track_name,
         total_duration,
+        rename_hint,
         DeckAudio {
             player,
             seek_handle,
@@ -616,7 +626,7 @@ fn tui_loop(
 
             // ---- Deck A ----
             if let (Some(deck), Some(rs)) = (&mut d0, &render[0]) {
-                let content = notification_line_for_deck(deck);
+                let content = notification_line_for_deck(deck, area_notif_a.width.saturating_sub(2) as usize);
                 let mut spans = vec![Span::styled("A ", label_style)];
                 spans.extend(content.spans);
                 frame.render_widget(Paragraph::new(Line::from(spans)).style(notif_bg), area_notif_a);
@@ -643,7 +653,7 @@ fn tui_loop(
 
             // ---- Deck B ----
             if let (Some(deck), Some(rs)) = (&mut d1, &render[1]) {
-                let content = notification_line_for_deck(deck);
+                let content = notification_line_for_deck(deck, area_notif_b.width.saturating_sub(2) as usize);
                 let mut spans = vec![Span::styled("B ", label_style)];
                 spans.extend(content.spans);
                 frame.render_widget(Paragraph::new(Line::from(spans)).style(notif_bg), area_notif_b);
@@ -690,6 +700,15 @@ fn tui_loop(
                     ))
                 };
                 frame.render_widget(Paragraph::new(global_line).style(notif_bg), area_global);
+            }
+
+            // Tag editor overlay
+            for deck_opt in [&d0, &d1] {
+                if let Some(deck) = deck_opt {
+                    if let Some(ref editor) = deck.tag_editor {
+                        render_tag_editor(frame, editor, area);
+                    }
+                }
             }
 
             // Help popup
@@ -743,6 +762,7 @@ Esc                  close this / quit";
         while event::poll(Duration::ZERO)? {
             match event::read()? {
             Event::Mouse(mouse_event) => {
+                if decks.iter().flatten().any(|d| d.tag_editor.is_some()) { continue; }
                 if mouse_event.kind == MouseEventKind::Down(MouseButton::Left) {
                     let col = mouse_event.column as usize;
                     let row = mouse_event.row as usize;
@@ -785,6 +805,93 @@ Esc                  close this / quit";
                     }
                     cache.save();
                     return Ok(());
+                }
+                // Tag editor — intercepts all key events when open, before any other handling.
+                {
+                    let editor_open = decks.iter().flatten().any(|d| d.tag_editor.is_some());
+                    if editor_open {
+                        if let KeyEventKind::Press = key.kind {
+                            for slot in 0..2 {
+                                if let Some(ref mut d) = decks[slot] {
+                                    if let Some(ref mut editor) = d.tag_editor {
+                                        match key.code {
+                                            KeyCode::Esc => { d.tag_editor = None; }
+                                            KeyCode::Enter => {
+                                                let artist_blank = editor.fields[0].0.trim().is_empty();
+                                                let title_blank  = editor.fields[1].0.trim().is_empty();
+                                                if !artist_blank && !title_blank {
+                                                    for (val, cursor) in &mut editor.fields {
+                                                        let trimmed = val.trim().to_string();
+                                                        *cursor = (*cursor).min(trimmed.chars().count());
+                                                        *val = trimmed;
+                                                    }
+                                                    let new_stem = editor.preview();
+                                                    d.rename_hint = Some(new_stem.clone());
+                                                    d.rename_accepted = Some(new_stem.clone());
+                                                    d.tag_editor = None;
+                                                    d.active_notification = Some(Notification {
+                                                        message: format!("→ {new_stem}"),
+                                                        style: NotificationStyle::Info,
+                                                        expires: Instant::now() + Duration::from_secs(3),
+                                                    });
+                                                }
+                                            }
+                                            KeyCode::Tab | KeyCode::Down => {
+                                                editor.active_field = (editor.active_field + 1) % TAG_FIELD_LABELS.len();
+                                            }
+                                            KeyCode::BackTab | KeyCode::Up => {
+                                                editor.active_field = (editor.active_field + TAG_FIELD_LABELS.len() - 1) % TAG_FIELD_LABELS.len();
+                                            }
+                                            KeyCode::Left => {
+                                                let (_, cursor) = editor.active_field_mut();
+                                                if *cursor > 0 { *cursor -= 1; }
+                                            }
+                                            KeyCode::Right => {
+                                                let (text, cursor) = editor.active_field_mut();
+                                                let len = text.chars().count();
+                                                if *cursor < len { *cursor += 1; }
+                                            }
+                                            KeyCode::Home => {
+                                                let (_, cursor) = editor.active_field_mut();
+                                                *cursor = 0;
+                                            }
+                                            KeyCode::End => {
+                                                let (text, cursor) = editor.active_field_mut();
+                                                *cursor = text.chars().count();
+                                            }
+                                            KeyCode::Backspace => {
+                                                let (text, cursor) = editor.active_field_mut();
+                                                if *cursor > 0 {
+                                                    let mut chars: Vec<char> = text.chars().collect();
+                                                    chars.remove(*cursor - 1);
+                                                    *text = chars.into_iter().collect();
+                                                    *cursor -= 1;
+                                                }
+                                            }
+                                            KeyCode::Delete => {
+                                                let (text, cursor) = editor.active_field_mut();
+                                                let mut chars: Vec<char> = text.chars().collect();
+                                                if *cursor < chars.len() {
+                                                    chars.remove(*cursor);
+                                                    *text = chars.into_iter().collect();
+                                                }
+                                            }
+                                            KeyCode::Char(c) => {
+                                                let (text, cursor) = editor.active_field_mut();
+                                                let mut chars: Vec<char> = text.chars().collect();
+                                                chars.insert(*cursor, c);
+                                                *text = chars.into_iter().collect();
+                                                *cursor += 1;
+                                            }
+                                            _ => {}
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        continue; // block all other key handling while editor is open
+                    }
                 }
                 // Space modifier: track held state for chords.
                 if key.code == KeyCode::Char(' ') {
@@ -1063,6 +1170,44 @@ Esc                  close this / quit";
                         }
                     }
                     if bpm_intercepted { continue 'tui; }
+
+                    // Rename offer — 'y' and 'h' are intercepted when offer is visible;
+                    // any other key dismisses the offer and falls through to normal handling.
+                    let mut rename_offer_consumed = false;
+                    for slot in 0..2 {
+                        if let Some(ref mut d) = decks[slot] {
+                            if d.rename_offer_active() {
+                                match key.code {
+                                    KeyCode::Char('y') => {
+                                        let tag_values = read_tags_for_editor(&d.path);
+                                        let current_stem = d.path.file_stem()
+                                            .and_then(|s| s.to_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let extension = d.path.extension()
+                                            .and_then(|s| s.to_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        d.tag_editor = Some(TagEditorState {
+                                            fields: tag_values.into_iter()
+                                                .map(|v| (v, 0))
+                                                .collect(),
+                                            active_field: 0,
+                                            current_stem,
+                                            extension,
+                                        });
+                                        d.rename_offer_started = None;
+                                        rename_offer_consumed = true;
+                                    }
+                                    _ => {
+                                        // Key performs normally; offer stays.
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    if rename_offer_consumed { continue 'tui; }
 
                     let action = if space_held && key.code != KeyCode::Char(' ') {
                         if let Some(a) = keymap.get(&KeyBinding::SpaceChord(key.code)) {
@@ -1707,7 +1852,8 @@ fn apply_offset_step(d: &mut Deck, delta_ms: i64) {
 // Per-deck render helpers (free functions used by terminal.draw closures)
 // ---------------------------------------------------------------------------
 
-fn notification_line_for_deck(deck: &Deck) -> Line<'static> {
+fn notification_line_for_deck(deck: &Deck, content_width: usize) -> Line<'static> {
+    let dim = Style::default().fg(Color::DarkGray);
     if let Some((_, p_bpm, _, received_at)) = &deck.tempo.pending_bpm {
         let secs_left = 15u64.saturating_sub(received_at.elapsed().as_secs());
         let yellow = Style::default().fg(Color::Yellow);
@@ -1728,12 +1874,134 @@ fn notification_line_for_deck(deck: &Deck) -> Line<'static> {
             NotificationStyle::Error   => Color::Red,
         };
         Line::from(Span::styled(n.message.clone(), Style::default().fg(color)))
+    } else if deck.rename_offer_active() {
+        let elapsed = deck.rename_offer_started.unwrap().elapsed().as_secs();
+        let (offer, offer_style) = if elapsed < 10 {
+            let secs_left = 10 - elapsed;
+            (format!("rename? [y]  ({}s)", secs_left), Style::default().fg(Color::Red))
+        } else {
+            ("rename? [y]".to_string(), dim)
+        };
+        let track_name = deck.track_name.clone();
+        let left_w  = track_name.chars().count();
+        let right_w = offer.chars().count();
+        let spacer_w = content_width.saturating_sub(left_w + right_w).max(1);
+        Line::from(vec![
+            Span::styled(track_name, Style::default().fg(spectral_color(deck.display.palette, 0.0, 0.85))),
+            Span::raw(" ".repeat(spacer_w)),
+            Span::styled(offer, offer_style),
+        ])
     } else {
         Line::from(Span::styled(
             deck.track_name.clone(),
             Style::default().fg(spectral_color(deck.display.palette, 0.0, 0.85)),
         ))
     }
+}
+
+fn popup_area(width: u16, height: u16, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    ratatui::layout::Rect { x, y, width: width.min(area.width), height: height.min(area.height) }
+}
+
+fn render_editor_field(label: &'static str, text: &str, active: bool, cursor: usize, text_width: usize) -> Vec<Line<'static>> {
+    let label_style  = Style::default().fg(Color::Rgb(40, 60, 100));
+    let text_style   = Style::default().fg(if active { Color::White } else { Color::Rgb(60, 80, 120) });
+    let cursor_style = Style::default().fg(Color::Black).bg(Color::Yellow);
+    let chars: Vec<char> = text.chars().collect();
+    let cursor = cursor.min(chars.len());
+
+    // Split into visual rows; always at least one so an empty field still renders.
+    let rows: Vec<&[char]> = if chars.is_empty() {
+        vec![&[]]
+    } else {
+        chars.chunks(text_width).collect()
+    };
+
+    rows.iter().enumerate().map(|(row_idx, row_chars)| {
+        let start      = row_idx * text_width;
+        let row_len    = row_chars.len();
+        let is_last    = row_idx == rows.len() - 1;
+        let prefix     = if row_idx == 0 { format!("{label}: ") } else { " ".repeat(9) };
+        let cursor_here = active && (
+            (cursor >= start && cursor < start + row_len) ||
+            (is_last && cursor == chars.len())
+        );
+        if cursor_here {
+            let local = cursor - start;
+            let before: String = row_chars[..local].iter().collect();
+            let (at_cur, after): (String, String) = if local < row_len {
+                (row_chars[local].to_string(), row_chars[local + 1..].iter().collect())
+            } else {
+                (" ".to_string(), String::new())
+            };
+            Line::from(vec![
+                Span::styled(prefix, label_style),
+                Span::styled(before, text_style),
+                Span::styled(at_cur, cursor_style),
+                Span::styled(after, text_style),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled(prefix, label_style),
+                Span::styled(row_chars.iter().collect::<String>(), text_style),
+            ])
+        }
+    }).collect()
+}
+
+fn section_divider(label: &'static str, inner_width: usize) -> Line<'static> {
+    let fill = "─".repeat(inner_width.saturating_sub(4 + label.len()));
+    Line::from(vec![
+        Span::styled("── ", Style::default().fg(Color::Rgb(40, 60, 100))),
+        Span::styled(label, Style::default().fg(Color::Rgb(80, 110, 160))),
+        Span::styled(format!(" {fill}"), Style::default().fg(Color::Rgb(40, 60, 100))),
+    ])
+}
+
+fn render_tag_editor(frame: &mut ratatui::Frame, editor: &TagEditorState, full_area: ratatui::layout::Rect) {
+    let popup_width = full_area.width.clamp(TAG_EDITOR_MIN_WIDTH, TAG_EDITOR_MAX_WIDTH);
+    let text_width  = popup_width as usize - 2 - 9; // inner − label prefix
+    let inner_width = popup_width as usize - 2;
+    let label_dim = Style::default().fg(Color::Rgb(40, 60, 100));
+    let hint_dim  = Style::default().fg(Color::Rgb(40, 60, 100));
+    let proposed  = editor.preview();
+    let with_ext  = |stem: &str| -> String {
+        if editor.extension.is_empty() { stem.to_string() }
+        else { format!("{stem}.{}", editor.extension) }
+    };
+    let mut lines: Vec<Line<'static>> = std::iter::once(section_divider("Tags", inner_width))
+        .chain(TAG_FIELD_LABELS.iter().enumerate()
+            .flat_map(|(i, &label)| {
+                let (val, cur) = &editor.fields[i];
+                render_editor_field(label, val, editor.active_field == i, *cur, text_width)
+            }))
+        .collect();
+    lines.push(section_divider("Filename", inner_width));
+    lines.push(Line::from(vec![
+        Span::styled(" Current: ", label_dim),
+        Span::styled(with_ext(&editor.current_stem), Style::default().fg(Color::Rgb(60, 80, 120))),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Proposed: ", label_dim),
+        Span::styled(with_ext(&proposed), Style::default().fg(Color::Yellow)),
+    ]));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("          Enter to confirm  Esc to cancel", hint_dim)));
+    let popup_height = (lines.len() as u16 + 2).min(full_area.height); // +2 for borders
+    let popup = popup_area(popup_width, popup_height, full_area);
+    let navy = Style::default().bg(Color::Rgb(20, 20, 38));
+    let blue = Color::Rgb(40, 60, 100);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(Span::styled(" Edit tags and rename file ", Style::default().fg(Color::Yellow)))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(blue))
+        .style(navy);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn info_line_for_deck(
@@ -2837,6 +3105,7 @@ fn box_smooth(v: &[f32], radius: usize) -> Vec<f32> {
 
 struct Deck {
     filename: String,
+    path:     PathBuf,
     track_name: String,
     total_duration: f64,
     volume: f32,
@@ -2847,6 +3116,10 @@ struct Deck {
     last_metro_beat: Option<i128>,
     active_notification: Option<Notification>,
     cue_sample: Option<usize>,
+    rename_hint: Option<String>,
+    rename_offer_started: Option<Instant>,
+    rename_accepted: Option<String>,
+    tag_editor: Option<TagEditorState>,
 
     audio: DeckAudio,
     tempo: TempoState,
@@ -2858,13 +3131,16 @@ struct Deck {
 impl Deck {
     fn new(
         filename: String,
+        path: PathBuf,
         track_name: String,
         total_duration: f64,
+        rename_hint: Option<String>,
         audio: DeckAudio,
         bpm_rx: mpsc::Receiver<(String, f32, i64, bool)>,
     ) -> Self {
         Deck {
             filename,
+            path,
             track_name,
             total_duration,
             volume: 1.0,
@@ -2875,6 +3151,10 @@ impl Deck {
             last_metro_beat: None,
             active_notification: None,
             cue_sample: None,
+            rename_offer_started: rename_hint.as_ref().map(|_| Instant::now()),
+            rename_hint,
+            rename_accepted: None,
+            tag_editor: None,
             audio,
             tempo: TempoState {
                 bpm: 120.0,
@@ -2911,6 +3191,13 @@ impl Deck {
             },
         }
     }
+
+    fn rename_offer_active(&self) -> bool {
+        self.rename_offer_started.is_some()
+            && self.rename_hint.is_some()
+            && self.tempo.pending_bpm.is_none()
+            && self.active_notification.is_none()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -2923,6 +3210,31 @@ struct Notification {
     message: String,
     style:   NotificationStyle,
     expires: Instant,
+}
+
+const TAG_FIELD_LABELS: &[&str] = &[
+    " Artist", "  Title", "  Album", "   Year", "  Track", "  Genre", "Comment",
+];
+const TAG_EDITOR_MAX_WIDTH: u16 = 64;
+const TAG_EDITOR_MIN_WIDTH: u16 = 36; // 2 borders + 9 label + at least ~25 chars of text
+
+struct TagEditorState {
+    fields:       Vec<(String, usize)>,
+    active_field: usize,
+    current_stem: String,
+    extension:    String,
+}
+
+impl TagEditorState {
+    fn active_field_mut(&mut self) -> (&mut String, &mut usize) {
+        let (val, cur) = &mut self.fields[self.active_field];
+        (val, cur)
+    }
+    fn preview(&self) -> String {
+        let a = self.fields[0].0.trim();
+        let t = self.fields[1].0.trim();
+        format!("{t} - {a}")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3913,6 +4225,106 @@ fn decode_audio(
     Ok((mono, interleaved, sample_rate, channels))
 }
 
+fn stem_conforms(stem: &str) -> bool {
+    if let Some(idx) = stem.find(" - ") {
+        !stem[..idx].is_empty() && !stem[idx + 3..].is_empty()
+    } else {
+        false
+    }
+}
+
+// Symphonia stores ID3v2 tags (MP3) in probed.metadata and container tags (FLAC, etc.)
+// in probed.format.metadata(). Prefer probe-level (ID3v2) over format-level (ID3v1/container)
+// so that richer ID3v2 data wins on files that carry both.
+fn collect_tags(probed: &mut symphonia::core::probe::ProbeResult) -> Vec<symphonia::core::meta::Tag> {
+    let from_probe: Option<Vec<_>> = probed.metadata.get()
+        .and_then(|m| m.current().map(|r| r.tags().to_vec()))
+        .filter(|t| !t.is_empty());
+    from_probe.unwrap_or_else(|| {
+        let meta = probed.format.metadata();
+        meta.current().map(|r| r.tags().to_vec()).unwrap_or_default()
+    })
+}
+
+fn read_tags_for_editor(path: &Path) -> [String; 7] {
+    let empty = || std::array::from_fn(|_| String::new());
+    let src = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return empty(),
+    };
+    let mss = MediaSourceStream::new(Box::new(src), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let mut probed = match symphonia::default::get_probe().format(
+        &hint, mss, &FormatOptions::default(), &MetadataOptions::default(),
+    ) {
+        Ok(p) => p,
+        Err(_) => return empty(),
+    };
+    let tags = collect_tags(&mut probed);
+    let find = |key: StandardTagKey| {
+        tags.iter()
+            .find(|t| t.std_key == Some(key))
+            .map(|t| t.value.to_string())
+            .unwrap_or_default()
+    };
+    [
+        find(StandardTagKey::Artist),
+        find(StandardTagKey::TrackTitle),
+        find(StandardTagKey::Album),
+        find(StandardTagKey::Date),
+        find(StandardTagKey::TrackNumber),
+        find(StandardTagKey::Genre),
+        find(StandardTagKey::Comment),
+    ]
+}
+
+fn propose_rename_stem(path: &Path) -> String {
+    let stem_fallback = || {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    let src = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return stem_fallback(),
+    };
+    let mss = MediaSourceStream::new(Box::new(src), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let mut probed = match symphonia::default::get_probe().format(
+        &hint, mss, &FormatOptions::default(), &MetadataOptions::default(),
+    ) {
+        Ok(p) => p,
+        Err(_) => return stem_fallback(),
+    };
+    let tags = collect_tags(&mut probed);
+    let find = |key: StandardTagKey| {
+        tags.iter()
+            .find(|t| t.std_key == Some(key))
+            .map(|t| t.value.to_string())
+    };
+    match (find(StandardTagKey::Artist), find(StandardTagKey::TrackTitle)) {
+        (Some(a), Some(t)) => format!("{} - {}", sanitise_for_filename(&t), sanitise_for_filename(&a)),
+        _ => stem_fallback(),
+    }
+}
+
+// Replace characters that are illegal or ambiguous in filenames.
+// `/` is the only hard filesystem barrier on Linux, but we also strip the
+// Windows-unsafe set so that proposed names are portable.
+fn sanitise_for_filename(s: &str) -> String {
+    s.chars().map(|c| match c {
+        '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '-',
+        c => c,
+    }).collect()
+}
+
 fn read_track_name(path: &str) -> String {
     let fallback = || {
         Path::new(path)
@@ -3936,8 +4348,7 @@ fn read_track_name(path: &str) -> String {
         Ok(p) => p,
         Err(_) => return fallback(),
     };
-    let meta = probed.format.metadata();
-    let tags = meta.current().map(|r| r.tags().to_vec()).unwrap_or_default();
+    let tags = collect_tags(&mut probed);
     let find = |key: StandardTagKey| {
         tags.iter()
             .find(|t| t.std_key == Some(key))
@@ -3946,7 +4357,7 @@ fn read_track_name(path: &str) -> String {
     let artist = find(StandardTagKey::Artist);
     let title = find(StandardTagKey::TrackTitle);
     match (artist, title) {
-        (Some(a), Some(t)) => format!("{a} \u{2013} {t}"),
+        (Some(a), Some(t)) => format!("{t} \u{2013} {a}"),
         (None, Some(t)) => t,
         _ => fallback(),
     }
@@ -4279,6 +4690,119 @@ fn run_browser(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    // Cleans itself up on drop.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("tj_rename_test_{nanos}"));
+            std::fs::create_dir_all(&path).unwrap();
+            TempDir(path)
+        }
+        fn path(&self) -> &Path { &self.0 }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    /// Reads all audio files from `TEST_AUDIO_DIR`, copies them to a temp directory under
+    /// their proposed names, then asserts:
+    ///   1. Output count and total byte size match the input.
+    ///   2. Re-running the rename logic on every output file proposes no further changes.
+    ///
+    /// Run with:  TEST_AUDIO_DIR=/path/to/music cargo test rename_roundtrip -- --nocapture
+    #[test]
+    fn rename_roundtrip() {
+        let src_dir = match std::env::var("TEST_AUDIO_DIR") {
+            Ok(d) => PathBuf::from(d),
+            Err(_) => return, // env var not set — skip
+        };
+
+        fn collect_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else { return };
+            for entry in entries.filter_map(|e| e.ok()) {
+                let path = entry.path();
+                if path.is_dir() { collect_recursive(&path, out); }
+                else if path.is_file() && is_audio(&path) { out.push(path); }
+            }
+        }
+        let mut src_files: Vec<PathBuf> = Vec::new();
+        collect_recursive(&src_dir, &mut src_files);
+
+        assert!(!src_files.is_empty(), "no audio files found in TEST_AUDIO_DIR");
+
+        let src_count = src_files.len();
+        let src_bytes: u64 = src_files.iter()
+            .map(|p| std::fs::metadata(p).unwrap().len())
+            .sum();
+
+        let out_dir = TempDir::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for src in &src_files {
+            let current_stem = src.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            let target_stem = if stem_conforms(&current_stem) {
+                current_stem
+            } else {
+                propose_rename_stem(src)
+            };
+            let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let dst_name = if ext.is_empty() {
+                target_stem.clone()
+            } else {
+                format!("{target_stem}.{ext}")
+            };
+            assert!(
+                seen.insert(dst_name.clone()),
+                "naming collision: two source files map to '{dst_name}'"
+            );
+            let dst = out_dir.path().join(&dst_name);
+            std::fs::copy(src, &dst)
+                .unwrap_or_else(|e| panic!("copy failed for '{dst_name}': {e}"));
+        }
+
+        // --- assertion 1: count and total size preserved ---
+
+        let dst_files: Vec<PathBuf> = std::fs::read_dir(out_dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.is_file())
+            .collect();
+
+        assert_eq!(dst_files.len(), src_count,
+            "output file count ({}) differs from input ({})", dst_files.len(), src_count);
+
+        let dst_bytes: u64 = dst_files.iter()
+            .map(|p| std::fs::metadata(p).unwrap().len())
+            .sum();
+        assert_eq!(dst_bytes, src_bytes,
+            "output total size ({dst_bytes} B) differs from input ({src_bytes} B)");
+
+        // --- assertion 2: rename is idempotent ---
+        // Mirrors the second-pass logic exactly: conforming stems are left alone,
+        // so only non-conforming stems need to be stable under propose_rename_stem.
+
+        for dst in &dst_files {
+            let current_stem = dst.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            if !stem_conforms(&current_stem) {
+                let proposed = propose_rename_stem(dst);
+                assert_eq!(proposed, current_stem,
+                    "rename not idempotent for '{}': proposed '{proposed}'",
+                    dst.display());
+            }
+        }
+    }
 
     fn make_state(kinds: &[EntryKind]) -> BrowserState {
         BrowserState {
