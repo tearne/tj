@@ -6,7 +6,7 @@ fn home_dir() -> Option<std::path::PathBuf> {
 
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Action {
-    Quit, Help, TerminalRefresh,
+    Quit, Help, TerminalRefresh, VinylModeToggle,
     ZoomIn, ZoomOut, HeightIncrease, HeightDecrease,
     LatencyIncrease, LatencyDecrease,
     WaveformStyle, PaletteCycle,
@@ -45,6 +45,7 @@ pub(crate) static ACTION_NAMES: &[(&str, Action)] = &[
     ("quit",              Action::Quit),
     ("help",              Action::Help),
     ("terminal_refresh",  Action::TerminalRefresh),
+    ("vinyl_mode_toggle", Action::VinylModeToggle),
     ("zoom_in",           Action::ZoomIn),
     ("zoom_out",          Action::ZoomOut),
     ("height_increase",   Action::HeightIncrease),

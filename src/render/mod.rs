@@ -391,6 +391,7 @@ pub(crate) fn notification_line_for_deck(deck: &Deck, content_width: usize) -> L
             NotificationStyle::Info    => Color::DarkGray,
             NotificationStyle::Warning => Color::Yellow,
             NotificationStyle::Error   => Color::Red,
+            NotificationStyle::Success => Color::Green,
         };
         Line::from(Span::styled(n.message.clone(), Style::default().fg(color)))
     } else if deck.rename_offer_active() {
@@ -432,6 +433,7 @@ pub(crate) fn info_line_for_deck(
     analysing: bool,
     _label_style: Style,
     bar_width: u16,
+    vinyl_mode: bool,
 ) -> Line<'static> {
     const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let play_icon = if deck.audio.player.is_paused() { "⏸" } else { "▶" };
@@ -459,36 +461,58 @@ pub(crate) fn info_line_for_deck(
             ),
         ]);
     }
-    let beat_style = if beat_on {
+    // Beat flash is suppressed in vinyl mode.
+    let beat_active = !vinyl_mode && beat_on;
+    let beat_style = if beat_active {
         Style::default().fg(Color::Yellow).bg(Color::Rgb(60, 50, 0))
     } else {
         dim
     };
-    let adjusted = (deck.tempo.bpm - deck.tempo.base_bpm).abs() >= 0.05;
+    // Percentage display: vinyl mode always; beat mode when no BPM established.
+    let show_percentage = vinyl_mode || !deck.tempo.bpm_established;
 
     // --- Left group ---
     let left_spans: Vec<Span<'static>> = {
         let mut spans = vec![Span::styled(format!("{play_icon}  "), dim)];
-        let unconfirmed = !deck.tempo.bpm_established;
-        let red_style = Style::default().fg(Color::Red);
-        if adjusted {
-            spans.push(Span::styled(format!("{:.2} ", deck.tempo.base_bpm), dim));
-            spans.push(Span::styled("(", dim));
-            if unconfirmed {
-                spans.push(Span::styled(format!("~{:.2}", deck.tempo.bpm), red_style));
+        if show_percentage {
+            let pct = if vinyl_mode {
+                (deck.tempo.vinyl_speed - 1.0) * 100.0
             } else {
-                spans.push(Span::styled(format!("{:.2}", deck.tempo.bpm), beat_style));
+                (deck.tempo.bpm / deck.tempo.base_bpm - 1.0) * 100.0
+            };
+            let rounded = (pct * 10.0).round() / 10.0;
+            let pct_str = if rounded == 0.0 {
+                "0.0%".to_string()
+            } else if rounded > 0.0 {
+                format!("+{:.1}%", rounded)
+            } else {
+                format!("{:.1}%", rounded)
+            };
+            spans.push(Span::styled(pct_str, beat_style));
+            // In beat mode without BPM, offset and metronome remain visible (dormant).
+            // In vinyl mode they are hidden entirely.
+            if !vinyl_mode {
+                if deck.metronome_mode {
+                    spans.push(Span::styled("\u{266A}", Style::default().fg(Color::Red)));
+                }
+                spans.push(Span::styled(format!("  {:+}ms", deck.tempo.offset_ms), dim));
             }
-            spans.push(Span::styled(")", dim));
-        } else if unconfirmed {
-            spans.push(Span::styled(format!("~{:.2}", deck.tempo.base_bpm), red_style));
         } else {
-            spans.push(Span::styled(format!("{:.2}", deck.tempo.base_bpm), beat_style));
+            // base_bpm adjusts in 0.01 steps → 2dp; playback bpm adjusts in 0.1 steps → 1dp.
+            let adjusted = (deck.tempo.bpm - deck.tempo.base_bpm).abs() >= 0.05;
+            if adjusted {
+                spans.push(Span::styled(format!("{:.2} ", deck.tempo.base_bpm), dim));
+                spans.push(Span::styled("(", dim));
+                spans.push(Span::styled(format!("{:.1}", deck.tempo.bpm), beat_style));
+                spans.push(Span::styled(")", dim));
+            } else {
+                spans.push(Span::styled(format!("{:.2}", deck.tempo.base_bpm), beat_style));
+            }
+            if deck.metronome_mode {
+                spans.push(Span::styled("\u{266A}", Style::default().fg(Color::Red)));
+            }
+            spans.push(Span::styled(format!("  {:+}ms", deck.tempo.offset_ms), dim));
         }
-        if deck.metronome_mode {
-            spans.push(Span::styled("\u{266A}", Style::default().fg(Color::Red)));
-        }
-        spans.push(Span::styled(format!("  {:+}ms", deck.tempo.offset_ms), dim));
         if !tap_str.is_empty() {
             if tap_flash_on {
                 let tap_flash_style = Style::default().fg(Color::Yellow).bg(Color::Rgb(60, 50, 0));
@@ -676,7 +700,7 @@ pub(crate) fn overview_for_deck(
     (ov_lines, bar_cols, bar_times)
 }
 
-pub(crate) fn overview_empty(rect: ratatui::layout::Rect) -> Vec<Line<'static>> {
+pub(crate) fn overview_empty(rect: ratatui::layout::Rect, vinyl_mode: bool) -> Vec<Line<'static>> {
     let w = rect.width as usize;
     let h = rect.height as usize;
     if w == 0 || h == 0 { return vec![]; }
@@ -688,8 +712,12 @@ pub(crate) fn overview_empty(rect: ratatui::layout::Rect) -> Vec<Line<'static>> 
         .map(|row| (0..w).map(|c| (row[c * 2] & 0x47) | (row[c * 2 + 1] & 0xB8)).collect())
         .collect();
 
-    // 120 BPM ticks over a 5-minute dummy duration.
-    let (bar_cols, _, _) = bar_tick_cols(120.0, 0, 300.0, w);
+    // 120 BPM ticks over a 5-minute dummy duration — beat mode only.
+    let bar_cols: Vec<usize> = if vinyl_mode {
+        Vec::new()
+    } else {
+        bar_tick_cols(120.0, 0, 300.0, w).0
+    };
 
     let wave_color = Color::Rgb(35, 35, 55);
     let tick_color = Color::DarkGray;

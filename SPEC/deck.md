@@ -6,7 +6,7 @@
 - One deck is active at a time. `g` selects Deck A; `h` selects Deck B. The active deck's control section is visually highlighted; the inactive deck's section is dim.
 - All active-deck controls (transport, BPM, offset, metronome, nudge, tap, re-detect) apply to the active deck only. Zoom and detail height are global and apply to both decks simultaneously.
 - Level and filter have dedicated per-deck bindings and may be adjusted on either deck regardless of which is active (see [keymap.md](keymap.md)).
-- Global controls (quit, help, terminal refresh, file browser, deck select) are not deck-specific.
+- Global controls (quit, help, vinyl mode toggle, terminal refresh, file browser, deck select) are not deck-specific.
 - At startup only Deck A is used. Deck B can be loaded by selecting it with `h` and opening the file browser.
 - Audio latency is a single global setting shared across both decks.
 
@@ -26,7 +26,7 @@
 - When analysis completes and no BPM is yet established (fresh load, no cache, no tap or manual adjustment), the BPM is applied immediately. If a BPM is already established, the result is held as a pending confirmation.
 - While a confirmation is pending, the notification bar shows a yellow prompt with the detected BPM and a countdown (e.g. `BPM detected: 124.40  [y] accept  [n] reject  (14s)`); the countdown number turns red when ≤ 5 s remain. The info bar right group is unaffected. Pressing `y` or `Enter` applies the result; any other key rejects it. After 15 seconds the result is auto-rejected and the pre-existing BPM and offset are preserved.
 - `@` triggers a manual re-detection pass at any time. The result always goes through the confirmation step. Pressing `@` while analysis is in progress hides the spinner (the thread continues silently); pressing `@` again reconnects to the same thread rather than spawning a new one.
-- The detected BPM is displayed to two decimal places.
+- The native BPM (`base_bpm`) is displayed to two decimal places, matching the 0.01 resolution of the `X`/`S` adjustment keys. The playback BPM (after `x`/`s` adjustment) is displayed to one decimal place, matching the 0.1 resolution of those keys. All underlying values retain full precision; rounding is display-only.
 - A beat phase offset (in milliseconds) can be adjusted at runtime to align the beat indicator with the audio. The offset and BPM are displayed in the UI.
 - `offset_ms` is snapped to the nearest 10 ms boundary on load from the cache, ensuring `+`/`-` steps always land on multiples of 10 ms and 0 ms is always reachable. After each adjustment and on cache load, `offset_ms` is wrapped into `[0, beat_period_ms)` using `rem_euclid`, where `beat_period_ms` is derived from `base_bpm` rounded to the nearest 10 ms, ensuring the offset always remains on the 10 ms grid.
 - The user can correct an inaccurate detection at runtime:
@@ -71,6 +71,34 @@
 ## Beat Jump
 
 - Eight dedicated beat jump actions cover four sizes (1, 4, 16, 64 beats) in each direction. Each action jumps by exactly N × `(60 / base_bpm)` audio seconds, which equals N beat periods at the effective playback BPM and lands precisely on the next tick mark.
+- In vinyl mode, beat jump keys are remapped to fixed time intervals (see *Vinyl Mode* below).
 - Jumping backward past the start clamps to position 0. Jumping forward past the end is a no-op.
 - Seeking is implemented via an atomic position counter shared with the audio thread; the audio thread never pauses.
 - A ~6ms fade-out before the cut and ~6ms fade-in after eliminate click artefacts without any perceptible gap.
+
+## Vinyl Mode
+
+Vinyl mode is a global toggle (`` ` ``) that applies to both decks simultaneously. It hides the BPM machinery and presents a cleaner interface for ear-based pitch matching.
+
+**Speed control** — `vinyl_speed: f32` (per deck, 1.0 = nominal) is the authoritative playback speed in vinyl mode, passed directly to `player.set_speed`. The BPM keys (`x`/`s`, `v`/`f`) adjust `vinyl_speed` in 0.001 steps (±0.1%); this is the only change: the same keys, the same step feel, a different unit. `vinyl_speed` resets to 1.0 whenever a new track is loaded in vinyl mode.
+
+**Speed display** — The BPM field in the info bar is replaced by a percentage (e.g. `+0.3%`, `0.0%`) derived from `vinyl_speed`. Beat flash, phase offset, and metronome indicator are hidden.
+
+**Waveform** — Beat tick marks and the cue column are hidden. The waveform itself is unchanged.
+
+**Beat jumps** — Remapped to fixed time intervals matching the beat jump sizes at 120 BPM:
+
+| Keys | Beat mode | Vinyl mode |
+|------|-----------|------------|
+| `1` / `q` | ±1 beat | ±0.5 s |
+| `2` / `w` | ±4 beats | ±2 s |
+| `3` / `e` | ±16 beats | ±8 s |
+| `4` / `r` | ±64 beats | ±32 s |
+
+**BPM analysis** — Does not run while vinyl mode is active. The redetect key has no effect in vinyl mode.
+
+**Mode transition: vinyl → beat** — On switching back to beat mode, `vinyl_speed` is converted to a BPM adjustment: `bpm = base_bpm × vinyl_speed`. The player speed is unchanged. The beat grid and display immediately reflect the new BPM.
+
+**Mode transition: beat → vinyl** — `vinyl_speed` is set to the current `bpm / base_bpm` so audio speed does not change.
+
+**Session persistence** — The active mode is stored in the cache file. On startup, the last-used mode is restored; the default for a fresh installation is beat mode.

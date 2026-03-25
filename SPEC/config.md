@@ -46,7 +46,8 @@
 | `h` | Select Deck B as active |
 | `z` | Open / close file browser (loads into active deck) |
 | `?` | Toggle key binding help popup |
-| `` ` `` | Refresh terminal (clear display glitches) |
+| `` ` `` | Toggle vinyl mode |
+| `¬` | Refresh terminal (clear display glitches) |
 | `Esc` / `Ctrl-C` | Quit |
 
 > Key bindings reflect the defaults in `config.toml`. All player bindings are user-configurable.
@@ -59,7 +60,7 @@ The diagram below shows all default bindings across the keyboard. Each cell list
 ── NUMBER ROW ─────────────────────────────────────────────────
  keys  │  `  │  1  │  2  │  3  │  4  │  7  │  8  │  -  │  =  │
  Sh    │     │1OF+ │     │2OF+ │     │     │     │     │     │
- --    │TREF │1+4b │1+8b │2+4b │2+8b │1HPF │2LPF │ZMIN │ZMOT │
+ --    │VNYL │1+4b │1+8b │2+4b │2+8b │1HPF │2LPF │ZMIN │ZMOT │
  Sp    │     │1+1Bt│1+4Bt│2+1Bt│2+4Bt│1 F= │2 F= │     │     │
 ── TOP ROW ────────────────────────────────────────────────────
  keys  │  q  │  w  │  e  │  r  │  u  │  i  │  o  │  p  │  [  │  ]  │

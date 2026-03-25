@@ -8,13 +8,6 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::{MetadataOptions, StandardTagKey};
 use symphonia::core::probe::Hint;
 
-pub(crate) fn stem_conforms(stem: &str) -> bool {
-    if let Some(idx) = stem.find(" - ") {
-        !stem[..idx].is_empty() && !stem[idx + 3..].is_empty()
-    } else {
-        false
-    }
-}
 
 // Symphonia stores ID3v2 tags (MP3) in probed.metadata and container tags (FLAC, etc.)
 // in probed.format.metadata(). Prefer probe-level (ID3v2) over format-level (ID3v1/container)
@@ -226,15 +219,7 @@ mod tests {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for src in &src_files {
-            let current_stem = src.file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-            let target_stem = if stem_conforms(&current_stem) {
-                current_stem
-            } else {
-                propose_rename_stem(src)
-            };
+            let target_stem = propose_rename_stem(src);
             let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("");
             let dst_name = if ext.is_empty() {
                 target_stem.clone()
@@ -277,12 +262,10 @@ mod tests {
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_string();
-            if !stem_conforms(&current_stem) {
-                let proposed = propose_rename_stem(dst);
-                assert_eq!(proposed, current_stem,
-                    "rename not idempotent for '{}': proposed '{proposed}'",
-                    dst.display());
-            }
+            let proposed = propose_rename_stem(dst);
+            assert_eq!(proposed, current_stem,
+                "rename not idempotent for '{}': proposed '{proposed}'",
+                dst.display());
         }
     }
 
@@ -322,6 +305,14 @@ mod tests {
         if let Some(path) = first_audio(&dir) {
             let stem = propose_rename_stem(&path);
             assert!(!stem.is_empty(), "propose_rename_stem returned empty for {}", path.display());
+            let tags = read_tags_for_editor(&path);
+            let artist = &tags[0];
+            let title  = &tags[1];
+            if !artist.is_empty() && !title.is_empty() {
+                let expected = format!("{} - {}", sanitise_for_filename(title), sanitise_for_filename(artist));
+                assert_eq!(stem, expected,
+                    "propose_rename_stem did not match tags for {}", path.display());
+            }
         }
     }
 

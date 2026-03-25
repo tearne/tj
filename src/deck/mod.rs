@@ -51,6 +51,9 @@ pub(crate) struct TempoState {
     pub(crate) redetecting: bool,
     pub(crate) redetect_saved_hash: Option<String>,
     pub(crate) background_rx: Option<std::sync::mpsc::Receiver<(String, f32, i64, bool)>>,
+    /// Absolute playback speed multiplier (1.0 = nominal). Used in vinyl mode and when
+    /// no BPM is established. Independent of BPM state; passed directly to `player.set_speed`.
+    pub(crate) vinyl_speed: f32,
 }
 
 pub(crate) struct TapState {
@@ -81,7 +84,7 @@ pub(crate) struct SpectrumState {
 pub(crate) enum NudgeMode { Jump, Warp }
 
 #[allow(dead_code)]
-pub(crate) enum NotificationStyle { Info, Warning, Error }
+pub(crate) enum NotificationStyle { Info, Warning, Error, Success }
 
 pub(crate) struct Notification {
     pub(crate) message: String,
@@ -179,6 +182,7 @@ impl Deck {
                 redetecting: false,
                 redetect_saved_hash: None,
                 background_rx: None,
+                vinyl_speed: 1.0,
             },
             tap: TapState {
                 tap_times: Vec::new(),
@@ -391,6 +395,21 @@ pub(crate) fn do_jump(seek_handle: &SeekHandle, player: &rodio::Player, bpm: f32
     } else {
         let target = current + jump;
         if playing && target + jump > track_end { return; }
+        let clamped = target.min(track_end);
+        if playing { seek_handle.seek_to(clamped); } else { seek_handle.seek_direct(clamped); }
+    }
+}
+
+/// Seek by a fixed number of seconds (vinyl mode jump).
+pub(crate) fn do_time_jump(seek_handle: &SeekHandle, player: &Player, track_end: f64, secs: f64) {
+    let current = seek_handle.current_pos().as_secs_f64();
+    let playing  = !player.is_paused();
+    if secs < 0.0 {
+        let target = (current + secs).max(0.0);
+        if playing { seek_handle.seek_to(target); } else { seek_handle.seek_direct(target); }
+    } else {
+        let target = current + secs;
+        if playing && target + secs > track_end { return; }
         let clamped = target.min(track_end);
         if playing { seek_handle.seek_to(clamped); } else { seek_handle.seek_direct(clamped); }
     }

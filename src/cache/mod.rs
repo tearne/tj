@@ -36,6 +36,8 @@ pub(crate) struct CacheFile {
     #[serde(default)]
     pub(crate) audio_latency_ms: i64,
     #[serde(default)]
+    pub(crate) vinyl_mode: bool,
+    #[serde(default)]
     pub(crate) entries: std::collections::HashMap<String, CacheEntry>,
 }
 
@@ -43,6 +45,7 @@ pub(crate) struct Cache {
     pub(crate) path: std::path::PathBuf,
     pub(crate) last_browser_path: Option<std::path::PathBuf>,
     pub(crate) audio_latency_ms: i64,
+    pub(crate) vinyl_mode: bool,
     pub(crate) entries: std::collections::HashMap<String, CacheEntry>,
 }
 
@@ -63,6 +66,7 @@ impl Cache {
             path,
             last_browser_path: file.last_browser_path.map(std::path::PathBuf::from),
             audio_latency_ms: file.audio_latency_ms,
+            vinyl_mode: file.vinyl_mode,
             entries: file.entries,
         }
     }
@@ -91,6 +95,14 @@ impl Cache {
         self.audio_latency_ms = ms;
     }
 
+    pub(crate) fn get_vinyl_mode(&self) -> bool {
+        self.vinyl_mode
+    }
+
+    pub(crate) fn set_vinyl_mode(&mut self, mode: bool) {
+        self.vinyl_mode = mode;
+    }
+
     pub(crate) fn entries_snapshot(&self) -> std::collections::HashMap<String, CacheEntry> {
         self.entries.clone()
     }
@@ -105,6 +117,7 @@ impl Cache {
                 .as_ref()
                 .and_then(|p| p.to_str().map(|s| s.to_string())),
             audio_latency_ms: self.audio_latency_ms,
+            vinyl_mode: self.vinyl_mode,
             entries: self.entries.clone(),
         };
         if let Ok(text) = serde_json::to_string_pretty(&file) {
