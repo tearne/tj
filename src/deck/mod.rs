@@ -47,6 +47,7 @@ pub(crate) struct TempoState {
     pub(crate) bpm_rx: std::sync::mpsc::Receiver<(String, f32, i64, bool)>,
     pub(crate) analysis_hash: Option<String>,
     pub(crate) bpm_established: bool,
+    pub(crate) offset_established: bool,
     pub(crate) pending_bpm: Option<(String, f32, i64, Instant)>,
     pub(crate) redetecting: bool,
     pub(crate) redetect_saved_hash: Option<String>,
@@ -178,6 +179,7 @@ impl Deck {
                 bpm_rx,
                 analysis_hash: None,
                 bpm_established: false,
+                offset_established: false,
                 pending_bpm: None,
                 redetecting: false,
                 redetect_saved_hash: None,
@@ -291,6 +293,7 @@ pub(crate) fn apply_offset_step(d: &mut Deck, delta_ms: i64) {
     d.tempo.offset_ms += delta_ms;
     let period = (60_000.0 / d.tempo.base_bpm as f64 / 10.0).round() as i64 * 10;
     d.tempo.offset_ms = d.tempo.offset_ms.rem_euclid(period);
+    d.tempo.offset_established = true;
     if d.audio.player.is_paused() {
         let delta_samp = delta_ms as f64 / 1000.0 * d.audio.sample_rate as f64;
         d.display.smooth_display_samp = (d.display.smooth_display_samp + delta_samp).max(0.0);

@@ -25,10 +25,19 @@ A single row pinned to the bottom of the UI. Content priority:
 ### Notification Bar
 
 - A single line displayed above the info bar. By default it shows the track name derived from embedded metadata: `Artist – Title` if both are present, `Title` if only a title is available, or the filename as a fallback. Shown only when a track is loaded.
-- When a notification is active it temporarily replaces the track name. Notifications carry a message, a style (`Info` / `Warning` / `Error`), and an expiry; the most recent notification takes precedence. Notifications expire automatically after their timeout; no explicit dismissal is required.
+- When a notification is active it temporarily replaces the track name. Notifications carry a message, a style (`Info` / `Warning` / `Error` / `Success`), and an expiry; the most recent notification takes precedence. Notifications expire automatically after their timeout; no explicit dismissal is required.
 - The track name is rendered in a muted form of the active palette's treble colour, distinguishing it visually from notification text.
 - The BPM confirmation prompt (see `deck/SPEC.md`) is displayed as a `Warning`-style notification.
 - If no config file is found on first launch, an `Info` notification briefly displays the path at which the default config was created, then the bar reverts to the track name.
+- Three cache status indicators are shown right-aligned in the notification bar whenever a track is loaded, separated from the track name by a spacer. They occupy a fixed 16-character width so the track name does not shift as state changes.
+
+| Indicator | Lit condition |
+|-----------|--------------|
+| `[BPM]`  | BPM established (analysis complete or loaded from cache) |
+| `[Tick]` | The beat grid has been explicitly placed — `offset_established` is true (set by any offset adjustment, tap BPM, or BPM confirmation) or a cue point is set |
+| `[Cue]`  | A cue point is set |
+
+"Lit" uses the active palette's treble colour. "Dark" uses a near-black colour. In vinyl mode all three indicators are always shown dark regardless of state; they return to normal lit/dark when switching back to beat mode.
 
 ### Info Bar
 

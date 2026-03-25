@@ -1,6 +1,14 @@
 # Cache Status Indicator
 **Type**: Proposal
-**Status**: Draft
+**Status**: Implemented
+
+## Log
+
+- `src/render/mod.rs`: added `cache_indicator_spans`; `notification_line_for_deck` takes `vinyl_mode: bool` and renders `[BPM][Tick][Cue]` right-aligned in the idle and rename-offer states; three brightness levels (beat-lit 0.45, vinyl-dim 0.18, dark near-black); `[Tick]` uses `offset_established || cue_sample.is_some()`
+- `src/main.rs`: both `notification_line_for_deck` call sites pass `vinyl_mode`; `offset_established` set at all user-action sites (offset step, tap BPM, BPM confirmation, cue set); restored from cache on analysis result
+- `src/deck/mod.rs`: `offset_established: bool` added to `TempoState`; set in `apply_offset_step`
+- `src/cache/mod.rs`: `offset_established: bool` added to `CacheEntry` with `#[serde(default)]`
+- `SPEC/render.md`: notification bar section updated with indicators, vinyl mode behaviour, corrected `[Tick]` condition; `Success` added to notification styles
 
 ## Intent
 

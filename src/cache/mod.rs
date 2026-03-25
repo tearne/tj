@@ -27,6 +27,8 @@ pub(crate) struct CacheEntry {
     pub(crate) name: String,
     #[serde(default)]
     pub(crate) cue_sample: Option<usize>,
+    #[serde(default)]
+    pub(crate) offset_established: bool,
 }
 
 #[derive(Serialize, Deserialize, Default)]

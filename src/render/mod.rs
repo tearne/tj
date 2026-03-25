@@ -371,7 +371,23 @@ impl SharedDetailRenderer {
     }
 }
 
-pub(crate) fn notification_line_for_deck(deck: &Deck, content_width: usize) -> Line<'static> {
+fn cache_indicator_spans(deck: &Deck, vinyl_mode: bool) -> Vec<Span<'static>> {
+    let lit  = Style::default().fg(spectral_color(deck.display.palette, 0.0, 0.45));
+    let dim  = Style::default().fg(spectral_color(deck.display.palette, 0.0, 0.18));
+    let dark = Style::default().fg(Color::Rgb(50, 50, 50));
+    let indicator_style = |active: bool| match (active, vinyl_mode) {
+        (true,  false) => lit,
+        (true,  true)  => dim,
+        (false, _)     => dark,
+    };
+    vec![
+        Span::styled("[BPM]",  indicator_style(deck.tempo.bpm_established)),
+        Span::styled("[Tick]", indicator_style(deck.tempo.offset_established || deck.cue_sample.is_some())),
+        Span::styled("[Cue]",  indicator_style(deck.cue_sample.is_some())),
+    ]
+}
+
+pub(crate) fn notification_line_for_deck(deck: &Deck, content_width: usize, vinyl_mode: bool) -> Line<'static> {
     let dim = Style::default().fg(Color::DarkGray);
     if let Some((_, p_bpm, _, received_at)) = &deck.tempo.pending_bpm {
         let secs_left = 15u64.saturating_sub(received_at.elapsed().as_secs());
@@ -403,19 +419,31 @@ pub(crate) fn notification_line_for_deck(deck: &Deck, content_width: usize) -> L
             ("rename? [y]".to_string(), dim)
         };
         let track_name = deck.track_name.clone();
+        let indicators = cache_indicator_spans(deck, vinyl_mode);
+        let indicators_w = 16; // "[BPM][Tick][Cue]"
         let left_w  = track_name.chars().count();
-        let right_w = offer.chars().count();
+        let right_w = offer.chars().count() + 1 + indicators_w; // space + indicators
         let spacer_w = content_width.saturating_sub(left_w + right_w).max(1);
-        Line::from(vec![
+        let mut spans = vec![
             Span::styled(track_name, Style::default().fg(spectral_color(deck.display.palette, 0.0, 0.85))),
             Span::raw(" ".repeat(spacer_w)),
             Span::styled(offer, offer_style),
-        ])
+            Span::raw(" "),
+        ];
+        spans.extend(indicators);
+        Line::from(spans)
     } else {
-        Line::from(Span::styled(
-            deck.track_name.clone(),
-            Style::default().fg(spectral_color(deck.display.palette, 0.0, 0.85)),
-        ))
+        let track_name = deck.track_name.clone();
+        let indicators = cache_indicator_spans(deck, vinyl_mode);
+        let indicators_w = 16; // "[BPM][Tick][Cue]"
+        let left_w   = track_name.chars().count();
+        let spacer_w = content_width.saturating_sub(left_w + indicators_w).max(1);
+        let mut spans = vec![
+            Span::styled(track_name, Style::default().fg(spectral_color(deck.display.palette, 0.0, 0.85))),
+            Span::raw(" ".repeat(spacer_w)),
+        ];
+        spans.extend(indicators);
+        Line::from(spans)
     }
 }
 
@@ -700,125 +728,40 @@ pub(crate) fn overview_for_deck(
     (ov_lines, bar_cols, bar_times)
 }
 
-pub(crate) fn overview_empty(rect: ratatui::layout::Rect, vinyl_mode: bool) -> Vec<Line<'static>> {
+fn empty_deck_mesh_line(w: usize, bg: Color, fg: Color) -> Line<'static> {
+    // U+2895 has dots 1,3,5,8 — a checkerboard within the 2×4 cell (•./. •/•./. •).
+    // Tiling identical characters continues the alternating pattern seamlessly in
+    // both directions, so no per-column logic is needed.
+    let s: String = std::iter::repeat('\u{2895}').take(w).collect();
+    Line::from(Span::styled(s, Style::default().fg(fg).bg(bg)))
+}
+
+pub(crate) fn overview_empty(rect: ratatui::layout::Rect, deck_slot: usize) -> Vec<Line<'static>> {
     let w = rect.width as usize;
     let h = rect.height as usize;
-    if w == 0 || h == 0 { return vec![]; }
-
-    // Zero-amplitude peaks (flat line) at double width for half-col resolution.
-    let hires: Vec<(f32, f32)> = vec![(0.0f32, 0.0f32); w * 2];
-    let hires_buf = render_braille(&hires, h, w * 2, false);
-    let ov_braille: Vec<Vec<u8>> = hires_buf.iter()
-        .map(|row| (0..w).map(|c| (row[c * 2] & 0x47) | (row[c * 2 + 1] & 0xB8)).collect())
-        .collect();
-
-    // 120 BPM ticks over a 5-minute dummy duration — beat mode only.
-    let bar_cols: Vec<usize> = if vinyl_mode {
-        Vec::new()
+    let bg = Color::Rgb(11, 11, 15);
+    let fg = if deck_slot == 0 {
+        Color::Rgb(26, 26, 36)
     } else {
-        bar_tick_cols(120.0, 0, 300.0, w).0
+        Color::Rgb(17, 17, 24)
     };
-
-    let wave_color = Color::Rgb(35, 35, 55);
-    let tick_color = Color::DarkGray;
-
-    ov_braille.into_iter().map(|row| {
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        let mut run = String::new();
-        let mut run_color = Color::Reset;
-        for (c, byte) in row.into_iter().enumerate() {
-            let (color, ch) = if bar_cols.contains(&c) {
-                (tick_color, '│')
-            } else {
-                (wave_color, char::from_u32(0x2800 | byte as u32).unwrap_or(' '))
-            };
-            if color != run_color {
-                if !run.is_empty() {
-                    spans.push(Span::styled(std::mem::take(&mut run), Style::default().fg(run_color)));
-                }
-                run_color = color;
-            }
-            run.push(ch);
-        }
-        if !run.is_empty() {
-            spans.push(Span::styled(run, Style::default().fg(run_color)));
-        }
-        Line::from(spans)
-    }).collect()
+    vec![empty_deck_mesh_line(w, bg, fg); h]
 }
 
 pub(crate) fn render_detail_empty(
     frame: &mut ratatui::Frame,
     area: ratatui::layout::Rect,
-    display_cfg: &crate::config::DisplayConfig,
-    shared_tick: Option<(&[u8], &[u8])>,
+    deck_slot: usize,
 ) {
     let w = area.width as usize;
     let h = area.height as usize;
-    if w == 0 || h == 0 { return; }
-
-    let centre_col = ((w as f64 * display_cfg.playhead_position as f64 / 100.0) as usize)
-        .clamp(0, w.saturating_sub(1));
-
-    let waveform_rows = if shared_tick.is_some() { h.saturating_sub(1) } else { h };
-    let wave_color   = Color::Rgb(35, 35, 55);
-    let centre_color = Color::Rgb(60, 60, 60);
-
-    let empty_row = vec![0u8; w];
-    let mut lines: Vec<Line<'static>> = (0..waveform_rows).map(|_r| {
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        let mut run = String::new();
-        let mut run_color = Color::Reset;
-        for (c, &byte) in empty_row.iter().enumerate() {
-            let (color, ch) = if c == centre_col {
-                (centre_color, '⣿')
-            } else {
-                (wave_color, char::from_u32(0x2800 | byte as u32).unwrap_or(' '))
-            };
-            if color != run_color {
-                if !run.is_empty() {
-                    spans.push(Span::styled(std::mem::take(&mut run), Style::default().fg(run_color)));
-                }
-                run_color = color;
-            }
-            run.push(ch);
-        }
-        if !run.is_empty() {
-            spans.push(Span::styled(run, Style::default().fg(run_color)));
-        }
-        Line::from(spans)
-    }).collect();
-
-    // Shared tick row (only for deck A slot).
-    if let Some((tick_a, tick_b)) = shared_tick {
-        let tick_color = Color::Rgb(60, 60, 60);
-        let display_row = compose_shared_tick_row(tick_a, tick_b, w);
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        let mut run = String::new();
-        let mut run_color = Color::Reset;
-        for c in 0..w {
-            let byte = display_row[c];
-            let (color, ch) = if c == centre_col {
-                (centre_color, '⣿')
-            } else if byte != 0 {
-                (tick_color, char::from_u32(0x2800 | byte as u32).unwrap_or(' '))
-            } else {
-                (tick_color, ' ')
-            };
-            if color != run_color {
-                if !run.is_empty() {
-                    spans.push(Span::styled(std::mem::take(&mut run), Style::default().fg(run_color)));
-                }
-                run_color = color;
-            }
-            run.push(ch);
-        }
-        if !run.is_empty() {
-            spans.push(Span::styled(run, Style::default().fg(run_color)));
-        }
-        lines.push(Line::from(spans));
-    }
-
+    let bg = Color::Rgb(11, 11, 15);
+    let fg = if deck_slot == 0 {
+        Color::Rgb(26, 26, 36)
+    } else {
+        Color::Rgb(17, 17, 24)
+    };
+    let lines: Vec<Line<'static>> = vec![empty_deck_mesh_line(w, bg, fg); h];
     frame.render_widget(Paragraph::new(lines), area);
 }
 
@@ -1217,7 +1160,6 @@ pub(crate) fn render_detail_waveform(
     detail_area: ratatui::layout::Rect,
     display_cfg: &crate::config::DisplayConfig,
     display_pos_samp: usize,
-    shared_tick: Option<(&[u8], &[u8])>,
     palette: SpecPalette,
 ) {
     let detail_width      = detail_area.width  as usize;
@@ -1255,16 +1197,11 @@ pub(crate) fn render_detail_waveform(
         })
     });
 
-    // Waveform rows occupy the full panel minus the shared tick row (if present).
-    let waveform_rows = if shared_tick.is_some() {
-        detail_panel_rows.saturating_sub(1)
-    } else {
-        detail_panel_rows
-    };
+    let waveform_rows = detail_panel_rows;
 
-    let mut detail_lines: Vec<Line<'static>> = (0..waveform_rows)
+    let detail_lines: Vec<Line<'static>> = (0..waveform_rows)
         .map(|r| {
-            // buf_r maps directly: row 0 → buffer row 0 (no top tick row to skip).
+            // buf_r maps directly: row 0 → buffer row 0.
             let buf_r = r;
             let shifted: Option<Vec<u8>>;
             let row_slice: Option<&[u8]>;
@@ -1322,32 +1259,19 @@ pub(crate) fn render_detail_waveform(
         })
         .collect();
 
-    // Shared tick row (bottom of deck A panel only).
-    if let Some((tick_a, tick_b)) = shared_tick {
-        let display_row = compose_shared_tick_row(tick_a, tick_b, detail_width);
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        let mut run = String::new();
-        let mut run_color = Color::Reset;
-        for c in 0..detail_width {
-            let byte = display_row[c];
-            let (color, ch) = if byte != 0 {
-                (Color::Gray, char::from_u32(0x2800 | byte as u32).unwrap_or(' '))
-            } else {
-                (Color::Gray, ' ')
-            };
-            if color != run_color {
-                if !run.is_empty() {
-                    spans.push(Span::styled(std::mem::take(&mut run), Style::default().fg(run_color)));
-                }
-                run_color = color;
-            }
-            run.push(ch);
-        }
-        if !run.is_empty() {
-            spans.push(Span::styled(run, Style::default().fg(run_color)));
-        }
-        detail_lines.push(Line::from(spans));
-    }
-
     frame.render_widget(Paragraph::new(detail_lines), detail_area);
+}
+
+pub(crate) fn render_shared_tick_row(
+    frame: &mut ratatui::Frame,
+    area: ratatui::layout::Rect,
+    tick_a: &[u8],
+    tick_b: &[u8],
+) {
+    let w = area.width as usize;
+    let display_row = compose_shared_tick_row(tick_a, tick_b, w);
+    let s: String = display_row.iter().map(|&byte| {
+        if byte != 0 { char::from_u32(0x2800 | byte as u32).unwrap_or(' ') } else { ' ' }
+    }).collect();
+    frame.render_widget(Paragraph::new(Line::from(Span::styled(s, Style::default().fg(Color::Gray)))), area);
 }

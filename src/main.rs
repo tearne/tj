@@ -46,6 +46,7 @@ use render::{
     extract_tick_viewport, info_line_empty, DEFAULT_ZOOM_IDX,
     info_line_for_deck, notification_line_empty, notification_line_for_deck,
     overview_empty, overview_for_deck, render_detail_empty, render_detail_waveform,
+    render_shared_tick_row,
     render_tag_editor, SharedDetailRenderer, ZOOM_LEVELS,
 };
 use tags::{propose_rename_stem, read_tags_for_editor, read_track_name};
@@ -472,7 +473,7 @@ fn tui_loop(
             const OV_MIN:  u16 = 2;
             let det_max = detail_height as u16;
             let ih = inner.height;
-            let fixed = 6_u16; // global + detail-info + notif×2 + info×2
+            let fixed = 7_u16; // global + detail-info + shared-tick + notif×2 + info×2
 
             // Cap detail_height to what the current terminal can actually display,
             // so HeightIncrease never outruns the screen.
@@ -521,24 +522,25 @@ fn tui_loop(
                 take(&mut rem, 1),                      // 0: global bar
                 take(&mut rem, 1),                      // 1: detail info bar
                 take_consume(&mut rem, effective_det_h), // 2: detail A
-                take_consume(&mut rem, effective_det_h), // 3: detail B
-                take(&mut rem, 1),                      // 4: notif A
-                take(&mut rem, 1),                      // 5: info A
-                take_consume(&mut rem, effective_ov_h),  // 6: overview A
-                take(&mut rem, 1),                      // 7: notif B
-                take(&mut rem, 1),                      // 8: info B
-                take_consume(&mut rem, effective_ov_h),  // 9: overview B
-                rem,                                    // 10: spacer (leftover)
+                take(&mut rem, 1),                      // 3: shared tick row
+                take_consume(&mut rem, effective_det_h), // 4: detail B
+                take(&mut rem, 1),                      // 5: notif A
+                take(&mut rem, 1),                      // 6: info A
+                take_consume(&mut rem, effective_ov_h),  // 7: overview A
+                take(&mut rem, 1),                      // 8: notif B
+                take(&mut rem, 1),                      // 9: info B
+                take_consume(&mut rem, effective_ov_h),  // 10: overview B
+                rem,                                    // 11: spacer (leftover)
             ];
 
             let c = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints(hh.map(Constraint::Length))
                 .split(inner);
-            let (area_detail_info, area_detail_a, area_detail_b,
-                 area_notif_a, area_info_a, area_overview_a,
+            let (area_detail_info, area_detail_a, area_tick,
+                 area_detail_b, area_notif_a, area_info_a, area_overview_a,
                  area_notif_b, area_info_b, area_overview_b,
-                 area_global) = (c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[0]);
+                 area_global) = (c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[0]);
 
             // Update renderer dimensions from layout.
             {
@@ -546,7 +548,7 @@ fn tui_loop(
                 let h = area_detail_a.height as usize;
                 if w > 0 && h > 0 {
                     shared_renderer.cols.store(w, Ordering::Relaxed);
-                    shared_renderer.rows.store(h.saturating_sub(1), Ordering::Relaxed);
+                    shared_renderer.rows.store(h, Ordering::Relaxed);
                 }
             }
 
@@ -582,22 +584,19 @@ fn tui_loop(
             let label_style = Style::default().fg(Color::Rgb(40, 60, 100));
             let notif_bg    = Style::default().bg(Color::Rgb(20, 20, 38));
 
-            // Extract shared tick rows from pre-rendered buffer data.
-            let (shared_tick_a, shared_tick_b): (Vec<u8>, Vec<u8>) = {
-                let w = area_detail_a.width as usize;
-                let centre_col = ((w as f64 * display_cfg.playhead_position as f64 / 100.0) as usize)
-                    .clamp(0, w.saturating_sub(1));
-                let pos_a = render[0].as_ref().map(|rs| rs.display_pos_samp).unwrap_or(0);
-                let pos_b = render[1].as_ref().map(|rs| rs.display_pos_samp).unwrap_or(0);
-                (
-                    extract_tick_viewport(&buf_a, pos_a, centre_col, w),
-                    extract_tick_viewport(&buf_b, pos_b, centre_col, w),
-                )
-            };
+            // Extract tick viewport slices for the shared tick row.
+            let tick_w = area_tick.width as usize;
+            let tick_centre = ((tick_w as f64 * display_cfg.playhead_position as f64 / 100.0) as usize)
+                .clamp(0, tick_w.saturating_sub(1));
+            let pos_a = render[0].as_ref().map(|rs| rs.display_pos_samp).unwrap_or(0);
+            let pos_b = render[1].as_ref().map(|rs| rs.display_pos_samp).unwrap_or(0);
+            let tick_a = extract_tick_viewport(&buf_a, pos_a, tick_centre, tick_w);
+            let tick_b = extract_tick_viewport(&buf_b, pos_b, tick_centre, tick_w);
+            render_shared_tick_row(frame, area_tick, &tick_a, &tick_b);
 
             // ---- Deck A ----
             if let (Some(deck), Some(rs)) = (&mut d0, &render[0]) {
-                let content = notification_line_for_deck(deck, area_notif_a.width.saturating_sub(2) as usize);
+                let content = notification_line_for_deck(deck, area_notif_a.width.saturating_sub(2) as usize, vinyl_mode);
                 let mut spans = vec![Span::styled("A ", label_style)];
                 spans.extend(content.spans);
                 frame.render_widget(Paragraph::new(Line::from(spans)).style(notif_bg), area_notif_a);
@@ -608,7 +607,7 @@ fn tui_loop(
                 deck.display.last_bar_cols  = bar_cols;
                 deck.display.last_bar_times = bar_times;
                 frame.render_widget(Paragraph::new(ov), area_overview_a);
-                render_detail_waveform(frame, &buf_a, deck, area_detail_a, &display_cfg, rs.display_pos_samp, Some((&shared_tick_a, &shared_tick_b)), deck.display.palette);
+                render_detail_waveform(frame, &buf_a, deck, area_detail_a, &display_cfg, rs.display_pos_samp, deck.display.palette);
             } else {
                 let mut spans = vec![Span::styled("A ", label_style)];
                 if let Some(ref s) = loading_label[0] {
@@ -618,13 +617,13 @@ fn tui_loop(
                 }
                 frame.render_widget(Paragraph::new(Line::from(spans)).style(notif_bg), area_notif_a);
                 frame.render_widget(Paragraph::new(info_line_empty(area_info_a.width)), area_info_a);
-                frame.render_widget(Paragraph::new(overview_empty(area_overview_a, vinyl_mode)), area_overview_a);
-                render_detail_empty(frame, area_detail_a, &display_cfg, Some((&shared_tick_a, &shared_tick_b)));
+                frame.render_widget(Paragraph::new(overview_empty(area_overview_a, 0)), area_overview_a);
+                render_detail_empty(frame, area_detail_a, 0);
             }
 
             // ---- Deck B ----
             if let (Some(deck), Some(rs)) = (&mut d1, &render[1]) {
-                let content = notification_line_for_deck(deck, area_notif_b.width.saturating_sub(2) as usize);
+                let content = notification_line_for_deck(deck, area_notif_b.width.saturating_sub(2) as usize, vinyl_mode);
                 let mut spans = vec![Span::styled("B ", label_style)];
                 spans.extend(content.spans);
                 frame.render_widget(Paragraph::new(Line::from(spans)).style(notif_bg), area_notif_b);
@@ -635,7 +634,7 @@ fn tui_loop(
                 deck.display.last_bar_cols  = bar_cols;
                 deck.display.last_bar_times = bar_times;
                 frame.render_widget(Paragraph::new(ov), area_overview_b);
-                render_detail_waveform(frame, &buf_b, deck, area_detail_b, &display_cfg, rs.display_pos_samp, None, deck.display.palette);
+                render_detail_waveform(frame, &buf_b, deck, area_detail_b, &display_cfg, rs.display_pos_samp, deck.display.palette);
             } else {
                 let mut spans = vec![Span::styled("B ", label_style)];
                 if let Some(ref s) = loading_label[1] {
@@ -645,8 +644,8 @@ fn tui_loop(
                 }
                 frame.render_widget(Paragraph::new(Line::from(spans)).style(notif_bg), area_notif_b);
                 frame.render_widget(Paragraph::new(info_line_empty(area_info_b.width)), area_info_b);
-                frame.render_widget(Paragraph::new(overview_empty(area_overview_b, vinyl_mode)), area_overview_b);
-                render_detail_empty(frame, area_detail_b, &display_cfg, None);
+                frame.render_widget(Paragraph::new(overview_empty(area_overview_b, 1)), area_overview_b);
+                render_detail_empty(frame, area_detail_b, 1);
             }
 
             // ---- Global status bar ----
@@ -771,7 +770,7 @@ Esc                  close this / quit";
                             d.audio.player.stop();
                             if let Some(ref hash) = d.tempo.analysis_hash {
                                 if let Some(entry) = cache.get(hash.as_str()).cloned() {
-                                    cache.set(hash.clone(), CacheEntry { offset_ms: d.tempo.offset_ms, ..entry });
+                                    cache.set(hash.clone(), CacheEntry { offset_ms: d.tempo.offset_ms, offset_established: d.tempo.offset_established, ..entry });
                                 }
                             }
                         }
@@ -1162,7 +1161,7 @@ Esc                  close this / quit";
                         anchor_beat_grid_to_cue(d);
                         if let Some(ref hash) = d.tempo.analysis_hash {
                             if let Some(entry) = cache.get(hash.as_str()).cloned() {
-                                cache.set(hash.clone(), CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, ..entry });
+                                cache.set(hash.clone(), CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, offset_established: d.tempo.offset_established, ..entry });
                                 cache.save();
                             }
                         }
@@ -1187,7 +1186,7 @@ Esc                  close this / quit";
                                     d.audio.player.stop();
                                     if let Some(ref hash) = d.tempo.analysis_hash {
                                         if let Some(entry) = cache.get(hash.as_str()).cloned() {
-                                            cache.set(hash.clone(), CacheEntry { offset_ms: d.tempo.offset_ms, ..entry });
+                                            cache.set(hash.clone(), CacheEntry { offset_ms: d.tempo.offset_ms, offset_established: d.tempo.offset_established, ..entry });
                                         }
                                     }
                                 }
@@ -1210,7 +1209,8 @@ Esc                  close this / quit";
                                     d.tempo.bpm_established = true;
                                     d.audio.player.set_speed(1.0);
                                     shared_renderer.store_speed_ratio(slot, d.tempo.bpm, d.tempo.base_bpm);
-                                    cache.set(hash.clone(), CacheEntry { bpm: d.tempo.bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: d.cue_sample });
+                                    d.tempo.offset_established = true;
+                                    cache.set(hash.clone(), CacheEntry { bpm: d.tempo.bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: d.cue_sample, offset_established: true });
                                     cache.save();
                                     d.tempo.analysis_hash = Some(hash);
                                 }
@@ -1287,7 +1287,7 @@ Esc                  close this / quit";
                                 d.audio.player.stop();
                                 if let Some(ref hash) = d.tempo.analysis_hash {
                                     if let Some(entry) = cache.get(hash.as_str()).cloned() {
-                                        cache.set(hash.clone(), CacheEntry { offset_ms: d.tempo.offset_ms, ..entry });
+                                        cache.set(hash.clone(), CacheEntry { offset_ms: d.tempo.offset_ms, offset_established: d.tempo.offset_established, ..entry });
                                     }
                                 }
                             }
@@ -1304,7 +1304,7 @@ Esc                  close this / quit";
                         if let Some(ref d) = decks[target] {
                             if let Some(ref hash) = d.tempo.analysis_hash {
                                 if let Some(entry) = cache.get(hash.as_str()).cloned() {
-                                    cache.set(hash.clone(), CacheEntry { offset_ms: d.tempo.offset_ms, ..entry });
+                                    cache.set(hash.clone(), CacheEntry { offset_ms: d.tempo.offset_ms, offset_established: d.tempo.offset_established, ..entry });
                                 }
                             }
                         }
@@ -1650,6 +1650,7 @@ Esc                  close this / quit";
                                     d.tempo.bpm = (d.tempo.base_bpm * speed_ratio).clamp(40.0, 240.0);
                                     d.tempo.offset_ms = tapped_offset;
                                     d.tempo.bpm_established = true;
+                                    d.tempo.offset_established = true;
                                     d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm);
                                     shared_renderer.store_speed_ratio(0, d.tempo.bpm, d.tempo.base_bpm);
                                 }
@@ -1674,6 +1675,7 @@ Esc                  close this / quit";
                                     d.tempo.bpm = (d.tempo.base_bpm * speed_ratio).clamp(40.0, 240.0);
                                     d.tempo.offset_ms = tapped_offset;
                                     d.tempo.bpm_established = true;
+                                    d.tempo.offset_established = true;
                                     d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm);
                                     shared_renderer.store_speed_ratio(1, d.tempo.bpm, d.tempo.base_bpm);
                                 }
@@ -1688,8 +1690,8 @@ Esc                  close this / quit";
                                 anchor_beat_grid_to_cue(d);
                                 if let Some(ref hash) = d.tempo.analysis_hash.clone() {
                                     let entry = cache.get(hash.as_str()).cloned()
-                                        .unwrap_or(CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: None });
-                                    cache.set(hash.clone(), CacheEntry { cue_sample: d.cue_sample, offset_ms: d.tempo.offset_ms, ..entry });
+                                        .unwrap_or(CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: None, offset_established: true });
+                                    cache.set(hash.clone(), CacheEntry { cue_sample: d.cue_sample, offset_ms: d.tempo.offset_ms, offset_established: d.tempo.offset_established, ..entry });
                                     cache.save();
                                 }
                             }
@@ -1703,8 +1705,8 @@ Esc                  close this / quit";
                                 anchor_beat_grid_to_cue(d);
                                 if let Some(ref hash) = d.tempo.analysis_hash.clone() {
                                     let entry = cache.get(hash.as_str()).cloned()
-                                        .unwrap_or(CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: None });
-                                    cache.set(hash.clone(), CacheEntry { cue_sample: d.cue_sample, offset_ms: d.tempo.offset_ms, ..entry });
+                                        .unwrap_or(CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: None, offset_established: true });
+                                    cache.set(hash.clone(), CacheEntry { cue_sample: d.cue_sample, offset_ms: d.tempo.offset_ms, offset_established: d.tempo.offset_established, ..entry });
                                     cache.save();
                                 }
                             }
@@ -1788,9 +1790,10 @@ fn service_deck_frame(
             d.tempo.base_bpm = new_bpm;
             shared_renderer.store_speed_ratio(slot, d.tempo.bpm, d.tempo.base_bpm);
             d.tempo.offset_ms = (new_offset as f64 / 10.0).round() as i64 * 10;
-            // Restore cue_sample from cache if present.
+            // Restore cue_sample and offset_established from cache if present.
             d.cue_sample = cache.get(hash.as_str()).and_then(|e| e.cue_sample);
-            cache.set(hash.clone(), CacheEntry { bpm: d.tempo.bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: d.cue_sample });
+            d.tempo.offset_established = cache.get(hash.as_str()).map_or(false, |e| e.offset_established);
+            cache.set(hash.clone(), CacheEntry { bpm: d.tempo.bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: d.cue_sample, offset_established: d.tempo.offset_established });
             cache.save();
             d.tempo.analysis_hash      = Some(hash);
             if !is_fresh || d.tempo.redetecting { d.tempo.bpm_established = true; }
@@ -1895,10 +1898,11 @@ fn service_deck_frame(
         d.tempo.bpm        = (d.tempo.base_bpm * speed_ratio).clamp(40.0, 240.0);
         d.tempo.offset_ms  = tapped_offset;
         d.tempo.bpm_established = true;
+        d.tempo.offset_established = true;
         d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm);
         shared_renderer.store_speed_ratio(slot, d.tempo.bpm, d.tempo.base_bpm);
         if let Some(ref hash) = d.tempo.analysis_hash {
-            cache.set(hash.clone(), CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: d.cue_sample });
+            cache.set(hash.clone(), CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: d.cue_sample, offset_established: true });
             cache.save();
         }
     }
