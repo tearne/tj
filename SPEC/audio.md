@@ -4,6 +4,20 @@
 
 - Each deck has an independent playback level, adjustable in 5% steps from 0% to 100%. Deck A uses `j` (up) / `m` (down); Deck B uses `k` (up) / `,` (down). These bindings are active regardless of which deck is selected. The current level is displayed in the info bar as `level:N%`. Changes take effect immediately without interrupting playback. Level is not persisted between sessions.
 
+## PFL Monitor
+
+- Each deck has a PFL (Pre-Fader, Pre-Filter Listen) toggle. Default is off. Not persisted between sessions.
+- PFL is exclusive: at most one deck can have PFL active at a time.
+- The PFL signal is tapped pre-fader and pre-filter — the raw decoded audio before any level or filter is applied.
+- Monitor output routing:
+  - Right channel: always carries the main mix (both decks at their respective levels and filter settings).
+  - Left channel: carries the active deck's PFL signal at full level when PFL is active; otherwise carries the main mix.
+  - When PFL is active, the main mix is suppressed entirely on the left channel.
+- Keys: `Space+x` toggles Deck A PFL on / off; `Space+v` toggles Deck B PFL on / off.
+- Toggling PFL on for one deck while the other deck's PFL is active cancels the other deck first.
+- PFL level is displayed in the info bar in cyan when non-zero.
+- PFL applies to stereo tracks only; mono tracks are unaffected.
+
 ## HPF / LPF Filter
 
 - A single `filter_offset` parameter (range −16 to +16, default 0) controls a real-time second-order Butterworth IIR filter on the playback output:

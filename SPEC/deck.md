@@ -17,7 +17,7 @@
 - Decode runs on a background thread. A loading screen displays a progress bar showing decode progress.
 - Decode completes and the deck is loaded paused. The user starts playback with `Space+Z`.
 - Displays track metadata: title, artist, album, duration, current position. The track name (artist – title, or filename) is shown in the notification bar above the info bar.
-- The TUI frame border title shows `tj vX.Y.Z` only.
+- The TUI frame border title shows `deck vX.Y.Z` only.
 
 ## Beat Detection
 
@@ -33,7 +33,7 @@
   - Per-deck BPM keys (`x`/`s` for Deck A, `v`/`f` for Deck B) increase/decrease the effective BPM by 0.1. Adjustments affect playback speed proportionally (relative to the detected BPM) and clamp to the range 40.0–240.0.
   - `b` tap-detects BPM: press in time with the beat. After 8 taps, `base_bpm` and `offset_ms` are set from the tap session. BPM is derived via linear regression of tap index against tap time (slope = beat period), which converges and stabilises as more taps are added. Taps with a residual exceeding half a beat period are treated as outliers and excluded before the final regression. Any active `f`/`v` speed ratio is preserved relative to the new `base_bpm`. The tap count is shown in the info bar (`tap:N`) while a session is active; tapping stops 2 seconds after the last tap.
   - Corrections are persisted to the cache immediately.
-- Detected BPM and phase offset are cached in `~/.local/share/tj/cache.json`, keyed by a Blake3 hash of the decoded audio samples. This makes the cache invariant of filename, tags, and container format. The cache also stores the last browser directory.
+- Detected BPM and phase offset are cached in `~/.config/deck/cache.json`, keyed by a Blake3 hash of the decoded audio samples. This makes the cache invariant of filename, tags, and container format. The cache also stores the last browser directory.
 - Each cache entry includes the filename at time of first detection as a human-readable hint to aid manual cache management.
 - On quit, the current phase offset is persisted to the cache.
 
@@ -45,6 +45,14 @@
 - The cue position acts as the zero datum for the beat grid: whenever `base_bpm` changes (manual adjustment or re-detection), `offset_ms` is recalculated to keep a tick on the cue position.
 - BPM tap does not disturb the cue point; the tapped grid lands where it lands.
 - The cue column is shown as a green marker in both the overview and detail waveforms.
+
+## Gain Trim
+
+- Each deck has an independent gain trim applied to the audio signal after the filter and before the fader. The trim range is ±12 dB in 1 dB steps.
+- `J` / `M` (Deck 1) and `K` / `<` (Deck 2) increase / decrease gain by 1 dB. Clamps silently at ±12 dB.
+- Gain is applied as a linear multiplier (`10^(dB/20)`) in the audio signal chain, after the filter and before PFL routing.
+- Gain is persisted to the cache alongside BPM and offset, and restored when the track is loaded.
+- The detail info bar shows a single character gain indicator immediately after the level closing bracket. It uses `▁▂▃▄▅▆▇` to represent the range −12 dB to +12 dB, with `▄` at 0 dB. The indicator is grey at 0 dB and dim amber at any non-zero value.
 
 ## Needle Drop
 
@@ -86,14 +94,14 @@ Vinyl mode is a global toggle (`` ` ``) that applies to both decks simultaneousl
 
 **Waveform** — Beat tick marks and the cue column are hidden. The waveform itself is unchanged.
 
-**Beat jumps** — Remapped to fixed time intervals matching the beat jump sizes at 120 BPM:
+**Beat jumps** — Remapped to fixed time intervals equal to N beats × 0.5 s (the beat period at 120 BPM):
 
 | Keys | Beat mode | Vinyl mode |
 |------|-----------|------------|
-| `1` / `q` | ±1 beat | ±0.5 s |
-| `2` / `w` | ±4 beats | ±2 s |
-| `3` / `e` | ±16 beats | ±8 s |
-| `4` / `r` | ±64 beats | ±32 s |
+| `1` / `q` (Deck 1), `3` / `e` (Deck 2) | ±4 bars (16 beats) | ±8 s |
+| `2` / `w` (Deck 1), `4` / `r` (Deck 2) | ±8 bars (32 beats) | ±16 s |
+| `Space+1` / `Space+q` (Deck 1), `Space+3` / `Space+e` (Deck 2) | ±1 beat | ±0.5 s |
+| `Space+2` / `Space+w` (Deck 1), `Space+4` / `Space+r` (Deck 2) | ±4 beats | ±2 s |
 
 **BPM analysis** — Does not run while vinyl mode is active. The redetect key has no effect in vinyl mode.
 

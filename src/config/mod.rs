@@ -9,12 +9,13 @@ pub(crate) enum Action {
     Quit, Help, TerminalRefresh, VinylModeToggle,
     ZoomIn, ZoomOut, HeightIncrease, HeightDecrease,
     LatencyIncrease, LatencyDecrease,
-    WaveformStyle, PaletteCycle,
+    PaletteCycle,
     NudgeModeToggle,
     // Deck 1
     Deck1PlayPause, Deck1OpenBrowser,
     Deck1LevelUp, Deck1LevelDown, Deck1LevelMax, Deck1LevelMin,
     Deck1FilterIncrease, Deck1FilterDecrease, Deck1FilterReset,
+    Deck1FilterSlopeIncrease, Deck1FilterSlopeDecrease,
     Deck1BpmTap, Deck1MetronomeToggle, Deck1RedetectBpm,
     Deck1BpmIncrease, Deck1BpmDecrease,
     Deck1BaseBpmIncrease, Deck1BaseBpmDecrease, Deck1TempoReset,
@@ -25,10 +26,13 @@ pub(crate) enum Action {
     Deck1JumpForward1bt, Deck1JumpBackward1bt,
     Deck1JumpForward4bt, Deck1JumpBackward4bt,
     Deck1Cue, Deck1CuePlay,
+    Deck1PflToggle,
+    Deck1GainIncrease, Deck1GainDecrease,
     // Deck 2
     Deck2PlayPause, Deck2OpenBrowser,
     Deck2LevelUp, Deck2LevelDown, Deck2LevelMax, Deck2LevelMin,
     Deck2FilterIncrease, Deck2FilterDecrease, Deck2FilterReset,
+    Deck2FilterSlopeIncrease, Deck2FilterSlopeDecrease,
     Deck2BpmTap, Deck2MetronomeToggle, Deck2RedetectBpm,
     Deck2BpmIncrease, Deck2BpmDecrease,
     Deck2BaseBpmIncrease, Deck2BaseBpmDecrease, Deck2TempoReset,
@@ -39,6 +43,8 @@ pub(crate) enum Action {
     Deck2JumpForward1bt, Deck2JumpBackward1bt,
     Deck2JumpForward4bt, Deck2JumpBackward4bt,
     Deck2Cue, Deck2CuePlay,
+    Deck2PflToggle,
+    Deck2GainIncrease, Deck2GainDecrease,
 }
 
 pub(crate) static ACTION_NAMES: &[(&str, Action)] = &[
@@ -52,7 +58,6 @@ pub(crate) static ACTION_NAMES: &[(&str, Action)] = &[
     ("height_decrease",   Action::HeightDecrease),
     ("latency_increase",  Action::LatencyIncrease),
     ("latency_decrease",  Action::LatencyDecrease),
-    ("waveform_style",    Action::WaveformStyle),
     ("palette_cycle",     Action::PaletteCycle),
     ("nudge_mode_toggle", Action::NudgeModeToggle),
     // Deck 1
@@ -62,9 +67,11 @@ pub(crate) static ACTION_NAMES: &[(&str, Action)] = &[
     ("deck1_level_down",        Action::Deck1LevelDown),
     ("deck1_level_max",         Action::Deck1LevelMax),
     ("deck1_level_min",         Action::Deck1LevelMin),
-    ("deck1_filter_increase",   Action::Deck1FilterIncrease),
-    ("deck1_filter_decrease",   Action::Deck1FilterDecrease),
-    ("deck1_filter_reset",      Action::Deck1FilterReset),
+    ("deck1_filter_increase",        Action::Deck1FilterIncrease),
+    ("deck1_filter_decrease",        Action::Deck1FilterDecrease),
+    ("deck1_filter_reset",           Action::Deck1FilterReset),
+    ("deck1_filter_slope_increase",  Action::Deck1FilterSlopeIncrease),
+    ("deck1_filter_slope_decrease",  Action::Deck1FilterSlopeDecrease),
     ("deck1_bpm_tap",           Action::Deck1BpmTap),
     ("deck1_metronome",         Action::Deck1MetronomeToggle),
     ("deck1_redetect_bpm",      Action::Deck1RedetectBpm),
@@ -87,6 +94,9 @@ pub(crate) static ACTION_NAMES: &[(&str, Action)] = &[
     ("deck1_jump_backward_4bt", Action::Deck1JumpBackward4bt),
     ("deck1_cue",               Action::Deck1Cue),
     ("deck1_cue_play",          Action::Deck1CuePlay),
+    ("deck1_pfl_toggle",        Action::Deck1PflToggle),
+    ("deck1_gain_increase",     Action::Deck1GainIncrease),
+    ("deck1_gain_decrease",     Action::Deck1GainDecrease),
     // Deck 2
     ("deck2_play_pause",        Action::Deck2PlayPause),
     ("deck2_open_browser",      Action::Deck2OpenBrowser),
@@ -94,9 +104,11 @@ pub(crate) static ACTION_NAMES: &[(&str, Action)] = &[
     ("deck2_level_down",        Action::Deck2LevelDown),
     ("deck2_level_max",         Action::Deck2LevelMax),
     ("deck2_level_min",         Action::Deck2LevelMin),
-    ("deck2_filter_increase",   Action::Deck2FilterIncrease),
-    ("deck2_filter_decrease",   Action::Deck2FilterDecrease),
-    ("deck2_filter_reset",      Action::Deck2FilterReset),
+    ("deck2_filter_increase",        Action::Deck2FilterIncrease),
+    ("deck2_filter_decrease",        Action::Deck2FilterDecrease),
+    ("deck2_filter_reset",           Action::Deck2FilterReset),
+    ("deck2_filter_slope_increase",  Action::Deck2FilterSlopeIncrease),
+    ("deck2_filter_slope_decrease",  Action::Deck2FilterSlopeDecrease),
     ("deck2_bpm_tap",           Action::Deck2BpmTap),
     ("deck2_metronome",         Action::Deck2MetronomeToggle),
     ("deck2_redetect_bpm",      Action::Deck2RedetectBpm),
@@ -119,6 +131,9 @@ pub(crate) static ACTION_NAMES: &[(&str, Action)] = &[
     ("deck2_jump_backward_4bt", Action::Deck2JumpBackward4bt),
     ("deck2_cue",               Action::Deck2Cue),
     ("deck2_cue_play",          Action::Deck2CuePlay),
+    ("deck2_pfl_toggle",        Action::Deck2PflToggle),
+    ("deck2_gain_increase",     Action::Deck2GainIncrease),
+    ("deck2_gain_decrease",     Action::Deck2GainDecrease),
 ];
 
 #[derive(Hash, Eq, PartialEq)]
@@ -146,7 +161,7 @@ pub(crate) fn parse_bare_key(s: &str) -> Option<KeyCode> {
         "esc"       => Some(KeyCode::Esc),
         s if s.chars().count() == 1 => Some(KeyCode::Char(s.chars().next().unwrap())),
         other => {
-            eprintln!("tj: unknown key {:?} in config — binding skipped", other);
+            eprintln!("deck: unknown key {:?} in config — binding skipped", other);
             None
         }
     }
@@ -175,7 +190,7 @@ pub(crate) fn resolve_config() -> (String, Option<String>) {
         return (std::fs::read_to_string(&path).unwrap_or_default(), None);
     }
     let user_path = match home_dir() {
-        Some(h) => h.join(".config/tj/config.toml"),
+        Some(h) => h.join(".config/deck/config.toml"),
         None => return (DEFAULT_CONFIG.to_string(), None),
     };
     if user_path.exists() {
@@ -232,7 +247,7 @@ pub(crate) fn parse_keymap(text: &str, map: &mut std::collections::HashMap<KeyBi
 {
     let parsed: toml::Value = match toml::from_str(text) {
         Ok(v) => v,
-        Err(e) => { eprintln!("tj: failed to parse config: {e}"); return std::mem::take(map); }
+        Err(e) => { eprintln!("deck: failed to parse config: {e}"); return std::mem::take(map); }
     };
     let keys = match parsed.get("keys").and_then(|v| v.as_table()) {
         Some(t) => t,
@@ -241,14 +256,14 @@ pub(crate) fn parse_keymap(text: &str, map: &mut std::collections::HashMap<KeyBi
     for (name, val) in keys {
         let action = match ACTION_NAMES.iter().find(|(n, _)| *n == name.as_str()) {
             Some((_, a)) => *a,
-            None => { eprintln!("tj: unknown function {name:?} in config — skipped"); continue; }
+            None => { eprintln!("deck: unknown function {name:?} in config — skipped"); continue; }
         };
         let key_strs: Vec<&str> = if let Some(s) = val.as_str() {
             vec![s]
         } else if let Some(arr) = val.as_array() {
             arr.iter().filter_map(|v| v.as_str()).collect()
         } else {
-            eprintln!("tj: key value for {name:?} must be a string or array of strings");
+            eprintln!("deck: key value for {name:?} must be a string or array of strings");
             continue;
         };
         for key_str in key_strs {

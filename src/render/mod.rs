@@ -67,7 +67,6 @@ pub(crate) struct SharedDetailRenderer {
     pub(crate) cols:           Arc<AtomicUsize>,
     pub(crate) rows:           Arc<AtomicUsize>,
     pub(crate) zoom_at:        Arc<AtomicUsize>,
-    pub(crate) style:          Arc<AtomicUsize>,
     pub(crate) sample_rate_a:  Arc<AtomicUsize>,
     pub(crate) sample_rate_b:  Arc<AtomicUsize>,
     /// `(bpm / base_bpm) × 65536`, updated on every BPM-changing action.
@@ -91,6 +90,10 @@ pub(crate) struct SharedDetailRenderer {
     /// Cue point in mono samples; -1 when unset.
     pub(crate) cue_sample_a:   Arc<AtomicI64>,
     pub(crate) cue_sample_b:   Arc<AtomicI64>,
+    /// Gain trim as f32 bits; 1.0 when unset. Peaks in the buffer are pre-scaled
+    /// by this value so the detail waveform height tracks gain visually.
+    pub(crate) gain_a:         Arc<AtomicU32>,
+    pub(crate) gain_b:         Arc<AtomicU32>,
     pub(crate) shared_a:       Arc<Mutex<Arc<BrailleBuffer>>>,
     pub(crate) shared_b:       Arc<Mutex<Arc<BrailleBuffer>>>,
     _stop_guard:    StopOnDrop,
@@ -106,7 +109,6 @@ impl SharedDetailRenderer {
         let cols           = Arc::new(AtomicUsize::new(0));
         let rows           = Arc::new(AtomicUsize::new(0));
         let zoom_at        = Arc::new(AtomicUsize::new(zoom_idx));
-        let style          = Arc::new(AtomicUsize::new(0));
         let sample_rate_a  = Arc::new(AtomicUsize::new(44100));
         let sample_rate_b  = Arc::new(AtomicUsize::new(44100));
         let speed_ratio_a  = Arc::new(AtomicUsize::new(65536)); // 1.0 × 65536
@@ -125,6 +127,8 @@ impl SharedDetailRenderer {
         let offset_ms_b    = Arc::new(AtomicI64::new(0));
         let cue_sample_a   = Arc::new(AtomicI64::new(-1));
         let cue_sample_b   = Arc::new(AtomicI64::new(-1));
+        let gain_a         = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let gain_b         = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let shared_a: Arc<Mutex<Arc<BrailleBuffer>>> =
             Arc::new(Mutex::new(Arc::new(BrailleBuffer::empty())));
         let shared_b: Arc<Mutex<Arc<BrailleBuffer>>> =
@@ -136,7 +140,6 @@ impl SharedDetailRenderer {
             let cols_bg      = Arc::clone(&cols);
             let rows_bg      = Arc::clone(&rows);
             let zoom_bg      = Arc::clone(&zoom_at);
-            let style_bg     = Arc::clone(&style);
             let sr_a_bg      = Arc::clone(&sample_rate_a);
             let sr_b_bg      = Arc::clone(&sample_rate_b);
             let ratio_a_bg   = Arc::clone(&speed_ratio_a);
@@ -155,6 +158,8 @@ impl SharedDetailRenderer {
             let off_ms_b_bg  = Arc::clone(&offset_ms_b);
             let cue_a_bg     = Arc::clone(&cue_sample_a);
             let cue_b_bg     = Arc::clone(&cue_sample_b);
+            let gain_a_bg    = Arc::clone(&gain_a);
+            let gain_b_bg    = Arc::clone(&gain_b);
             let shared_a_bg  = Arc::clone(&shared_a);
             let shared_b_bg  = Arc::clone(&shared_b);
             let stop_bg      = Arc::clone(&stop);
@@ -163,7 +168,6 @@ impl SharedDetailRenderer {
                 let mut last_cols      = 0usize;
                 let mut last_rows      = 0usize;
                 let mut last_zoom      = usize::MAX;
-                let mut last_style     = usize::MAX;
                 let mut last_col_samp_a = 0usize;
                 let mut last_col_samp_b = 0usize;
                 let mut last_anchor_a  = 0usize;
@@ -176,6 +180,8 @@ impl SharedDetailRenderer {
                 let mut last_off_b: i64  = 0;
                 let mut last_cue_a: i64  = -1;
                 let mut last_cue_b: i64  = -1;
+                let mut last_gain_a: u32 = 1.0f32.to_bits();
+                let mut last_gain_b: u32 = 1.0f32.to_bits();
 
                 loop {
                     if stop_bg.load(Ordering::Relaxed) { break; }
@@ -209,19 +215,19 @@ impl SharedDetailRenderer {
                         pos_b.abs_diff(last_anchor_b) / last_col_samp_b
                     } else { usize::MAX };
 
-                    let style    = style_bg.load(Ordering::Relaxed);
                     let gen_a    = gen_a_bg.load(Ordering::Relaxed);
                     let gen_b    = gen_b_bg.load(Ordering::Relaxed);
                     let bpm_a_raw = bpm_a_bg.load(Ordering::Relaxed);
                     let bpm_b_raw = bpm_b_bg.load(Ordering::Relaxed);
                     let off_ms_a  = off_ms_a_bg.load(Ordering::Relaxed);
                     let off_ms_b  = off_ms_b_bg.load(Ordering::Relaxed);
-                    let cue_raw_a = cue_a_bg.load(Ordering::Relaxed);
-                    let cue_raw_b = cue_b_bg.load(Ordering::Relaxed);
+                    let cue_raw_a  = cue_a_bg.load(Ordering::Relaxed);
+                    let cue_raw_b  = cue_b_bg.load(Ordering::Relaxed);
+                    let gain_raw_a = gain_a_bg.load(Ordering::Relaxed);
+                    let gain_raw_b = gain_b_bg.load(Ordering::Relaxed);
                     let must_recompute = cols != last_cols
                         || rows != last_rows
                         || zoom != last_zoom
-                        || style != last_style
                         || col_samp_a != last_col_samp_a
                         || col_samp_b != last_col_samp_b
                         || drift_a >= cols * 3 / 4
@@ -233,7 +239,9 @@ impl SharedDetailRenderer {
                         || off_ms_a != last_off_a
                         || off_ms_b != last_off_b
                         || cue_raw_a != last_cue_a
-                        || cue_raw_b != last_cue_b;
+                        || cue_raw_b != last_cue_b
+                        || gain_raw_a != last_gain_a
+                        || gain_raw_b != last_gain_b;
 
                     if must_recompute {
                         let buf_cols = cols * 5;
@@ -252,10 +260,15 @@ impl SharedDetailRenderer {
                             let col = buf_cols as i64 / 2 + delta.div_euclid(col_samp as i64);
                             if col >= 0 && (col as usize) < buf_cols { Some(col as usize) } else { None }
                         };
+                        let gain_a = f32::from_bits(gain_raw_a);
+                        let gain_b = f32::from_bits(gain_raw_b);
+                        let scale_peaks = |peaks: Vec<(f32, f32)>, g: f32| -> Vec<(f32, f32)> {
+                            peaks.into_iter().map(|(mn, mx)| (mn * g, mx * g)).collect()
+                        };
                         let buf_a = Arc::new(BrailleBuffer {
                             grid: render_braille(
-                                &peaks_for_slot(&wf_a, anchor_a, col_samp_a, buf_cols),
-                                rows, buf_cols, style == 1,
+                                &scale_peaks(peaks_for_slot(&wf_a, anchor_a, col_samp_a, buf_cols), gain_a),
+                                rows, buf_cols,
                             ),
                             bass_ratio:      spectral_for_slot(&wf_a, anchor_a, col_samp_a, buf_cols, sr_a as u32),
                             tick:            compute_tick_display(buf_cols, col_samp_a, tick_view_start_a,
@@ -267,8 +280,8 @@ impl SharedDetailRenderer {
                         });
                         let buf_b = Arc::new(BrailleBuffer {
                             grid: render_braille(
-                                &peaks_for_slot(&wf_b, anchor_b, col_samp_b, buf_cols),
-                                rows, buf_cols, style == 1,
+                                &scale_peaks(peaks_for_slot(&wf_b, anchor_b, col_samp_b, buf_cols), gain_b),
+                                rows, buf_cols,
                             ),
                             bass_ratio:      spectral_for_slot(&wf_b, anchor_b, col_samp_b, buf_cols, sr_b as u32),
                             tick:            compute_tick_display(buf_cols, col_samp_b, tick_view_start_b,
@@ -285,7 +298,6 @@ impl SharedDetailRenderer {
                         last_cols       = cols;
                         last_rows       = rows;
                         last_zoom       = zoom;
-                        last_style      = style;
                         last_col_samp_a = col_samp_a;
                         last_col_samp_b = col_samp_b;
                         last_anchor_a   = anchor_a;
@@ -298,6 +310,8 @@ impl SharedDetailRenderer {
                         last_off_b      = off_ms_b;
                         last_cue_a      = cue_raw_a;
                         last_cue_b      = cue_raw_b;
+                        last_gain_a     = gain_raw_a;
+                        last_gain_b     = gain_raw_b;
                     }
 
                     thread::sleep(Duration::from_millis(8));
@@ -306,7 +320,7 @@ impl SharedDetailRenderer {
         }
 
         SharedDetailRenderer {
-            cols, rows, zoom_at, style,
+            cols, rows, zoom_at,
             sample_rate_a, sample_rate_b,
             speed_ratio_a, speed_ratio_b,
             waveform_a, waveform_b,
@@ -316,6 +330,7 @@ impl SharedDetailRenderer {
             bpm_a, bpm_b,
             offset_ms_a, offset_ms_b,
             cue_sample_a, cue_sample_b,
+            gain_a, gain_b,
             shared_a, shared_b,
             _stop_guard: stop_guard,
         }
@@ -367,6 +382,13 @@ impl SharedDetailRenderer {
                 self.bpm_b.store(bpm_raw, Ordering::Relaxed);
                 self.offset_ms_b.store(offset_ms, Ordering::Relaxed);
             }
+        }
+    }
+
+    pub(crate) fn store_gain(&self, slot: usize, gain_linear: f32) {
+        match slot {
+            0 => self.gain_a.store(gain_linear.to_bits(), Ordering::Relaxed),
+            _ => self.gain_b.store(gain_linear.to_bits(), Ordering::Relaxed),
         }
     }
 }
@@ -566,10 +588,23 @@ pub(crate) fn info_line_for_deck(
         .fg(Color::Rgb((60.0 + 195.0 * t).round() as u8, (50.0 + 165.0 * t).round() as u8, 0))
         .bg(Color::Rgb((40.0 * t).round() as u8, (33.0 * t).round() as u8, 0));
     let bracket_style = Style::default().fg(Color::Rgb(140, 140, 140));
+    if deck.pfl_level > 0 {
+        right_spans.push(Span::styled("  PFL", Style::default().fg(Color::Cyan)));
+    }
     right_spans.push(Span::styled("  level:", dim));
     right_spans.push(Span::styled("\u{2595}", bracket_style));
     right_spans.push(Span::styled(level_char.to_string(), level_style));
     right_spans.push(Span::styled("\u{258F}", bracket_style));
+    {
+        const GAIN_CHARS: [char; 7] = ['▁','▂','▃','▄','▅','▆','▇'];
+        let idx = ((deck.gain_db as i32 + 12) * 6 / 24).clamp(0, 6) as usize;
+        let gain_style = if deck.gain_db == 0 {
+            Style::default().fg(Color::Rgb(45, 45, 45))
+        } else {
+            Style::default().fg(Color::Rgb(180, 140, 0))
+        };
+        right_spans.push(Span::styled(GAIN_CHARS[idx].to_string(), gain_style));
+    }
     {
         let stopband: Option<(bool, usize)> = if deck.filter_offset != 0 {
             let n = deck.filter_offset.unsigned_abs() as usize;
@@ -601,6 +636,9 @@ pub(crate) fn info_line_for_deck(
             right_spans.push(Span::styled(ch, style));
         }
         right_spans.push(Span::styled("\u{258F}".to_string(), dim));
+        // dB/oct indicator: fixed 2-char field — visible when filter active, blank otherwise.
+        let slope_str = if deck.filter_offset != 0 { match deck.filter_poles { 4 => "24", _ => "12" } } else { "  " };
+        right_spans.push(Span::styled(slope_str, dim));
     }
 
     // Spacer: fill gap between left and right groups.
@@ -649,13 +687,18 @@ pub(crate) fn overview_for_deck(
             .min(overview_width.saturating_sub(1))
     });
 
-    let (ov_peaks_hires, ov_bass_hires): (Vec<(f32, f32)>, Vec<f32>) = (0..overview_width * 2)
+    let gain_linear = 10f32.powf(deck.gain_db as f32 / 20.0);
+    let hires: Vec<((f32, f32), f32)> = (0..overview_width * 2)
         .map(|col| {
             let idx = (col * total_peaks / (overview_width * 2).max(1)).min(total_peaks.saturating_sub(1));
-            (deck.audio.waveform.peaks[idx], deck.audio.waveform.bass_ratio[idx])
+            let (min_v, max_v) = deck.audio.waveform.peaks[idx];
+            let bass = deck.audio.waveform.bass_ratio[idx];
+            ((min_v * gain_linear, max_v * gain_linear), bass)
         })
-        .unzip();
-    let hires_buf = render_braille(&ov_peaks_hires, overview_height, overview_width * 2, false);
+        .collect();
+    let ov_peaks_hires: Vec<(f32, f32)> = hires.iter().map(|(p, _)| *p).collect();
+    let ov_bass_hires: Vec<f32>          = hires.iter().map(|(_, b)| *b).collect();
+    let hires_buf = render_braille(&ov_peaks_hires, overview_height, overview_width * 2);
     let ov_braille: Vec<Vec<u8>> = hires_buf.iter()
         .map(|row| (0..overview_width).map(|c| (row[c * 2] & 0x47) | (row[c * 2 + 1] & 0xB8)).collect())
         .collect();
@@ -1044,6 +1087,7 @@ pub(crate) fn spectral_for_slot(
     box_smooth(&bass_raw, 3)
 }
 
+
 pub(crate) fn box_smooth(v: &[f32], radius: usize) -> Vec<f32> {
     let n = v.len();
     (0..n).map(|i| {
@@ -1061,7 +1105,7 @@ pub(crate) fn shift_braille_half(a: u8, b: u8) -> u8 {
     left | right
 }
 
-pub(crate) fn render_braille(peaks: &[(f32, f32)], rows: usize, cols: usize, outline: bool) -> Vec<Vec<u8>> {
+pub(crate) fn render_braille(peaks: &[(f32, f32)], rows: usize, cols: usize) -> Vec<Vec<u8>> {
     // Bit mask for left+right dots at each of the 4 dot-rows within a Braille cell.
     // Layout: dot1(bit0)/dot4(bit3), dot2(bit1)/dot5(bit4), dot3(bit2)/dot6(bit5), dot7(bit6)/dot8(bit7)
     const DOT_BITS: [u8; 4] = [0x09, 0x12, 0x24, 0xC0];
@@ -1080,17 +1124,10 @@ pub(crate) fn render_braille(peaks: &[(f32, f32)], rows: usize, cols: usize, out
         }
     };
 
-    let mut prev_top: Option<usize> = None;
-    let mut prev_bot: Option<usize> = None;
-
     for (c, &(min_val, max_val)) in peaks.iter().take(cols).enumerate() {
         let clamped_max = max_val.min(1.0);
         let clamped_min = min_val.max(-1.0);
-        if clamped_min > clamped_max {
-            prev_top = None;
-            prev_bot = None;
-            continue;
-        }
+        if clamped_min > clamped_max { continue; }
         // Map y ∈ [-1, 1] → dot row ∈ [0, total_dots); y=1 is top (row 0).
         let top_dot = ((1.0 - clamped_max) / 2.0 * total_dots as f32) as usize;
         let bot_dot = {
@@ -1098,21 +1135,7 @@ pub(crate) fn render_braille(peaks: &[(f32, f32)], rows: usize, cols: usize, out
                 .min(total_dots - 1);
             if raw > top_dot && raw + top_dot >= total_dots { raw - 1 } else { raw }
         };
-        if outline {
-            // Bridge vertical gap to previous column so the outline is continuous.
-            let top_from = prev_top.map(|p| p.min(top_dot)).unwrap_or(top_dot);
-            let top_to   = prev_top.map(|p| p.max(top_dot)).unwrap_or(top_dot);
-            for d in top_from..=top_to { set_dot(c, d); }
-            if bot_dot != top_dot {
-                let bot_from = prev_bot.map(|p| p.min(bot_dot)).unwrap_or(bot_dot);
-                let bot_to   = prev_bot.map(|p| p.max(bot_dot)).unwrap_or(bot_dot);
-                for d in bot_from..=bot_to { set_dot(c, d); }
-            }
-            prev_top = Some(top_dot);
-            prev_bot = Some(bot_dot);
-        } else {
-            for d in top_dot..=bot_dot { set_dot(c, d); }
-        }
+        for d in top_dot..=bot_dot { set_dot(c, d); }
     }
     grid
 }

@@ -495,6 +495,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
 
 [[package]]
+name = "deck"
+version = "0.6.1"
+dependencies = [
+ "blake3",
+ "color-eyre",
+ "crossterm",
+ "lofty",
+ "ratatui",
+ "rodio",
+ "serde",
+ "serde_json",
+ "stratum-dsp",
+ "symphonia",
+ "toml",
+]
+
+[[package]]
 name = "deltae"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2360,23 +2377,6 @@ name = "time-core"
 version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7694e1cfe791f8d31026952abf09c69ca6f6fa4e1a1229e18988f06a04a12dca"
-
-[[package]]
-name = "tj"
-version = "0.5.214"
-dependencies = [
- "blake3",
- "color-eyre",
- "crossterm",
- "lofty",
- "ratatui",
- "rodio",
- "serde",
- "serde_json",
- "stratum-dsp",
- "symphonia",
- "toml",
-]
 
 [[package]]
 name = "toml"

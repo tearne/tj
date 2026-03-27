@@ -16,7 +16,7 @@ pub(crate) fn hash_mono(samples: &[f32]) -> String {
 pub(crate) fn cache_path() -> std::path::PathBuf {
     home_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".local/share/tj/cache.json")
+        .join(".config/deck/cache.json")
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -29,6 +29,8 @@ pub(crate) struct CacheEntry {
     pub(crate) cue_sample: Option<usize>,
     #[serde(default)]
     pub(crate) offset_established: bool,
+    #[serde(default)]
+    pub(crate) gain_db: i8,
 }
 
 #[derive(Serialize, Deserialize, Default)]

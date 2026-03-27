@@ -2,7 +2,7 @@
 
 ## Overview
 
-Detected BPM, phase offset, and cue points are cached in `~/.local/share/tj/cache.json`, keyed by a Blake3 hash of the decoded audio samples. This makes the cache invariant of filename, tags, and container format.
+Detected BPM, phase offset, and cue points are cached in `~/.config/deck/cache.json`, keyed by a Blake3 hash of the decoded audio samples. This makes the cache invariant of filename, tags, and container format.
 
 ## Contents
 

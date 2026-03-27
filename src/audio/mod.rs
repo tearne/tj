@@ -1,6 +1,6 @@
 use std::num::NonZero;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,6 +16,30 @@ use symphonia::core::probe::Hint;
 
 pub(crate) const OVERVIEW_RESOLUTION: usize = 4000;
 pub(crate) const FADE_SAMPLES: i64 = 256; // ~5.8ms at 44100 Hz — fade-out then fade-in around each seek
+
+/// Width of the soft-knee zone below 0 dBFS. The limiter engages gradually over
+/// [1.0 - LIMITER_KNEE, 1.0], using a cubic Hermite that enters with slope 1 and
+/// asymptotes to the ceiling with slope 0. Hard clip applies above 1.0.
+pub(crate) const LIMITER_KNEE: f32 = 0.3;
+
+/// Apply gain and soft-knee limiting. The knee is a cubic Hermite over
+/// [1 - LIMITER_KNEE, 1.0]: slope 1 at entry, slope 0 at the ceiling.
+fn apply_gain_and_limit(x: f32, gain: f32) -> f32 {
+    let scaled = x * gain;
+    let abs_s = scaled.abs();
+    let threshold = 1.0 - LIMITER_KNEE;
+    if abs_s <= threshold {
+        scaled
+    } else if abs_s >= 1.0 {
+        scaled.signum()
+    } else {
+        // u ∈ (0, 1): position within the knee zone.
+        // Hermite cubic f(u) = u + u² - u³ satisfies f(0)=0, f(1)=1, f'(0)=1, f'(1)=0.
+        let u = (abs_s - threshold) / LIMITER_KNEE;
+        let f = u + u * u - u * u * u;
+        scaled.signum() * (threshold + LIMITER_KNEE * f)
+    }
+}
 
 /// Log-spaced cutoff frequencies for filter offsets ±1..±16.
 /// Index 0 = offset ±1 (near-flat), index 15 = offset ±16 (fully cut).
@@ -183,23 +207,48 @@ pub(crate) struct FilterSource<S: Source<Item = f32>> {
     pub(crate) inner: S,
     pub(crate) filter_offset: Arc<std::sync::atomic::AtomicI32>,
     pub(crate) filter_state_reset: Arc<AtomicBool>,
-    /// Counts down from FADE_SAMPLES to 0 after a state reset; output is scaled
-    /// by an ascending ramp so any IIR settling transient is inaudible.
-    pub(crate) output_fade_remaining: u32,
+    /// Crossfade state: blends from `last_y` to the new output over FADE_SAMPLES on any
+    /// discontinuity (engage, disengage, poles change, state reset).
+    pub(crate) transition_fade: u32,
+    pub(crate) last_y: Vec<f32>,  // per-channel last emitted sample
     pub(crate) last_offset: i32,
+    pub(crate) last_poles: u8,
     pub(crate) channels: u16,
     pub(crate) sample_rate: u32,
-    // Per-channel biquad history
+    // Per-channel biquad history — stage 1
     pub(crate) x1: Vec<f32>, pub(crate) x2: Vec<f32>,
     pub(crate) y1: Vec<f32>, pub(crate) y2: Vec<f32>,
-    // Normalised coefficients (a0 = 1)
+    // Per-channel biquad history — stage 2 (used when filter_poles == 4)
+    pub(crate) x1_2: Vec<f32>, pub(crate) x2_2: Vec<f32>,
+    pub(crate) y1_2: Vec<f32>, pub(crate) y2_2: Vec<f32>,
+    // Normalised coefficients (a0 = 1); shared by both stages
     pub(crate) b0: f32, pub(crate) b1: f32, pub(crate) b2: f32, pub(crate) a1: f32, pub(crate) a2: f32,
     // Which channel slot we are about to emit
     pub(crate) ch_idx: usize,
+    /// Number of filter poles: 2 = 12 dB/oct, 4 = 24 dB/oct.
+    pub(crate) filter_poles: Arc<AtomicU8>,
+    // PFL monitor routing
+    pub(crate) pfl_level: Arc<AtomicU8>,
+    pub(crate) pfl_active_deck: Arc<AtomicUsize>,
+    pub(crate) deck_slot: usize,
+    /// Deck volume as f32 bits; used on the right channel when PFL is active (player volume is 1.0 then).
+    pub(crate) deck_volume: Arc<AtomicU32>,
+    /// Gain trim as f32 bits (linear multiplier); applied pre-fader.
+    pub(crate) gain: Arc<AtomicU32>,
 }
 
 impl<S: Source<Item = f32>> FilterSource<S> {
-    pub(crate) fn new(inner: S, filter_offset: Arc<std::sync::atomic::AtomicI32>, filter_state_reset: Arc<AtomicBool>) -> Self {
+    pub(crate) fn new(
+        inner: S,
+        filter_offset: Arc<std::sync::atomic::AtomicI32>,
+        filter_state_reset: Arc<AtomicBool>,
+        pfl_level: Arc<AtomicU8>,
+        pfl_active_deck: Arc<AtomicUsize>,
+        deck_slot: usize,
+        deck_volume: Arc<AtomicU32>,
+        gain: Arc<AtomicU32>,
+        filter_poles: Arc<AtomicU8>,
+    ) -> Self {
         let channels = inner.channels().get() as u16;
         let sample_rate = inner.sample_rate().get();
         let n = channels as usize;
@@ -207,14 +256,24 @@ impl<S: Source<Item = f32>> FilterSource<S> {
             inner,
             filter_offset,
             filter_state_reset,
-            output_fade_remaining: 0,
+            transition_fade: 0,
+            last_y: vec![0.0; n],
             last_offset: 0,
+            last_poles: 2,
             channels,
             sample_rate,
             x1: vec![0.0; n], x2: vec![0.0; n],
             y1: vec![0.0; n], y2: vec![0.0; n],
+            x1_2: vec![0.0; n], x2_2: vec![0.0; n],
+            y1_2: vec![0.0; n], y2_2: vec![0.0; n],
             b0: 1.0, b1: 0.0, b2: 0.0, a1: 0.0, a2: 0.0,
             ch_idx: 0,
+            pfl_level,
+            pfl_active_deck,
+            deck_slot,
+            deck_volume,
+            gain,
+            filter_poles,
         }
     }
 
@@ -239,36 +298,108 @@ impl<S: Source<Item = f32>> Iterator for FilterSource<S> {
     type Item = f32;
     fn next(&mut self) -> Option<f32> {
         if self.filter_state_reset.swap(false, Ordering::Relaxed) {
-            for v in self.x1.iter_mut().chain(&mut self.x2).chain(&mut self.y1).chain(&mut self.y2) {
+            for v in self.x1.iter_mut().chain(&mut self.x2).chain(&mut self.y1).chain(&mut self.y2)
+                         .chain(self.x1_2.iter_mut()).chain(&mut self.x2_2).chain(&mut self.y1_2).chain(&mut self.y2_2) {
                 *v = 0.0;
             }
-            self.last_offset = 0; // force recompute_coefficients on next sample
-            self.output_fade_remaining = FADE_SAMPLES as u32;
+            for v in self.last_y.iter_mut() { *v = 0.0; }
+            self.last_offset = 0;
+            self.transition_fade = FADE_SAMPLES as u32;
         }
         let x = self.inner.next()?;
         let offset = self.filter_offset.load(Ordering::Relaxed);
-        if offset != self.last_offset {
-            self.last_offset = offset;
-            self.recompute_coefficients(offset);
+        let poles = self.filter_poles.load(Ordering::Relaxed);
+
+        // Detect pole count change and set up crossfade.
+        if poles != self.last_poles {
+            if poles >= 4 && self.last_poles < 4 {
+                // Pre-fill stage 2 from stage 1 so it starts close to steady state.
+                self.x1_2.copy_from_slice(&self.x1);
+                self.x2_2.copy_from_slice(&self.x2);
+                self.y1_2.copy_from_slice(&self.y1);
+                self.y2_2.copy_from_slice(&self.y2);
+            } else {
+                // Disabling stage 2 — zero its state so it's clean for next enable.
+                for v in self.x1_2.iter_mut().chain(&mut self.x2_2)
+                             .chain(&mut self.y1_2).chain(&mut self.y2_2) { *v = 0.0; }
+            }
+            self.last_poles = poles;
+            self.transition_fade = FADE_SAMPLES as u32;
         }
+
+        // Detect filter offset change and set up crossfade.
+        if offset != self.last_offset {
+            if offset == 0 {
+                // Disengaging — zero biquad state so re-engage starts cleanly.
+                for v in self.x1.iter_mut().chain(&mut self.x2).chain(&mut self.y1).chain(&mut self.y2)
+                             .chain(self.x1_2.iter_mut()).chain(&mut self.x2_2)
+                             .chain(&mut self.y1_2).chain(&mut self.y2_2) { *v = 0.0; }
+            } else {
+                self.recompute_coefficients(offset);
+            }
+            self.last_offset = offset;
+            self.transition_fade = FADE_SAMPLES as u32;
+        }
+
         let ch = self.ch_idx;
         self.ch_idx = (ch + 1) % self.channels as usize;
-        if offset == 0 {
-            self.output_fade_remaining = 0; // cancel pending fade when filter is bypassed
-            return Some(x);
-        }
-        let y = self.b0 * x + self.b1 * self.x1[ch] + self.b2 * self.x2[ch]
-              - self.a1 * self.y1[ch] - self.a2 * self.y2[ch];
-        self.x2[ch] = self.x1[ch]; self.x1[ch] = x;
-        self.y2[ch] = self.y1[ch]; self.y1[ch] = y;
-        if self.output_fade_remaining > 0 {
-            let n = FADE_SAMPLES as u32 - self.output_fade_remaining;
-            let t = n as f32 / FADE_SAMPLES as f32;
-            self.output_fade_remaining -= 1;
-            Some(y * t)
+
+        // Compute current output: filtered when active, raw when bypassed.
+        let current = if offset != 0 {
+            // Stage 1
+            let y = self.b0 * x + self.b1 * self.x1[ch] + self.b2 * self.x2[ch]
+                  - self.a1 * self.y1[ch] - self.a2 * self.y2[ch];
+            self.x2[ch] = self.x1[ch]; self.x1[ch] = x;
+            self.y2[ch] = self.y1[ch]; self.y1[ch] = y;
+            // Stage 2 — identical coefficients, active when poles == 4 (24 dB/oct)
+            if poles >= 4 {
+                let y2 = self.b0 * y + self.b1 * self.x1_2[ch] + self.b2 * self.x2_2[ch]
+                       - self.a1 * self.y1_2[ch] - self.a2 * self.y2_2[ch];
+                self.x2_2[ch] = self.x1_2[ch]; self.x1_2[ch] = y;
+                self.y2_2[ch] = self.y1_2[ch]; self.y1_2[ch] = y2;
+                y2
+            } else {
+                y
+            }
         } else {
-            Some(y)
+            x
+        };
+
+        // Crossfade from last_y to current on any transition.
+        let filtered = if self.transition_fade > 0 {
+            let t = self.transition_fade as f32 / FADE_SAMPLES as f32;
+            let blended = self.last_y[ch] * t + current * (1.0 - t);
+            self.transition_fade = self.transition_fade.saturating_sub(1);
+            blended
+        } else {
+            current
+        };
+        self.last_y[ch] = filtered;
+
+        let gain = f32::from_bits(self.gain.load(Ordering::Relaxed));
+        let filtered = apply_gain_and_limit(filtered, gain);
+
+        // PFL monitor routing (stereo tracks only).
+        // When any deck has PFL active, the left channel carries PFL and the main mix is
+        // suppressed there; the right channel always carries the main mix at deck volume.
+        // player.set_volume() is held at 1.0 for the active PFL deck so that FilterSource
+        // can control the right-channel gain independently.
+        let pfl_active = self.pfl_active_deck.load(Ordering::Relaxed);
+        if self.channels >= 2 && pfl_active != usize::MAX {
+            if ch == 0 {
+                return if pfl_active == self.deck_slot {
+                    let scale = self.pfl_level.load(Ordering::Relaxed) as f32 / 100.0;
+                    Some(x * scale)
+                } else {
+                    Some(0.0)
+                };
+            } else if pfl_active == self.deck_slot {
+                let vol = f32::from_bits(self.deck_volume.load(Ordering::Relaxed));
+                return Some(filtered * vol);
+            }
         }
+
+        Some(filtered)
     }
 }
 

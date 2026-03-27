@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicI32};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -18,15 +18,6 @@ pub(crate) const PALETTE_SCHEMES: &[(&str, SpecPalette, SpecPalette)] = &[
     ("amber/cyan",
      ((  0, 255, 255), (  0, 255, 120), (220, 255,   0), (255, 120,   0)),  // cyan → teal → gold → amber
      ((  0, 255, 255), (  0, 255, 120), (220, 255,   0), (255, 120,   0))), // B: same
-    ("warm-rainbow",
-     (( 60, 255,   0), (220, 255,   0), (255, 140,   0), (255,  20,   0)),  // lime → yellow → orange → red
-     (( 60, 255,   0), (220, 255,   0), (255, 140,   0), (255,  20,   0))), // B: same
-    ("sunset",
-     ((220, 220,   0), (255, 140,   0), (255,  20,  80), (180,   0, 200)),  // gold → orange → crimson → violet
-     ((220, 220,   0), (255, 140,   0), (255,  20,  80), (180,   0, 200))), // B: same
-    ("ember",
-     ((220, 200,   0), (255, 120,   0), (200,  20,   0), ( 80,   0,   0)),  // gold → orange → red → deep-red
-     ((220, 200,   0), (255, 120,   0), (200,  20,   0), ( 80,   0,   0))), // B: same
 ];
 
 
@@ -38,6 +29,13 @@ pub(crate) struct DeckAudio {
     pub(crate) sample_rate: u32,
     pub(crate) filter_offset_shared: Arc<AtomicI32>,
     pub(crate) filter_state_reset: Arc<AtomicBool>,
+    pub(crate) pfl_level: Arc<AtomicU8>,
+    /// Deck fader volume as f32 bits; read by FilterSource on the right channel when PFL is active.
+    pub(crate) deck_volume_atomic: Arc<AtomicU32>,
+    /// Gain trim as f32 bits (linear multiplier); applied pre-fader in FilterSource.
+    pub(crate) gain_linear: Arc<AtomicU32>,
+    /// Filter slope: 2 = 12 dB/oct, 4 = 24 dB/oct.
+    pub(crate) filter_poles: Arc<AtomicU8>,
 }
 
 pub(crate) struct TempoState {
@@ -125,7 +123,10 @@ pub(crate) struct Deck {
     pub(crate) track_name: String,
     pub(crate) total_duration: f64,
     pub(crate) volume: f32,
+    pub(crate) gain_db: i8,
+    pub(crate) pfl_level: u8,
     pub(crate) filter_offset: i32,
+    pub(crate) filter_poles: u8,
     pub(crate) nudge: i8,
     pub(crate) nudge_mode: NudgeMode,
     pub(crate) metronome_mode: bool,
@@ -160,7 +161,10 @@ impl Deck {
             track_name,
             total_duration,
             volume: 1.0,
+            gain_db: 0,
+            pfl_level: 0,
             filter_offset: 0,
+            filter_poles: 2,
             nudge: 0,
             nudge_mode: NudgeMode::Jump,
             metronome_mode: false,

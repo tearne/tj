@@ -4,7 +4,7 @@ A terminal-based two-deck music player written in Rust, with real-time waveform 
 
 ## Launching
 ```
-tj [path]
+deck [path]
 ```
 - If `path` is an audio file, opens and begins playing it immediately.
 - If `path` is a directory, opens the file browser rooted at that directory.
@@ -17,6 +17,10 @@ tj [path]
 - Audio playback: `rodio`.
 - BPM detection: `stratum-dsp`.
 - Target platform: Linux (primary); other Unix-like systems are a stretch goal.
+
+## Versioning
+
+Releases follow [Semantic Versioning](https://semver.org/) (`MAJOR.MINOR.PATCH`). The appropriate increment is agreed between user and agent at release time based on what the accumulated changes represent — it is not auto-incremented. See `AGENT/ADDITIONAL/VERSIONING.md`.
 
 ## Out of Scope (deferred)
 - Cover art display.

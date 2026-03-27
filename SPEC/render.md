@@ -87,7 +87,7 @@ Layout constraints are based on the loaded deck's `detail_height` (defaulting to
 
 - Zoom level and detail height are shared across both decks. `-`/`=` and `{`/`}` adjust them globally.
 - Both sets of markers shift immediately when the phase offset is adjusted.
-- The detail info bar is a single shared row above both detail waveforms, showing the common zoom level (e.g. `zoom:4s`), latency, nudge mode, and palette name in dim style. A mode indicator is always present: `[VINYL]` in vinyl mode, `[BEAT]` in beat mode.
+- The detail info bar is a single shared row above both detail waveforms, showing the common zoom level (e.g. `zoom:4s`), latency, and nudge mode in dim style. A mode indicator is always present: `[VINYL]` in vinyl mode, `[BEAT]` in beat mode. When Space is held, `[SPC]` appears to the right of the mode indicator.
 - The detail waveform height is user-adjustable at runtime with `{` (decrease) and `}` (increase), and applies to both decks simultaneously. Any unused space below the panel is left blank. The initial height is set by `detail_height` in the `[display]` section of `config.toml` (default `6`, minimum `3`; value is total rows including the 2-row tick area, giving 4 waveform rows at the default).
 - The playhead column in the detail panel is set by `playhead_position` (0–100, default `20`) in the `[display]` section of `config.toml`. The value is a percentage of the panel width from the left edge; out-of-range values are clamped silently.
 - The detail waveform scrolls at half-column resolution: the viewport can be positioned at half-character offsets without modifying the pre-rendered buffer (see *Glossary — Half-column scrolling*).

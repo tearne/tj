@@ -138,7 +138,7 @@ pub(crate) fn run_browser(
         let list = List::new(items)
             .block(
                 Block::default()
-                    .title(format!(" tj — {} ", cwd_display))
+                    .title(format!(" deck — {} ", cwd_display))
                     .borders(Borders::ALL),
             )
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
