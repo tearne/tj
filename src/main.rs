@@ -43,13 +43,13 @@ use deck::{
     TagEditorState, TAG_FIELD_LABELS,
 };
 use render::{
-    extract_tick_viewport, info_line_empty, DEFAULT_ZOOM_IDX,
+    extract_tick_viewport, halfblock_art, info_line_empty, DEFAULT_ZOOM_IDX,
     info_line_for_deck, notification_line_empty, notification_line_for_deck,
     overview_empty, overview_for_deck, render_detail_empty, render_detail_waveform,
     render_shared_tick_row,
     render_tag_editor, SharedDetailRenderer, ZOOM_LEVELS,
 };
-use tags::{propose_rename_stem, read_tags_for_editor, read_track_name};
+use tags::{propose_rename_stem, read_cover_art, read_tags_for_editor, read_track_name};
 
 fn cleanup_terminal() {
     let _ = disable_raw_mode();
@@ -268,7 +268,7 @@ fn build_deck(
         });
     }
 
-    Deck::new(
+    let mut deck = Deck::new(
         filename,
         path.to_path_buf(),
         track_name,
@@ -288,7 +288,9 @@ fn build_deck(
             gain_linear,
         },
         bpm_rx,
-    )
+    );
+    deck.cover_art = read_cover_art(path);
+    deck
 }
 
 fn tui_loop(
@@ -329,6 +331,7 @@ fn tui_loop(
     const DET_MIN: u16 = 3;
     let mut audio_latency_ms: i64 = ((cache.get_latency() as f64 / 10.0).round() as i64 * 10).clamp(0, 250);
     let mut scheme_idx: usize = 0;
+    let mut art_bright_idx: u8 = cache.get_art_bright_idx();
     let mut zoom_idx: usize = DEFAULT_ZOOM_IDX;
     let mut vinyl_mode: bool = cache.get_vinyl_mode();
     let shared_renderer = SharedDetailRenderer::new(zoom_idx);
@@ -695,6 +698,34 @@ fn tui_loop(
                     ))
                 };
                 frame.render_widget(Paragraph::new(global_line).style(notif_bg), area_global);
+            }
+
+            // ---- Cover art (spacer row) ----
+            if c[11].height >= 3 && art_bright_idx < 2 {
+                let brightness = [1.0f32, 0.35, 0.0][art_bright_idx as usize];
+                // 1-row top margin separates art from deck B above.
+                let vert = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(1), Constraint::Min(0)])
+                    .split(c[11]);
+                let art_row = vert[1];
+                // 1-column centre gap between the two panels.
+                let art_areas = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Fill(1), Constraint::Length(1), Constraint::Fill(1)])
+                    .split(art_row);
+                for (idx, deck_opt) in [&d0, &d1].iter().enumerate() {
+                    let panel_idx = idx * 2; // indices 0 and 2; index 1 is the gap
+                    if let Some(deck) = deck_opt {
+                        if let Some(ref bytes) = deck.cover_art {
+                            let a = art_areas[panel_idx];
+                            frame.render_widget(
+                                Paragraph::new(halfblock_art(bytes, a.width, a.height, brightness)),
+                                a,
+                            );
+                        }
+                    }
+                }
             }
 
             // Tag editor overlay
@@ -1614,6 +1645,11 @@ Esc                  close this / quit";
                                 d.display.palette = if slot == 0 { PALETTE_SCHEMES[scheme_idx].1 } else { PALETTE_SCHEMES[scheme_idx].2 };
                             }
                         }
+                    }
+                    Some(Action::ArtCycle) => {
+                        art_bright_idx = [2u8, 0, 1][art_bright_idx as usize]; // dim→bright→off→dim
+                        cache.set_art_bright_idx(art_bright_idx);
+                        cache.save();
                     }
                     Some(Action::Deck1OffsetIncrease) => {
                         if !vinyl_mode { if let Some(ref mut d) = decks[0] { apply_offset_step(d, 10); } }

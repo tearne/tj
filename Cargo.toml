@@ -1,6 +1,6 @@
 [package]
 name = "deck"
-version = "0.6.1"
+version = "0.6.9"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 
@@ -16,3 +16,4 @@ toml = "0.8"
 symphonia = { version = "0.5.5", features = ["all"] }
 color-eyre = "0.6.5"
 lofty = "0.22"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

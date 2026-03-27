@@ -137,6 +137,7 @@ pub(crate) struct Deck {
     pub(crate) rename_offer_started: Option<Instant>,
     pub(crate) rename_accepted: Option<String>,
     pub(crate) tag_editor: Option<TagEditorState>,
+    pub(crate) cover_art: Option<Vec<u8>>,
 
     pub(crate) audio: DeckAudio,
     pub(crate) tempo: TempoState,
@@ -175,6 +176,7 @@ impl Deck {
             rename_hint,
             rename_accepted: None,
             tag_editor: None,
+            cover_art: None,
             audio,
             tempo: TempoState {
                 bpm: 120.0,

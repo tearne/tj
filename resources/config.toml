@@ -11,6 +11,7 @@ latency_increase = "]"
 palette_cycle    = "P"
 terminal_refresh = "¬"
 vinyl_mode_toggle = "`"
+art_cycle         = "\\"
 help             = "?"
 nudge_mode_toggle = "|"
 

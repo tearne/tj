@@ -123,6 +123,17 @@ pub(crate) fn write_tags(path: &Path, fields: &[(String, usize)]) -> Result<(), 
     tag.save_to_path(path, WriteOptions::default()).map_err(|e| e.to_string())
 }
 
+pub(crate) fn read_cover_art(path: &Path) -> Option<Vec<u8>> {
+    use lofty::picture::PictureType;
+    let tagged_file = lofty::read_from_path(path).ok()?;
+    let tag = tagged_file.primary_tag()?;
+    let pictures = tag.pictures();
+    let pic = pictures.iter()
+        .find(|p| p.pic_type() == PictureType::CoverFront)
+        .or_else(|| pictures.first())?;
+    Some(pic.data().to_vec())
+}
+
 pub(crate) fn read_track_name(path: &str) -> String {
     let fallback = || {
         Path::new(path)

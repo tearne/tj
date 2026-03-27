@@ -808,6 +808,39 @@ pub(crate) fn render_detail_empty(
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+/// Render embedded cover art as half-block characters (`▀`), filling the area.
+/// The image is scaled to cover the full cols×rows cell area (cropping the longer
+/// axis symmetrically). `brightness` (0.0–1.0) dims the pixel values uniformly.
+pub(crate) fn halfblock_art(bytes: &[u8], cols: u16, rows: u16, brightness: f32) -> Vec<Line<'static>> {
+    use image::imageops::FilterType;
+    if cols == 0 || rows == 0 { return vec![]; }
+    let img = match image::load_from_memory(bytes) {
+        Ok(i) => i,
+        Err(_) => return vec![],
+    };
+    let pixel_w = cols as u32;
+    let pixel_h = rows as u32 * 2;
+    // Scale to a square large enough to cover both dimensions, then crop to the panel.
+    let art_px = pixel_w.max(pixel_h);
+    let x_off  = (art_px - pixel_w) / 2;
+    let y_off  = (art_px - pixel_h) / 2;
+    let rgb = img.resize_exact(art_px, art_px, FilterType::Triangle).to_rgb8();
+    let dim = |c: u8| (c as f32 * brightness) as u8;
+    (0..rows).map(|row| {
+        let spans: Vec<Span<'static>> = (0..cols).map(|col| {
+            let px      = col as u32 + x_off;
+            let py_top  = row as u32 * 2 + y_off;
+            let py_bot  = (py_top + 1).min(art_px - 1);
+            let top = rgb.get_pixel(px, py_top);
+            let bot = rgb.get_pixel(px, py_bot);
+            Span::styled("▀", Style::default()
+                .fg(Color::Rgb(dim(top[0]), dim(top[1]), dim(top[2])))
+                .bg(Color::Rgb(dim(bot[0]), dim(bot[1]), dim(bot[2]))))
+        }).collect();
+        Line::from(spans)
+    }).collect()
+}
+
 pub(crate) fn popup_area(width: u16, height: u16, area: ratatui::layout::Rect) -> ratatui::layout::Rect {
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;

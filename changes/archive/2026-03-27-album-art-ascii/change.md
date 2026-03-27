@@ -51,3 +51,26 @@ Two options were considered:
 5. In the render loop, split `c[11]` horizontally 50/50 and render each deck's art panel.
 
 ## Outcome
+
+### 2026-03-27 — POC implemented
+
+POC is complete and building clean. Implementation matches the plan from initial research:
+
+- `image` crate added (JPEG + PNG decode, no extra features)
+- `read_cover_art(path)` in `src/tags/mod.rs` — extracts `CoverFront` picture via lofty, falling back to first picture
+- `halfblock_art(bytes, cols, rows)` in `src/render/mod.rs` — decodes, resizes to `cols × (rows*2)`, maps pixel pairs to `▀` with true-colour fg/bg
+- `cover_art: Option<Vec<u8>>` on `Deck` — set in `build_deck` after decode
+- Spacer row `c[11]` split 50/50 horizontally — each deck's art rendered if present and area ≥ 2 rows tall
+
+Ready for live testing. Key questions to resolve:
+1. Does art render correctly on the host terminal?
+2. Is `image::load_from_memory` + resize-per-frame too slow at 50ms frame times, or fast enough?
+3. Is 50/50 side-by-side the right layout, or should art only show for the loaded deck?
+
+### 2026-03-27 — Refinements
+
+Following live testing:
+
+- Switched to fill (cover) mode: image scales to cover the full panel, cropping the shorter axis symmetrically — no letterboxing
+- Added 1-row top margin and 1-column centre gap (black border separating art from the deck waveforms above and from each other)
+- Added `\` art cycle key: full → dim (35%) → off → full, via `art_state: u8` in the tui loop and a `brightness: f32` parameter on `halfblock_art`

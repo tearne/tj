@@ -2,6 +2,8 @@ use color_eyre::Result as EyreResult;
 use serde::{Deserialize, Serialize};
 use stratum_dsp::{analyze_audio, AnalysisConfig};
 
+fn default_art_bright_idx() -> u8 { 1 }
+
 fn home_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(std::path::PathBuf::from)
 }
@@ -33,7 +35,7 @@ pub(crate) struct CacheEntry {
     pub(crate) gain_db: i8,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize)]
 pub(crate) struct CacheFile {
     #[serde(default)]
     pub(crate) last_browser_path: Option<String>,
@@ -41,8 +43,22 @@ pub(crate) struct CacheFile {
     pub(crate) audio_latency_ms: i64,
     #[serde(default)]
     pub(crate) vinyl_mode: bool,
+    #[serde(default = "default_art_bright_idx")]
+    pub(crate) art_bright_idx: u8,
     #[serde(default)]
     pub(crate) entries: std::collections::HashMap<String, CacheEntry>,
+}
+
+impl Default for CacheFile {
+    fn default() -> Self {
+        Self {
+            last_browser_path: None,
+            audio_latency_ms: 0,
+            vinyl_mode: false,
+            art_bright_idx: default_art_bright_idx(),
+            entries: std::collections::HashMap::new(),
+        }
+    }
 }
 
 pub(crate) struct Cache {
@@ -50,6 +66,7 @@ pub(crate) struct Cache {
     pub(crate) last_browser_path: Option<std::path::PathBuf>,
     pub(crate) audio_latency_ms: i64,
     pub(crate) vinyl_mode: bool,
+    pub(crate) art_bright_idx: u8,
     pub(crate) entries: std::collections::HashMap<String, CacheEntry>,
 }
 
@@ -71,6 +88,7 @@ impl Cache {
             last_browser_path: file.last_browser_path.map(std::path::PathBuf::from),
             audio_latency_ms: file.audio_latency_ms,
             vinyl_mode: file.vinyl_mode,
+            art_bright_idx: file.art_bright_idx,
             entries: file.entries,
         }
     }
@@ -107,6 +125,14 @@ impl Cache {
         self.vinyl_mode = mode;
     }
 
+    pub(crate) fn get_art_bright_idx(&self) -> u8 {
+        self.art_bright_idx
+    }
+
+    pub(crate) fn set_art_bright_idx(&mut self, state: u8) {
+        self.art_bright_idx = state;
+    }
+
     pub(crate) fn entries_snapshot(&self) -> std::collections::HashMap<String, CacheEntry> {
         self.entries.clone()
     }
@@ -122,6 +148,7 @@ impl Cache {
                 .and_then(|p| p.to_str().map(|s| s.to_string())),
             audio_latency_ms: self.audio_latency_ms,
             vinyl_mode: self.vinyl_mode,
+            art_bright_idx: self.art_bright_idx,
             entries: self.entries.clone(),
         };
         if let Ok(text) = serde_json::to_string_pretty(&file) {

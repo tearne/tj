@@ -11,6 +11,7 @@ pub(crate) enum Action {
     LatencyIncrease, LatencyDecrease,
     PaletteCycle,
     NudgeModeToggle,
+    ArtCycle,
     // Deck 1
     Deck1PlayPause, Deck1OpenBrowser,
     Deck1LevelUp, Deck1LevelDown, Deck1LevelMax, Deck1LevelMin,
@@ -60,6 +61,7 @@ pub(crate) static ACTION_NAMES: &[(&str, Action)] = &[
     ("latency_decrease",  Action::LatencyDecrease),
     ("palette_cycle",     Action::PaletteCycle),
     ("nudge_mode_toggle", Action::NudgeModeToggle),
+    ("art_cycle",         Action::ArtCycle),
     // Deck 1
     ("deck1_play_pause",        Action::Deck1PlayPause),
     ("deck1_open_browser",      Action::Deck1OpenBrowser),
