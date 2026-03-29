@@ -6,6 +6,7 @@ use ratatui::layout::Rect;
 use rodio::Player;
 
 use crate::audio::{butterworth_biquad, SeekHandle, WaveformData, FILTER_CUTOFFS_HZ};
+use crate::cache::CacheEntry;
 
 pub(crate) type Rgb = (u8, u8, u8);
 /// Four-stop spectral palette: (treble, mid-treble, mid-bass, bass).
@@ -91,6 +92,8 @@ pub(crate) struct Notification {
     pub(crate) expires: Instant,
 }
 
+pub(crate) const NOTIFICATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub(crate) const TAG_FIELD_LABELS: &[&str] = &[
     " Artist", "  Title", "  Album", "   Year", "  Track", "  Genre", "Comment",
 ];
@@ -138,6 +141,7 @@ pub(crate) struct Deck {
     pub(crate) rename_accepted: Option<String>,
     pub(crate) tag_editor: Option<TagEditorState>,
     pub(crate) cover_art: Option<Vec<u8>>,
+    pub(crate) cover_art_cache: Option<(u16, u16, u8, Vec<ratatui::text::Line<'static>>)>, // (cols, rows, bright_idx, lines)
 
     pub(crate) audio: DeckAudio,
     pub(crate) tempo: TempoState,
@@ -177,6 +181,7 @@ impl Deck {
             rename_accepted: None,
             tag_editor: None,
             cover_art: None,
+            cover_art_cache: None,
             audio,
             tempo: TempoState {
                 bpm: 120.0,
@@ -421,6 +426,17 @@ pub(crate) fn do_time_jump(seek_handle: &SeekHandle, player: &Player, track_end:
         if playing && target + secs > track_end { return; }
         let clamped = target.min(track_end);
         if playing { seek_handle.seek_to(clamped); } else { seek_handle.seek_direct(clamped); }
+    }
+}
+
+pub(crate) fn cache_entry_for_deck(d: &Deck) -> CacheEntry {
+    CacheEntry {
+        bpm: d.tempo.base_bpm,
+        offset_ms: d.tempo.offset_ms,
+        name: d.filename.clone(),
+        cue_sample: d.cue_sample,
+        offset_established: d.tempo.offset_established,
+        gain_db: d.gain_db,
     }
 }
 

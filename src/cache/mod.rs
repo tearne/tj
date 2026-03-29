@@ -40,6 +40,8 @@ pub(crate) struct CacheFile {
     #[serde(default)]
     pub(crate) last_browser_path: Option<String>,
     #[serde(default)]
+    pub(crate) browser_workspace: Option<String>,
+    #[serde(default)]
     pub(crate) audio_latency_ms: i64,
     #[serde(default)]
     pub(crate) vinyl_mode: bool,
@@ -53,6 +55,7 @@ impl Default for CacheFile {
     fn default() -> Self {
         Self {
             last_browser_path: None,
+            browser_workspace: None,
             audio_latency_ms: 0,
             vinyl_mode: false,
             art_bright_idx: default_art_bright_idx(),
@@ -64,6 +67,7 @@ impl Default for CacheFile {
 pub(crate) struct Cache {
     pub(crate) path: std::path::PathBuf,
     pub(crate) last_browser_path: Option<std::path::PathBuf>,
+    pub(crate) browser_workspace: Option<std::path::PathBuf>,
     pub(crate) audio_latency_ms: i64,
     pub(crate) vinyl_mode: bool,
     pub(crate) art_bright_idx: u8,
@@ -86,6 +90,9 @@ impl Cache {
         Self {
             path,
             last_browser_path: file.last_browser_path.map(std::path::PathBuf::from),
+            browser_workspace: file.browser_workspace
+                .map(std::path::PathBuf::from)
+                .filter(|p| p.is_dir()),
             audio_latency_ms: file.audio_latency_ms,
             vinyl_mode: file.vinyl_mode,
             art_bright_idx: file.art_bright_idx,
@@ -107,6 +114,14 @@ impl Cache {
 
     pub(crate) fn set_last_browser_path(&mut self, p: &std::path::Path) {
         self.last_browser_path = Some(p.to_path_buf());
+    }
+
+    pub(crate) fn workspace(&self) -> Option<&std::path::Path> {
+        self.browser_workspace.as_deref()
+    }
+
+    pub(crate) fn set_workspace(&mut self, p: &std::path::Path) {
+        self.browser_workspace = Some(p.to_path_buf());
     }
 
     pub(crate) fn get_latency(&self) -> i64 {
@@ -144,6 +159,9 @@ impl Cache {
         let tmp = self.path.with_extension("tmp");
         let file = CacheFile {
             last_browser_path: self.last_browser_path
+                .as_ref()
+                .and_then(|p| p.to_str().map(|s| s.to_string())),
+            browser_workspace: self.browser_workspace
                 .as_ref()
                 .and_then(|p| p.to_str().map(|s| s.to_string())),
             audio_latency_ms: self.audio_latency_ms,

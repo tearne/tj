@@ -6,21 +6,31 @@
 
 The UI is structured into the following vertical sections (top to bottom):
 1. Detail info bar (shared)
-2. Detail waveform — Deck A
-3. Detail waveform — Deck B
-4. Notification bar — Deck A
-5. Info bar — Deck A
-6. Overview — Deck A
-7. Notification bar — Deck B
-8. Info bar — Deck B
-9. Overview — Deck B
+2. Detail waveform — Deck 1
+3. Detail waveform — Deck 2
+4. Notification bar — Deck 1
+5. Info bar — Deck 1
+6. Overview — Deck 1
+7. Notification bar — Deck 2
+8. Info bar — Deck 2
+9. Overview — Deck 2
 10. Global status bar
 
 ### Global Status Bar
 
 A single row pinned to the bottom of the UI. Content priority:
-1. **System notification** — transient messages not tied to either deck (e.g. config parse warning, startup prompt). Shown until expired; uses the same `Notification` type and expiry mechanism as per-deck notifications.
-2. **Idle status** — shown when no system notification is active. Displays the current browser working directory in dim style.
+1. **Interactive confirmation** (`pending_quit`, `browser_blocked`) — centred text, countdown timer, coloured background. `y`/`Esc`/`n` are intercepted before any other key handling.
+2. **System notification** — transient messages not tied to either deck. All styles render with centred text, a countdown timer, and a style-appropriate colour scheme (see table below). Dismissed immediately by `Esc`. Standard timeout: 5 seconds (`NOTIFICATION_TIMEOUT`).
+3. **Idle status** — shown when no notification is active. Displays the current browser working directory (left) and version string (right) in dim style.
+
+Notification colour schemes:
+
+| Style   | Use                        | Foreground           | Background          |
+|---------|----------------------------|----------------------|---------------------|
+| Error   | failures, blocked actions  | `Rgb(255, 180, 180)` | `Rgb(100, 20, 20)`  |
+| Warning | advisory notices           | `Rgb(255, 220, 120)` | `Rgb(80, 60, 0)`    |
+| Info    | neutral informational      | `Rgb(160, 200, 255)` | `Rgb(20, 40, 80)`   |
+| Success | confirmations, completions | `Rgb(140, 230, 160)` | `Rgb(10, 60, 30)`   |
 
 ### Notification Bar
 

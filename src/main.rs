@@ -33,14 +33,14 @@ mod render;
 mod tags;
 
 use audio::{decode_audio, scrub_audio, play_click_tone, FilterSource, TrackingSource, WaveformData, SeekHandle, FADE_SAMPLES};
-use browser::{run_browser, BrowserResult};
-use cache::{cache_path, hash_mono, Cache, CacheEntry, detect_bpm};
+use browser::{BrowserResult, BrowserState, handle_browser_key, render_browser};
+use cache::{cache_path, hash_mono, Cache, detect_bpm};
 use config::{load_config, Action, KeyBinding};
 use deck::do_time_jump;
 use deck::{
-    anchor_beat_grid_to_cue, apply_offset_step, compute_spectrum, compute_tap_bpm_offset,
-    Deck, DeckAudio, NudgeMode, Notification, NotificationStyle, PALETTE_SCHEMES,
-    TagEditorState, TAG_FIELD_LABELS,
+    anchor_beat_grid_to_cue, apply_offset_step, cache_entry_for_deck, compute_spectrum,
+    compute_tap_bpm_offset, Deck, DeckAudio, NudgeMode, Notification, NotificationStyle,
+    NOTIFICATION_TIMEOUT, PALETTE_SCHEMES, TagEditorState, TAG_FIELD_LABELS,
 };
 use render::{
     extract_tick_viewport, halfblock_art, info_line_empty, DEFAULT_ZOOM_IDX,
@@ -315,8 +315,8 @@ fn tui_loop(
     if let Some(msg) = config_notice {
         global_notification = Some(Notification {
             message: msg,
-            style: NotificationStyle::Info,
-            expires: Instant::now() + Duration::from_secs(8),
+            style: NotificationStyle::Success,
+            expires: Instant::now() + NOTIFICATION_TIMEOUT,
         });
     }
     let mut decks: [Option<Deck>; 2] = [None, None];
@@ -339,6 +339,7 @@ fn tui_loop(
     let mut frame_count: usize = 0;
     let mut last_render = Instant::now();
     let mut help_open = false;
+    let mut browser_state: Option<(BrowserState, usize)> = None; // (state, target deck slot)
     let mut max_det_h: usize = usize::MAX;
     let pfl_active_deck = Arc::new(AtomicUsize::new(usize::MAX));
     let mut space_held = false;
@@ -349,7 +350,8 @@ fn tui_loop(
     // happens via a Release event (those also don't arrive in crossterm 0.29 + Kitty).
     let mut space_repeat_suppressed = false;
     let mut space_saw_event_this_frame = false;
-    let mut pending_quit = false;
+    let mut pending_quit: Option<Instant> = None;
+    let mut browser_blocked: Option<(Instant, usize)> = None; // (expiry, target deck slot)
     let mut bpm_ramp_started: Option<Instant> = None;
     let mut bpm_ramp_last: Option<Instant> = None;
     // When Esc dismisses an overlay, suppress the next Quit action for a short window.
@@ -414,7 +416,7 @@ fn tui_loop(
                     global_notification = Some(Notification {
                         message: format!("Load failed: {e}"),
                         style: NotificationStyle::Error,
-                        expires: Instant::now() + Duration::from_secs(10),
+                        expires: Instant::now() + NOTIFICATION_TIMEOUT,
                     });
                     pending_loads[slot] = None;
                 }
@@ -482,11 +484,7 @@ fn tui_loop(
 
         terminal.draw(|frame| {
             let area = frame.area();
-            let outer = Block::default()
-                .title(format!(" deck {} ", env!("CARGO_PKG_VERSION")))
-                .borders(Borders::ALL);
-            let inner = outer.inner(area);
-            frame.render_widget(outer, area);
+            let inner = area;
 
             // Compression order as the terminal shrinks:
             //   1. Detail waveforms compress evenly: detail_height → DET_MIN
@@ -621,10 +619,10 @@ fn tui_loop(
             let tick_b = extract_tick_viewport(&buf_b, pos_b, tick_centre, tick_w);
             render_shared_tick_row(frame, area_tick, &tick_a, &tick_b);
 
-            // ---- Deck A ----
+            // ---- Deck 1 ----
             if let (Some(deck), Some(rs)) = (&mut d0, &render[0]) {
                 let content = notification_line_for_deck(deck, area_notif_a.width.saturating_sub(2) as usize, vinyl_mode);
-                let mut spans = vec![Span::styled("A ", label_style)];
+                let mut spans = vec![Span::styled("1 ", label_style)];
                 spans.extend(content.spans);
                 frame.render_widget(Paragraph::new(Line::from(spans)).style(notif_bg), area_notif_a);
                 let info = info_line_for_deck(deck, frame_count, rs.beat_on, rs.spinner_active, label_style, area_info_a.width, vinyl_mode);
@@ -648,10 +646,10 @@ fn tui_loop(
                 render_detail_empty(frame, area_detail_a, 0);
             }
 
-            // ---- Deck B ----
+            // ---- Deck 2 ----
             if let (Some(deck), Some(rs)) = (&mut d1, &render[1]) {
                 let content = notification_line_for_deck(deck, area_notif_b.width.saturating_sub(2) as usize, vinyl_mode);
-                let mut spans = vec![Span::styled("B ", label_style)];
+                let mut spans = vec![Span::styled("2 ", label_style)];
                 spans.extend(content.spans);
                 frame.render_widget(Paragraph::new(Line::from(spans)).style(notif_bg), area_notif_b);
                 let info = info_line_for_deck(deck, frame_count, rs.beat_on, rs.spinner_active, label_style, area_info_b.width, vinyl_mode);
@@ -677,33 +675,67 @@ fn tui_loop(
 
             // ---- Global status bar ----
             {
-                let global_line = if pending_quit {
-                    Line::from(vec![
-                        Span::styled("  Track is playing — quit? ", Style::default().fg(Color::Yellow)),
-                        Span::styled("[y] yes  ", Style::default().fg(Color::White)),
-                        Span::styled("[Esc/n] cancel", Style::default().fg(Color::DarkGray)),
-                    ])
-                } else if let Some(ref n) = global_notification {
-                    let color = match n.style {
-                        NotificationStyle::Info    => Color::DarkGray,
-                        NotificationStyle::Warning => Color::Yellow,
-                        NotificationStyle::Error   => Color::Red,
-                        NotificationStyle::Success => Color::Green,
-                    };
-                    Line::from(Span::styled(n.message.clone(), Style::default().fg(color)))
-                } else {
-                    Line::from(Span::styled(
-                        format!("  {}", browser_dir.display()),
-                        Style::default().fg(Color::DarkGray),
-                    ))
+                if pending_quit.map_or(false, |e| Instant::now() > e) { pending_quit = None; }
+                if browser_blocked.map_or(false, |(e, _)| Instant::now() > e) { browser_blocked = None; global_notification = None; }
+                let notification_bar = |msg: &str, expires: Instant, fg: Color, bg: Color, countdown_fg: Color| {
+                    let secs = expires.saturating_duration_since(Instant::now()).as_secs();
+                    let countdown = format!("[{}]", secs);
+                    let w = area_global.width as usize;
+                    let inner = w.saturating_sub(countdown.len());
+                    let pad = inner.saturating_sub(msg.len()) / 2;
+                    let centred = format!("{:pad$}{msg}", "");
+                    let fill = inner.saturating_sub(pad + msg.len());
+                    let line = Line::from(vec![
+                        Span::styled(format!("{centred}{:fill$}", ""), Style::default().fg(fg)),
+                        Span::styled(countdown, Style::default().fg(countdown_fg)),
+                    ]);
+                    (line, Style::default().bg(bg))
                 };
-                frame.render_widget(Paragraph::new(global_line).style(notif_bg), area_global);
+                let (global_line, bar_style) = if let Some(quit_expires) = pending_quit {
+                    notification_bar("Track is playing — quit?  [y] quit   [Esc/n] cancel", quit_expires,
+                        Color::Rgb(255, 180, 180), Color::Rgb(100, 20, 20), Color::Rgb(200, 120, 120))
+                } else if let Some(ref n) = global_notification {
+                    match n.style {
+                        NotificationStyle::Error =>
+                            notification_bar(&n.message, n.expires,
+                                Color::Rgb(255, 180, 180), Color::Rgb(100, 20, 20), Color::Rgb(200, 120, 120)),
+                        NotificationStyle::Warning =>
+                            notification_bar(&n.message, n.expires,
+                                Color::Rgb(255, 220, 120), Color::Rgb(80, 60, 0), Color::Rgb(200, 160, 80)),
+                        NotificationStyle::Info =>
+                            notification_bar(&n.message, n.expires,
+                                Color::Rgb(160, 200, 255), Color::Rgb(20, 40, 80), Color::Rgb(100, 140, 200)),
+                        NotificationStyle::Success =>
+                            notification_bar(&n.message, n.expires,
+                                Color::Rgb(140, 230, 160), Color::Rgb(10, 60, 30), Color::Rgb(80, 170, 100)),
+                    }
+                } else {
+                    let version = format!(" {} ", env!("CARGO_PKG_VERSION"));
+                    let dir     = format!("  {}", browser_dir.display());
+                    let w       = area_global.width as usize;
+                    let pad     = w.saturating_sub(dir.len() + version.len());
+                    let line    = Line::from(vec![
+                        Span::styled(dir, Style::default().fg(Color::DarkGray)),
+                        Span::styled(format!("{:pad$}", ""), Style::default()),
+                        Span::styled(version, Style::default().fg(Color::DarkGray)),
+                    ]);
+                    (line, notif_bg)
+                };
+                frame.render_widget(Paragraph::new(global_line).style(bar_style), area_global);
             }
 
-            // ---- Cover art (spacer row) ----
-            if c[11].height >= 3 && art_bright_idx < 2 {
+            // ---- Browser / cover art (spacer row) ----
+            if let Some((ref bs, slot)) = browser_state {
+                if c[11].height >= 8 {
+                    render_browser(frame, c[11], bs, slot);
+                } else {
+                    // Art area too small — render browser fullscreen.
+                    frame.render_widget(ratatui::widgets::Clear, inner);
+                    render_browser(frame, inner, bs, slot);
+                }
+            } else if c[11].height >= 3 && art_bright_idx < 2 {
                 let brightness = [1.0f32, 0.35, 0.0][art_bright_idx as usize];
-                // 1-row top margin separates art from deck B above.
+                // 1-row top margin separates art from deck 2 above.
                 let vert = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Length(1), Constraint::Min(0)])
@@ -714,15 +746,20 @@ fn tui_loop(
                     .direction(Direction::Horizontal)
                     .constraints([Constraint::Fill(1), Constraint::Length(1), Constraint::Fill(1)])
                     .split(art_row);
-                for (idx, deck_opt) in [&d0, &d1].iter().enumerate() {
+                for (idx, deck_opt) in [&mut d0, &mut d1].iter_mut().enumerate() {
                     let panel_idx = idx * 2; // indices 0 and 2; index 1 is the gap
                     if let Some(deck) = deck_opt {
                         if let Some(ref bytes) = deck.cover_art {
                             let a = art_areas[panel_idx];
-                            frame.render_widget(
-                                Paragraph::new(halfblock_art(bytes, a.width, a.height, brightness)),
-                                a,
-                            );
+                            let cached = deck.cover_art_cache.get_or_insert_with(|| {
+                                (a.width, a.height, art_bright_idx,
+                                 halfblock_art(bytes, a.width, a.height, brightness))
+                            });
+                            if cached.0 != a.width || cached.1 != a.height || cached.2 != art_bright_idx {
+                                *cached = (a.width, a.height, art_bright_idx,
+                                           halfblock_art(bytes, a.width, a.height, brightness));
+                            }
+                            frame.render_widget(Paragraph::new(cached.3.clone()), a);
                         }
                     }
                 }
@@ -790,6 +827,7 @@ Esc                  close this / quit";
         while event::poll(Duration::ZERO)? {
             match event::read()? {
             Event::Mouse(mouse_event) => {
+                if browser_state.is_some() { continue; }
                 if decks.iter().flatten().any(|d| d.tag_editor.is_some()) { continue; }
                 if mouse_event.kind == MouseEventKind::Down(MouseButton::Left) {
                     let col = mouse_event.column as usize;
@@ -829,9 +867,7 @@ Esc                  close this / quit";
                         if let Some(ref d) = decks[slot] {
                             d.audio.player.stop();
                             if let Some(ref hash) = d.tempo.analysis_hash {
-                                if let Some(entry) = cache.get(hash.as_str()).cloned() {
-                                    cache.set(hash.clone(), CacheEntry { offset_ms: d.tempo.offset_ms, offset_established: d.tempo.offset_established, ..entry });
-                                }
+                                cache.set(hash.clone(), cache_entry_for_deck(d));
                             }
                         }
                     }
@@ -916,7 +952,7 @@ Esc                  close this / quit";
                                                                                 d.active_notification = Some(Notification {
                                                                                     message: format!("\u{2192} {new_stem}"),
                                                                                     style: NotificationStyle::Success,
-                                                                                    expires: Instant::now() + Duration::from_secs(3),
+                                                                                    expires: Instant::now() + NOTIFICATION_TIMEOUT,
                                                                                 });
                                                                             } else {
                                                                                 d.active_notification = Some(Notification {
@@ -938,7 +974,7 @@ Esc                  close this / quit";
                                                                     d.active_notification = Some(Notification {
                                                                         message: "tags saved".to_string(),
                                                                         style: NotificationStyle::Info,
-                                                                        expires: Instant::now() + Duration::from_secs(3),
+                                                                        expires: Instant::now() + NOTIFICATION_TIMEOUT,
                                                                     });
                                                                 }
                                                             }
@@ -1002,6 +1038,44 @@ Esc                  close this / quit";
                         }
                         continue; // block all other key handling while editor is open
                     }
+                }
+                // Browser — intercepts all key events when open.
+                if let Some((ref mut bs, target)) = browser_state {
+                    let target = target;
+                    match handle_browser_key(bs, key)? {
+                        Some(BrowserResult::ReturnToPlayer) => {
+                            *browser_dir = bs.cwd.clone();
+                            cache.set_last_browser_path(browser_dir);
+                            cache.save();
+                            browser_state = None;
+                        }
+                        Some(BrowserResult::Selected(path)) => {
+                            *browser_dir = bs.cwd.clone();
+                            cache.set_last_browser_path(browser_dir);
+                            cache.save();
+                            if let Some(ref d) = decks[target] { d.audio.player.stop(); }
+                            decks[target] = None;
+                            pending_loads[target] = Some(start_load(&path));
+                            browser_state = None;
+                        }
+                        Some(BrowserResult::WorkspaceSet(path)) => {
+                            cache.set_workspace(&path);
+                            cache.save();
+                        }
+                        Some(BrowserResult::WorkspaceCleared) => {
+                            cache.browser_workspace = None;
+                            cache.save();
+                        }
+                        Some(BrowserResult::Quit) => {
+                            *browser_dir = bs.cwd.clone();
+                            cache.set_last_browser_path(browser_dir);
+                            for slot in 0..2 { if let Some(ref d) = decks[slot] { d.audio.player.stop(); } }
+                            cache.save();
+                            return Ok(());
+                        }
+                        None => {}
+                    }
+                    continue; // block all player key handling while browser is open
                 }
                 // Space modifier: track held state for chords.
                 if key.code == KeyCode::Char(' ') {
@@ -1221,10 +1295,8 @@ Esc                  close this / quit";
                         shared_renderer.store_speed_ratio(slot, d.tempo.bpm, d.tempo.base_bpm);
                         anchor_beat_grid_to_cue(d);
                         if let Some(ref hash) = d.tempo.analysis_hash {
-                            if let Some(entry) = cache.get(hash.as_str()).cloned() {
-                                cache.set(hash.clone(), CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, offset_established: d.tempo.offset_established, ..entry });
-                                cache.save();
-                            }
+                            cache.set(hash.clone(), cache_entry_for_deck(d));
+                            cache.save();
                         }
                     }
                 }
@@ -1238,17 +1310,28 @@ Esc                  close this / quit";
                         }
                         continue 'tui;
                     }
+                    // Browser-blocked intercept — y overrides, Esc/n cancels.
+                    if let Some((_, target)) = browser_blocked {
+                        if matches!(key.code, KeyCode::Char('y')) {
+                            browser_blocked = None;
+                            global_notification = None;
+                            let workspace = cache.workspace().map(|p| p.to_path_buf());
+                            browser_state = Some((BrowserState::new(browser_dir.clone(), workspace)?, target));
+                        } else if matches!(key.code, KeyCode::Char('n') | KeyCode::Esc) {
+                            browser_blocked = None;
+                            global_notification = None;
+                        }
+                        continue 'tui;
+                    }
                     // Quit confirmation intercept — y/Enter confirms, anything else cancels.
-                    if pending_quit {
-                        pending_quit = false;
+                    if pending_quit.is_some() {
+                        pending_quit = None;
                         if matches!(key.code, KeyCode::Char('y') | KeyCode::Enter) {
                             for slot in 0..2 {
                                 if let Some(ref d) = decks[slot] {
                                     d.audio.player.stop();
                                     if let Some(ref hash) = d.tempo.analysis_hash {
-                                        if let Some(entry) = cache.get(hash.as_str()).cloned() {
-                                            cache.set(hash.clone(), CacheEntry { offset_ms: d.tempo.offset_ms, offset_established: d.tempo.offset_established, ..entry });
-                                        }
+                                        cache.set(hash.clone(), cache_entry_for_deck(d));
                                     }
                                 }
                             }
@@ -1256,6 +1339,12 @@ Esc                  close this / quit";
                             cache.save();
                             return Ok(());
                         }
+                        continue 'tui;
+                    }
+                    // Esc dismisses any active global notification.
+                    if global_notification.is_some() && key.code == KeyCode::Esc {
+                        global_notification = None;
+                        suppress_quit_until = Some(Instant::now() + Duration::from_millis(300));
                         continue 'tui;
                     }
                     // BPM confirmation intercept — check both decks.
@@ -1271,7 +1360,7 @@ Esc                  close this / quit";
                                     d.audio.player.set_speed(1.0);
                                     shared_renderer.store_speed_ratio(slot, d.tempo.bpm, d.tempo.base_bpm);
                                     d.tempo.offset_established = true;
-                                    cache.set(hash.clone(), CacheEntry { bpm: d.tempo.bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: d.cue_sample, offset_established: true, gain_db: d.gain_db });
+                                    cache.set(hash.clone(), cache_entry_for_deck(d));
                                     cache.save();
                                     d.tempo.analysis_hash = Some(hash);
                                 }
@@ -1339,17 +1428,15 @@ Esc                  close this / quit";
                             continue 'tui;
                         }
                         let any_playing = decks.iter().flatten().any(|d| !d.audio.player.is_paused());
-                        if any_playing && !pending_quit {
-                            pending_quit = true;
+                        if any_playing && pending_quit.is_none() {
+                            pending_quit = Some(Instant::now() + Duration::from_secs(5));
                             continue 'tui;
                         }
                         for slot in 0..2 {
                             if let Some(ref d) = decks[slot] {
                                 d.audio.player.stop();
                                 if let Some(ref hash) = d.tempo.analysis_hash {
-                                    if let Some(entry) = cache.get(hash.as_str()).cloned() {
-                                        cache.set(hash.clone(), CacheEntry { offset_ms: d.tempo.offset_ms, offset_established: d.tempo.offset_established, ..entry });
-                                    }
+                                    cache.set(hash.clone(), cache_entry_for_deck(d));
                                 }
                             }
                         }
@@ -1359,44 +1446,19 @@ Esc                  close this / quit";
                     }
                     Some(Action::Deck1OpenBrowser) | Some(Action::Deck2OpenBrowser) => {
                         let target = if action == Some(&Action::Deck1OpenBrowser) { 0 } else { 1 };
-                        // Save cache state but leave the player running — the deck continues
-                        // playing while the browser is open. stop() is deferred to the
-                        // Selected branch; returning without selecting leaves the deck intact.
-                        if let Some(ref d) = decks[target] {
-                            if let Some(ref hash) = d.tempo.analysis_hash {
-                                if let Some(entry) = cache.get(hash.as_str()).cloned() {
-                                    cache.set(hash.clone(), CacheEntry { offset_ms: d.tempo.offset_ms, offset_established: d.tempo.offset_established, ..entry });
-                                }
-                            }
+                        let playing = decks[target].as_ref().map_or(false, |d| !d.audio.player.is_paused());
+                        if playing {
+                            let expires = Instant::now() + Duration::from_secs(5);
+                            global_notification = Some(Notification {
+                                message: "Track is playing — open browser?  [y] open   [Esc/n] cancel".to_string(),
+                                style: NotificationStyle::Error,
+                                expires,
+                            });
+                            browser_blocked = Some((expires, target));
+                        } else {
+                            let workspace = cache.workspace().map(|p| p.to_path_buf());
+                            browser_state = Some((BrowserState::new(browser_dir.clone(), workspace)?, target));
                         }
-                        cache.save();
-                        match run_browser(terminal, browser_dir.clone())? {
-                            (BrowserResult::ReturnToPlayer, cwd) => {
-                                *browser_dir = cwd;
-                                cache.set_last_browser_path(browser_dir);
-                                cache.save();
-                            }
-                            (BrowserResult::Selected(path), cwd) => {
-                                *browser_dir = cwd;
-                                cache.set_last_browser_path(browser_dir);
-                                cache.save();
-                                // Stop and drop the outgoing deck.
-                                if let Some(ref d) = decks[target] {
-                                    d.audio.player.stop();
-                                }
-                                decks[target] = None;
-                                // Cancel any in-progress load for this slot and start the new one.
-                                pending_loads[target] = Some(start_load(&path));
-                            }
-                            (BrowserResult::Quit, cwd) => {
-                                *browser_dir = cwd;
-                                cache.set_last_browser_path(browser_dir);
-                                for slot in 0..2 { if let Some(ref d) = decks[slot] { d.audio.player.stop(); } }
-                                cache.save();
-                                return Ok(());
-                            }
-                        }
-                        continue 'tui;
                     }
                     Some(Action::Deck1PlayPause) => {
                         if let Some(ref d) = decks[0] {
@@ -1455,9 +1517,7 @@ Esc                  close this / quit";
                             d.gain_db = (d.gain_db + 1).min(12);
                             d.audio.gain_linear.store(10f32.powf(d.gain_db as f32 / 20.0).to_bits(), Ordering::Relaxed);
                             if let Some(ref hash) = d.tempo.analysis_hash.clone() {
-                                let entry = cache.get(hash.as_str()).cloned()
-                                    .unwrap_or(CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: d.cue_sample, offset_established: d.tempo.offset_established, gain_db: d.gain_db });
-                                cache.set(hash.clone(), CacheEntry { gain_db: d.gain_db, ..entry });
+                                cache.set(hash.clone(), cache_entry_for_deck(d));
                                 cache.save();
                             }
                         }
@@ -1467,9 +1527,7 @@ Esc                  close this / quit";
                             d.gain_db = (d.gain_db - 1).max(-12);
                             d.audio.gain_linear.store(10f32.powf(d.gain_db as f32 / 20.0).to_bits(), Ordering::Relaxed);
                             if let Some(ref hash) = d.tempo.analysis_hash.clone() {
-                                let entry = cache.get(hash.as_str()).cloned()
-                                    .unwrap_or(CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: d.cue_sample, offset_established: d.tempo.offset_established, gain_db: d.gain_db });
-                                cache.set(hash.clone(), CacheEntry { gain_db: d.gain_db, ..entry });
+                                cache.set(hash.clone(), cache_entry_for_deck(d));
                                 cache.save();
                             }
                         }
@@ -1479,9 +1537,7 @@ Esc                  close this / quit";
                             d.gain_db = (d.gain_db + 1).min(12);
                             d.audio.gain_linear.store(10f32.powf(d.gain_db as f32 / 20.0).to_bits(), Ordering::Relaxed);
                             if let Some(ref hash) = d.tempo.analysis_hash.clone() {
-                                let entry = cache.get(hash.as_str()).cloned()
-                                    .unwrap_or(CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: d.cue_sample, offset_established: d.tempo.offset_established, gain_db: d.gain_db });
-                                cache.set(hash.clone(), CacheEntry { gain_db: d.gain_db, ..entry });
+                                cache.set(hash.clone(), cache_entry_for_deck(d));
                                 cache.save();
                             }
                         }
@@ -1491,9 +1547,7 @@ Esc                  close this / quit";
                             d.gain_db = (d.gain_db - 1).max(-12);
                             d.audio.gain_linear.store(10f32.powf(d.gain_db as f32 / 20.0).to_bits(), Ordering::Relaxed);
                             if let Some(ref hash) = d.tempo.analysis_hash.clone() {
-                                let entry = cache.get(hash.as_str()).cloned()
-                                    .unwrap_or(CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: d.cue_sample, offset_established: d.tempo.offset_established, gain_db: d.gain_db });
-                                cache.set(hash.clone(), CacheEntry { gain_db: d.gain_db, ..entry });
+                                cache.set(hash.clone(), cache_entry_for_deck(d));
                                 cache.save();
                             }
                         }
@@ -1828,9 +1882,7 @@ Esc                  close this / quit";
                                 d.cue_sample = Some(raw_samp);
                                 anchor_beat_grid_to_cue(d);
                                 if let Some(ref hash) = d.tempo.analysis_hash.clone() {
-                                    let entry = cache.get(hash.as_str()).cloned()
-                                        .unwrap_or(CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: None, offset_established: true, gain_db: d.gain_db });
-                                    cache.set(hash.clone(), CacheEntry { cue_sample: d.cue_sample, offset_ms: d.tempo.offset_ms, offset_established: d.tempo.offset_established, ..entry });
+                                    cache.set(hash.clone(), cache_entry_for_deck(d));
                                     cache.save();
                                 }
                             }
@@ -1843,9 +1895,7 @@ Esc                  close this / quit";
                                 d.cue_sample = Some(raw_samp);
                                 anchor_beat_grid_to_cue(d);
                                 if let Some(ref hash) = d.tempo.analysis_hash.clone() {
-                                    let entry = cache.get(hash.as_str()).cloned()
-                                        .unwrap_or(CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: None, offset_established: true, gain_db: d.gain_db });
-                                    cache.set(hash.clone(), CacheEntry { cue_sample: d.cue_sample, offset_ms: d.tempo.offset_ms, offset_established: d.tempo.offset_established, ..entry });
+                                    cache.set(hash.clone(), cache_entry_for_deck(d));
                                     cache.save();
                                 }
                             }
@@ -1936,7 +1986,13 @@ fn service_deck_frame(
             d.tempo.offset_established = cache.get(hash.as_str()).map_or(false, |e| e.offset_established);
             d.gain_db = cache.get(hash.as_str()).map_or(0, |e| e.gain_db);
             d.audio.gain_linear.store(10f32.powf(d.gain_db as f32 / 20.0).to_bits(), Ordering::Relaxed);
-            cache.set(hash.clone(), CacheEntry { bpm: d.tempo.bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: d.cue_sample, offset_established: d.tempo.offset_established, gain_db: d.gain_db });
+            if !vinyl_mode {
+                if let Some(cue_samp) = d.cue_sample {
+                    let cue_secs = cue_samp as f64 / d.audio.sample_rate as f64;
+                    d.audio.seek_handle.seek_direct(cue_secs);
+                }
+            }
+            cache.set(hash.clone(), cache_entry_for_deck(d));
             cache.save();
             d.tempo.analysis_hash      = Some(hash);
             if !is_fresh || d.tempo.redetecting { d.tempo.bpm_established = true; }
@@ -2045,7 +2101,7 @@ fn service_deck_frame(
         d.audio.player.set_speed(d.tempo.bpm / d.tempo.base_bpm);
         shared_renderer.store_speed_ratio(slot, d.tempo.bpm, d.tempo.base_bpm);
         if let Some(ref hash) = d.tempo.analysis_hash {
-            cache.set(hash.clone(), CacheEntry { bpm: d.tempo.base_bpm, offset_ms: d.tempo.offset_ms, name: d.filename.clone(), cue_sample: d.cue_sample, offset_established: true, gain_db: d.gain_db });
+            cache.set(hash.clone(), cache_entry_for_deck(d));
             cache.save();
         }
     }

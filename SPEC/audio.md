@@ -2,7 +2,7 @@
 
 ## Level Control
 
-- Each deck has an independent playback level, adjustable in 5% steps from 0% to 100%. Deck A uses `j` (up) / `m` (down); Deck B uses `k` (up) / `,` (down). These bindings are active regardless of which deck is selected. The current level is displayed in the info bar as `level:N%`. Changes take effect immediately without interrupting playback. Level is not persisted between sessions.
+- Each deck has an independent playback level, adjustable in 5% steps from 0% to 100%. Deck 1 uses `j` (up) / `m` (down); Deck 2 uses `k` (up) / `,` (down). These bindings are active regardless of which deck is selected. The current level is displayed in the info bar as `level:N%`. Changes take effect immediately without interrupting playback. Level is not persisted between sessions.
 
 ## PFL Monitor
 
@@ -13,7 +13,7 @@
   - Right channel: always carries the main mix (both decks at their respective levels and filter settings).
   - Left channel: carries the active deck's PFL signal at full level when PFL is active; otherwise carries the main mix.
   - When PFL is active, the main mix is suppressed entirely on the left channel.
-- Keys: `Space+x` toggles Deck A PFL on / off; `Space+v` toggles Deck B PFL on / off.
+- Keys: `Space+x` toggles Deck 1 PFL on / off; `Space+v` toggles Deck 2 PFL on / off.
 - Toggling PFL on for one deck while the other deck's PFL is active cancels the other deck first.
 - PFL level is displayed in the info bar in cyan when non-zero.
 - PFL applies to stereo tracks only; mono tracks are unaffected.
@@ -24,8 +24,8 @@
   - `0` — flat (filter bypassed).
   - `−1` to `−16` — low-pass filter; more negative = lower cutoff frequency.
   - `+1` to `+16` — high-pass filter; more positive = higher cutoff frequency.
-- Deck A: `u` decreases `filter_offset` by 1; `7` increases it by 1. `Space+u` or `Space+7` snaps to flat.
-- Deck B: `i` decreases `filter_offset` by 1; `8` increases it by 1. These bindings are active regardless of which deck is selected.
+- Deck 1: `u` decreases `filter_offset` by 1; `7` increases it by 1. `Space+u` or `Space+7` snaps to flat.
+- Deck 2: `i` decreases `filter_offset` by 1; `8` increases it by 1. These bindings are active regardless of which deck is selected.
 - Cutoff frequencies are logarithmically spaced from ~40 Hz to ~18 kHz across the ±1–±16 range. Each step corresponds to exactly one character of the spectrum strip.
 - Filter state is visible in the spectrum strip (grey shading on attenuated bins) and not shown as separate text.
 - The spectrum analyser reflects the filtered output.

@@ -2,12 +2,12 @@
 
 ## Deck Selection
 
-- Two decks — Deck A and Deck B — operate independently. Each deck maintains its own track, transport, BPM, offset, volume, filter, metronome, zoom, waveform, tap accumulator, BPM analysis state, and notification state.
-- One deck is active at a time. `g` selects Deck A; `h` selects Deck B. The active deck's control section is visually highlighted; the inactive deck's section is dim.
+- Two decks — Deck 1 and Deck 2 — operate independently. Each deck maintains its own track, transport, BPM, offset, volume, filter, metronome, zoom, waveform, tap accumulator, BPM analysis state, and notification state.
+- One deck is active at a time. `g` selects Deck 1; `h` selects Deck 2. The active deck's control section is visually highlighted; the inactive deck's section is dim.
 - All active-deck controls (transport, BPM, offset, metronome, nudge, tap, re-detect) apply to the active deck only. Zoom and detail height are global and apply to both decks simultaneously.
 - Level and filter have dedicated per-deck bindings and may be adjusted on either deck regardless of which is active (see [keymap.md](keymap.md)).
 - Global controls (quit, help, vinyl mode toggle, terminal refresh, file browser, deck select) are not deck-specific.
-- At startup only Deck A is used. Deck B can be loaded by selecting it with `h` and opening the file browser.
+- At startup only Deck 1 is used. Deck 2 can be loaded by selecting it with `h` and opening the file browser.
 - Audio latency is a single global setting shared across both decks.
 
 ## Playback
@@ -30,7 +30,7 @@
 - A beat phase offset (in milliseconds) can be adjusted at runtime to align the beat indicator with the audio. The offset and BPM are displayed in the UI.
 - `offset_ms` is snapped to the nearest 10 ms boundary on load from the cache, ensuring `+`/`-` steps always land on multiples of 10 ms and 0 ms is always reachable. After each adjustment and on cache load, `offset_ms` is wrapped into `[0, beat_period_ms)` using `rem_euclid`, where `beat_period_ms` is derived from `base_bpm` rounded to the nearest 10 ms, ensuring the offset always remains on the 10 ms grid.
 - The user can correct an inaccurate detection at runtime:
-  - Per-deck BPM keys (`x`/`s` for Deck A, `v`/`f` for Deck B) increase/decrease the effective BPM by 0.1. Adjustments affect playback speed proportionally (relative to the detected BPM) and clamp to the range 40.0–240.0.
+  - Per-deck BPM keys (`x`/`s` for Deck 1, `v`/`f` for Deck 2) increase/decrease the effective BPM by 0.1. Adjustments affect playback speed proportionally (relative to the detected BPM) and clamp to the range 40.0–240.0.
   - `b` tap-detects BPM: press in time with the beat. After 8 taps, `base_bpm` and `offset_ms` are set from the tap session. BPM is derived via linear regression of tap index against tap time (slope = beat period), which converges and stabilises as more taps are added. Taps with a residual exceeding half a beat period are treated as outliers and excluded before the final regression. Any active `f`/`v` speed ratio is preserved relative to the new `base_bpm`. The tap count is shown in the info bar (`tap:N`) while a session is active; tapping stops 2 seconds after the last tap.
   - Corrections are persisted to the cache immediately.
 - Detected BPM and phase offset are cached in `~/.config/deck/cache.json`, keyed by a Blake3 hash of the decoded audio samples. This makes the cache invariant of filename, tags, and container format. The cache also stores the last browser directory.
