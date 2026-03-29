@@ -106,6 +106,18 @@ impl BrowserState {
             self.cursor = i;
         }
     }
+
+    /// Returns the path of the currently highlighted audio file, or `None` if
+    /// the cursor is on a directory or non-audio entry.
+    pub(crate) fn highlighted_audio_path(&self) -> Option<std::path::PathBuf> {
+        if let Some(ref results) = self.search_results {
+            results.get(self.cursor).cloned()
+        } else {
+            self.entries.get(self.cursor).and_then(|e| {
+                if e.kind == EntryKind::Audio { Some(e.path.clone()) } else { None }
+            })
+        }
+    }
 }
 
 /// Compute a human-readable relative path from `base` to `target`, using `./` and `../` notation.
@@ -281,9 +293,9 @@ pub(crate) fn render_browser(
     frame.render_stateful_widget(list, chunks[1], &mut list_state);
 
     let hint = if state.search_results.is_some() {
-        "↑/↓  Enter: load   Bksp: edit search   Esc: clear search   q: quit"
+        "↑/↓  Enter: load   Bksp: edit search   Esc: clear search   #: preview   q: quit"
     } else {
-        "↑/↓  Enter  ←/Bksp: up   Esc: back   q: quit"
+        "↑/↓  Enter  ←/Bksp: up   Esc: back   #: preview   q: quit"
     };
     frame.render_widget(
         Paragraph::new(hint).style(Style::default().fg(Color::Rgb(40, 60, 100)).bg(bg)),

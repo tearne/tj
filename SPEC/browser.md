@@ -10,8 +10,9 @@
 | `Esc` | Clear search term (when searching); otherwise return to player |
 | `@` | Set current directory as workspace |
 | `'` | Clear workspace |
+| `#` | Preview: start playback of the highlighted audio file from 20% through the track; press `#` again to restart; any other key stops the preview |
 | `q` | Quit (only when search term is empty) |
-| any printable character (except `@`, `'`) | Append to search term (workspace required) |
+| any printable character (except `@`, `'`, `#`) | Append to search term (workspace required) |
 
 ## Behaviour
 
@@ -22,6 +23,8 @@
 - A header shows the current directory path.
 - Selecting an audio file dismisses the browser and begins playback.
 - The browser can be opened and closed from the player at any time with `z`. Audio continues playing while the browser is open. Pressing `Esc` returns to the player view; selecting a new file loads and plays it.
+- Pressing `#` on a highlighted audio file begins streaming playback from approximately 20% into the track (30 s offset if the file's duration is not available from the header). The preview plays through the main output independently of the deck players. Pressing `#` again restarts the preview from the same position. Any other keypress stops the preview; the key's normal action is then applied. Preview stops automatically when the browser is closed.
+- Directories are not previewable; `#` is a no-op when the cursor is on a directory.
 - If the target deck is playing when the browser key is pressed, an error is shown: `"Track is playing — open browser?  [y] open   [Esc/n] cancel"`. Pressing `y` within the 5-second window opens the browser; `Esc` or `n` cancels.
 - The last visited directory is persisted to the cache between sessions. The browser always opens at the last visited path (falling back to CWD if it no longer exists). If a directory or file argument is given on the command line, it overrides the last visited path for the first browser open of that session only; subsequent opens resume from last visited.
 

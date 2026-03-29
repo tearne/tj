@@ -5,14 +5,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use color_eyre::Result as EyreResult;
-use rodio::Source;
+use rodio::{Player, Source};
 use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::codecs::{Decoder, DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::errors::Error as SymphoniaError;
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
+use symphonia::core::units::Time;
 
 pub(crate) const OVERVIEW_RESOLUTION: usize = 4000;
 pub(crate) const FADE_SAMPLES: i64 = 256; // ~5.8ms at 44100 Hz — fade-out then fade-in around each seek
@@ -586,6 +587,157 @@ pub(crate) fn scrub_audio(
         snippet,
     );
     mixer.add(src);
+}
+
+// ---------------------------------------------------------------------------
+// Browser preview: streaming decode source + output handle
+// ---------------------------------------------------------------------------
+
+/// A streaming rodio `Source` backed by a live symphonia decoder.
+/// Constructed at a seek position 20% into the track for instant browser preview.
+pub(crate) struct SymphoniaPreviewSource {
+    format:      Box<dyn FormatReader>,
+    decoder:     Box<dyn Decoder>,
+    track_id:    u32,
+    sample_rate: u32,
+    channels:    u16,
+    buffer:      Vec<f32>,
+    buffer_pos:  usize,
+    sample_buf:  Option<SampleBuffer<f32>>,
+    done:        bool,
+}
+
+impl SymphoniaPreviewSource {
+    pub(crate) fn open(path: &Path) -> EyreResult<Self> {
+        let src = std::fs::File::open(path)?;
+        let mss = MediaSourceStream::new(Box::new(src), Default::default());
+        let mut hint = Hint::new();
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            hint.with_extension(ext);
+        }
+        let probed = symphonia::default::get_probe().format(
+            &hint, mss, &FormatOptions::default(), &MetadataOptions::default(),
+        )?;
+        let mut format = probed.format;
+        // Extract everything needed from the track before seeking (track borrows format).
+        let (track_id, sample_rate, channels, seek_secs, codec_params) = {
+            let track = format
+                .tracks()
+                .iter()
+                .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+                .ok_or_else(|| color_eyre::eyre::eyre!("no audio track"))?;
+            let track_id    = track.id;
+            let sample_rate = track.codec_params.sample_rate
+                .ok_or_else(|| color_eyre::eyre::eyre!("no sample rate"))?;
+            let channels    = track.codec_params.channels.map(|c| c.count()).unwrap_or(2) as u16;
+            // 20% of duration; fall back to 30 s if duration is not in the header.
+            let seek_secs   = track.codec_params.n_frames
+                .map(|n| n as f64 / sample_rate as f64 * 0.20)
+                .unwrap_or(30.0);
+            let codec_params = track.codec_params.clone();
+            (track_id, sample_rate, channels, seek_secs, codec_params)
+        };
+
+        let _ = format.seek(
+            SeekMode::Accurate,
+            SeekTo::Time {
+                time: Time { seconds: seek_secs as u64, frac: seek_secs.fract() },
+                track_id: Some(track_id),
+            },
+        );
+
+        let decoder = symphonia::default::get_codecs()
+            .make(&codec_params, &DecoderOptions::default())?;
+
+        Ok(Self {
+            format,
+            decoder,
+            track_id,
+            sample_rate,
+            channels,
+            buffer: Vec::new(),
+            buffer_pos: 0,
+            sample_buf: None,
+            done: false,
+        })
+    }
+
+    fn fill_buffer(&mut self) -> bool {
+        loop {
+            let packet = match self.format.next_packet() {
+                Ok(p) => p,
+                Err(_) => { self.done = true; return false; }
+            };
+            if packet.track_id() != self.track_id { continue; }
+            match self.decoder.decode(&packet) {
+                Ok(decoded) => {
+                    let buf = self.sample_buf.get_or_insert_with(|| {
+                        SampleBuffer::new(decoded.capacity() as u64, *decoded.spec())
+                    });
+                    buf.copy_interleaved_ref(decoded);
+                    self.buffer.clear();
+                    self.buffer.extend_from_slice(buf.samples());
+                    self.buffer_pos = 0;
+                    return true;
+                }
+                Err(SymphoniaError::DecodeError(_)) | Err(SymphoniaError::IoError(_)) => continue,
+                Err(_) => { self.done = true; return false; }
+            }
+        }
+    }
+}
+
+impl Iterator for SymphoniaPreviewSource {
+    type Item = f32;
+    fn next(&mut self) -> Option<f32> {
+        if self.done { return None; }
+        if self.buffer_pos >= self.buffer.len() {
+            if !self.fill_buffer() { return None; }
+        }
+        let s = self.buffer[self.buffer_pos];
+        self.buffer_pos += 1;
+        Some(s)
+    }
+}
+
+impl Source for SymphoniaPreviewSource {
+    fn current_span_len(&self) -> Option<usize> { None }
+    fn channels(&self)    -> NonZero<u16> { NonZero::new(self.channels).unwrap_or(NonZero::new(2).unwrap()) }
+    fn sample_rate(&self) -> NonZero<u32> { NonZero::new(self.sample_rate).unwrap_or(NonZero::new(44100).unwrap()) }
+    fn total_duration(&self) -> Option<Duration> { None }
+}
+
+/// Warm audio output for browser preview. Opened when the browser opens; each
+/// `play` call stops any current preview and starts a new one immediately.
+pub(crate) struct PreviewOutput {
+    player: Player,
+}
+
+impl PreviewOutput {
+    pub(crate) fn new(mixer: &rodio::mixer::Mixer) -> Self {
+        Self { player: Player::connect_new(mixer) }
+    }
+
+    pub(crate) fn play(&self, path: &Path) {
+        self.player.stop();
+        match SymphoniaPreviewSource::open(path) {
+            Ok(src) => {
+                self.player.append(src);
+                self.player.play();
+            }
+            Err(_) => {}
+        }
+    }
+
+    pub(crate) fn stop(&self) {
+        self.player.stop();
+    }
+}
+
+impl Drop for PreviewOutput {
+    fn drop(&mut self) {
+        self.player.stop();
+    }
 }
 
 /// Synthesise a short 1 kHz click tone and inject it into the mixer.

@@ -32,7 +32,7 @@ mod deck;
 mod render;
 mod tags;
 
-use audio::{decode_audio, scrub_audio, play_click_tone, FilterSource, TrackingSource, WaveformData, SeekHandle, FADE_SAMPLES};
+use audio::{decode_audio, scrub_audio, play_click_tone, FilterSource, PreviewOutput, TrackingSource, WaveformData, SeekHandle, FADE_SAMPLES};
 use browser::{BrowserResult, BrowserState, handle_browser_key, render_browser};
 use cache::{cache_path, hash_mono, Cache, detect_bpm};
 use config::{load_config, Action, KeyBinding};
@@ -340,6 +340,7 @@ fn tui_loop(
     let mut last_render = Instant::now();
     let mut help_open = false;
     let mut browser_state: Option<(BrowserState, usize)> = None; // (state, target deck slot)
+    let mut preview_output: Option<PreviewOutput> = None;
     let mut max_det_h: usize = usize::MAX;
     let pfl_active_deck = Arc::new(AtomicUsize::new(usize::MAX));
     let mut space_held = false;
@@ -1042,12 +1043,29 @@ Esc                  close this / quit";
                 // Browser — intercepts all key events when open.
                 if let Some((ref mut bs, target)) = browser_state {
                     let target = target;
+
+                    // # starts (or restarts) preview of the highlighted audio file.
+                    if key.kind == KeyEventKind::Press && key.code == KeyCode::Char('#') {
+                        if let Some(ref po) = preview_output {
+                            if let Some(path) = bs.highlighted_audio_path() {
+                                po.play(&path);
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Any other key stops an active preview before being handled normally.
+                    if let Some(ref po) = preview_output {
+                        po.stop();
+                    }
+
                     match handle_browser_key(bs, key)? {
                         Some(BrowserResult::ReturnToPlayer) => {
                             *browser_dir = bs.cwd.clone();
                             cache.set_last_browser_path(browser_dir);
                             cache.save();
                             browser_state = None;
+                            preview_output = None;
                         }
                         Some(BrowserResult::Selected(path)) => {
                             *browser_dir = bs.cwd.clone();
@@ -1057,6 +1075,7 @@ Esc                  close this / quit";
                             decks[target] = None;
                             pending_loads[target] = Some(start_load(&path));
                             browser_state = None;
+                            preview_output = None;
                         }
                         Some(BrowserResult::WorkspaceSet(path)) => {
                             cache.set_workspace(&path);
@@ -1317,6 +1336,7 @@ Esc                  close this / quit";
                             global_notification = None;
                             let workspace = cache.workspace().map(|p| p.to_path_buf());
                             browser_state = Some((BrowserState::new(browser_dir.clone(), workspace)?, target));
+                            preview_output = Some(PreviewOutput::new(mixer));
                         } else if matches!(key.code, KeyCode::Char('n') | KeyCode::Esc) {
                             browser_blocked = None;
                             global_notification = None;
@@ -1458,6 +1478,7 @@ Esc                  close this / quit";
                         } else {
                             let workspace = cache.workspace().map(|p| p.to_path_buf());
                             browser_state = Some((BrowserState::new(browser_dir.clone(), workspace)?, target));
+                            preview_output = Some(PreviewOutput::new(mixer));
                         }
                     }
                     Some(Action::Deck1PlayPause) => {
