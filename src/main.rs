@@ -32,7 +32,7 @@ mod deck;
 mod render;
 mod tags;
 
-use audio::{decode_audio, scrub_audio, play_click_tone, FilterSource, PreviewOutput, TrackingSource, WaveformData, SeekHandle, FADE_SAMPLES};
+use audio::{decode_audio, scrub_audio, play_click_tone, FilterSource, PitchSource, PreviewOutput, TrackingSource, WaveformData, SeekHandle, FADE_SAMPLES};
 use browser::{BrowserResult, BrowserState, handle_browser_key, render_browser};
 use cache::{cache_path, hash_mono, Cache, detect_bpm};
 use config::{load_config, Action, KeyBinding};
@@ -194,7 +194,7 @@ fn build_deck(
     pfl_active_deck: Arc<AtomicUsize>,
     deck_slot:       usize,
 ) -> Deck {
-    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU8, AtomicU32};
+    use std::sync::atomic::{AtomicBool, AtomicI8, AtomicI32, AtomicI64, AtomicU8, AtomicU32};
     let track_name  = read_track_name(&path.to_string_lossy());
     let rename_hint = {
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
@@ -213,7 +213,8 @@ fn build_deck(
     let position       = Arc::new(AtomicUsize::new(0));
     let fade_remaining = Arc::new(AtomicI64::new(0));
     let fade_len       = Arc::new(AtomicI64::new(FADE_SAMPLES));
-    let pending_target = Arc::new(AtomicUsize::new(usize::MAX));
+    let pending_target  = Arc::new(AtomicUsize::new(usize::MAX));
+    let flush_pitch     = Arc::new(AtomicBool::new(false));
     let seek_handle = SeekHandle {
         samples: Arc::clone(&samples),
         position: Arc::clone(&position),
@@ -222,6 +223,7 @@ fn build_deck(
         pending_target: Arc::clone(&pending_target),
         sample_rate,
         channels,
+        flush_pitch: Arc::clone(&flush_pitch),
     };
 
     let filter_offset_shared = Arc::new(AtomicI32::new(0));
@@ -230,19 +232,24 @@ fn build_deck(
     let deck_volume_atomic   = Arc::new(AtomicU32::new(1.0f32.to_bits()));
     let gain_linear          = Arc::new(AtomicU32::new(1.0f32.to_bits()));
     let filter_poles         = Arc::new(AtomicU8::new(2));
+    let pitch_semitones      = Arc::new(AtomicI8::new(0));
     let player = Player::connect_new(mixer);
-    player.append(FilterSource::new(
-        TrackingSource::new(
-            samples, position, fade_remaining, fade_len, pending_target, sample_rate, channels,
+    player.append(PitchSource::new(
+        FilterSource::new(
+            TrackingSource::new(
+                samples, position, fade_remaining, fade_len, pending_target, sample_rate, channels,
+            ),
+            Arc::clone(&filter_offset_shared),
+            Arc::clone(&filter_state_reset),
+            Arc::clone(&pfl_level),
+            pfl_active_deck,
+            deck_slot,
+            Arc::clone(&deck_volume_atomic),
+            Arc::clone(&gain_linear),
+            Arc::clone(&filter_poles),
         ),
-        Arc::clone(&filter_offset_shared),
-        Arc::clone(&filter_state_reset),
-        Arc::clone(&pfl_level),
-        pfl_active_deck,
-        deck_slot,
-        Arc::clone(&deck_volume_atomic),
-        Arc::clone(&gain_linear),
-        Arc::clone(&filter_poles),
+        Arc::clone(&pitch_semitones),
+        Arc::clone(&flush_pitch),
     ));
     player.pause();
 
@@ -286,6 +293,7 @@ fn build_deck(
             pfl_level,
             deck_volume_atomic,
             gain_linear,
+            pitch_semitones,
         },
         bpm_rx,
     );
@@ -1573,6 +1581,30 @@ Esc                  close this / quit";
                             }
                         }
                     }
+                    Some(Action::Deck1PitchUp) => {
+                        if let Some(ref mut d) = decks[0] {
+                            d.pitch_semitones = (d.pitch_semitones + 1).min(6);
+                            d.audio.pitch_semitones.store(d.pitch_semitones, Ordering::Relaxed);
+                        }
+                    }
+                    Some(Action::Deck1PitchDown) => {
+                        if let Some(ref mut d) = decks[0] {
+                            d.pitch_semitones = (d.pitch_semitones - 1).max(-6);
+                            d.audio.pitch_semitones.store(d.pitch_semitones, Ordering::Relaxed);
+                        }
+                    }
+                    Some(Action::Deck2PitchUp) => {
+                        if let Some(ref mut d) = decks[1] {
+                            d.pitch_semitones = (d.pitch_semitones + 1).min(6);
+                            d.audio.pitch_semitones.store(d.pitch_semitones, Ordering::Relaxed);
+                        }
+                    }
+                    Some(Action::Deck2PitchDown) => {
+                        if let Some(ref mut d) = decks[1] {
+                            d.pitch_semitones = (d.pitch_semitones - 1).max(-6);
+                            d.audio.pitch_semitones.store(d.pitch_semitones, Ordering::Relaxed);
+                        }
+                    }
                     Some(Action::Deck1MetronomeToggle) => {
                         if !vinyl_mode {
                             if let Some(ref mut d) = decks[0] {
@@ -1744,7 +1776,7 @@ Esc                  close this / quit";
                     Some(Action::HeightIncrease) => { if detail_height < max_det_h { detail_height += 1; } }
                     Some(Action::Deck1BpmIncrease) => {
                         if let Some(ref mut d) = decks[0] {
-                            if vinyl_mode {
+                            if vinyl_mode || !d.tempo.bpm_established {
                                 d.tempo.vinyl_speed = (d.tempo.vinyl_speed + 0.001).clamp(0.1, 4.0);
                                 d.audio.player.set_speed(d.tempo.vinyl_speed);
                                 shared_renderer.store_speed_ratio(0, d.tempo.vinyl_speed, 1.0);
@@ -1759,7 +1791,7 @@ Esc                  close this / quit";
                     }
                     Some(Action::Deck1BpmDecrease) => {
                         if let Some(ref mut d) = decks[0] {
-                            if vinyl_mode {
+                            if vinyl_mode || !d.tempo.bpm_established {
                                 d.tempo.vinyl_speed = (d.tempo.vinyl_speed - 0.001).clamp(0.1, 4.0);
                                 d.audio.player.set_speed(d.tempo.vinyl_speed);
                                 shared_renderer.store_speed_ratio(0, d.tempo.vinyl_speed, 1.0);
@@ -1774,7 +1806,7 @@ Esc                  close this / quit";
                     }
                     Some(Action::Deck2BpmIncrease) => {
                         if let Some(ref mut d) = decks[1] {
-                            if vinyl_mode {
+                            if vinyl_mode || !d.tempo.bpm_established {
                                 d.tempo.vinyl_speed = (d.tempo.vinyl_speed + 0.001).clamp(0.1, 4.0);
                                 d.audio.player.set_speed(d.tempo.vinyl_speed);
                                 shared_renderer.store_speed_ratio(1, d.tempo.vinyl_speed, 1.0);
@@ -1789,7 +1821,7 @@ Esc                  close this / quit";
                     }
                     Some(Action::Deck2BpmDecrease) => {
                         if let Some(ref mut d) = decks[1] {
-                            if vinyl_mode {
+                            if vinyl_mode || !d.tempo.bpm_established {
                                 d.tempo.vinyl_speed = (d.tempo.vinyl_speed - 0.001).clamp(0.1, 4.0);
                                 d.audio.player.set_speed(d.tempo.vinyl_speed);
                                 shared_renderer.store_speed_ratio(1, d.tempo.vinyl_speed, 1.0);
@@ -2034,12 +2066,15 @@ fn service_deck_frame(
     let pos_samp = pos_raw / d.audio.seek_handle.channels as usize;
     let total_mono_samps = d.audio.seek_handle.samples.len() / d.audio.seek_handle.channels as usize;
 
-    // End-of-track: pause and reset to start.
+    // End-of-track: pause and reset to cue point if set, otherwise start.
     let at_end = pos_samp >= total_mono_samps;
     if at_end && !d.audio.player.is_paused() {
         d.audio.player.pause();
-        d.audio.seek_handle.seek_direct(0.0);
-        d.display.smooth_display_samp = 0.0;
+        let (reset_secs, reset_samp) = d.cue_sample
+            .map(|s| (s as f64 / d.audio.sample_rate as f64, s as f64))
+            .unwrap_or((0.0, 0.0));
+        d.audio.seek_handle.seek_direct(reset_secs);
+        d.display.smooth_display_samp = reset_samp;
         return;
     }
 

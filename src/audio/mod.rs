@@ -420,6 +420,8 @@ pub(crate) struct SeekHandle {
     pub(crate) pending_target: Arc<AtomicUsize>,
     pub(crate) sample_rate: u32,
     pub(crate) channels: u16,
+    /// Set by any seek; cleared by PitchSource to flush its internal buffer on discontinuity.
+    pub(crate) flush_pitch: Arc<AtomicBool>,
 }
 
 impl SeekHandle {
@@ -457,6 +459,7 @@ impl SeekHandle {
 
         // Store the target, then trigger fade-out. The audio thread applies the seek
         // when the fade-out completes and then fades back in.
+        self.flush_pitch.store(true, Ordering::Relaxed);
         self.fade_len.store(FADE_SAMPLES, Ordering::SeqCst);
         self.pending_target.store(target_sample, Ordering::SeqCst);
         self.fade_remaining.store(-FADE_SAMPLES, Ordering::SeqCst);
@@ -471,6 +474,7 @@ impl SeekHandle {
         let target_sample = (best_frame * frame_len).min(self.samples.len());
 
         // Write position directly and clear any in-progress fade.
+        self.flush_pitch.store(true, Ordering::Relaxed);
         self.pending_target.store(usize::MAX, Ordering::SeqCst);
         self.fade_remaining.store(0, Ordering::SeqCst);
         self.position.store(target_sample, Ordering::SeqCst);
@@ -487,6 +491,100 @@ impl SeekHandle {
         self.fade_remaining.store(0, Ordering::SeqCst);
         self.position.store(target_sample, Ordering::SeqCst);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pitch source — time-domain pitch shift via SoundTouch, tempo unchanged
+// ---------------------------------------------------------------------------
+
+pub(crate) struct PitchSource<S: Source<Item = f32>> {
+    inner:           S,
+    st:              soundtouch::SoundTouch,
+    output:          std::collections::VecDeque<f32>,
+    pitch_semitones: Arc<std::sync::atomic::AtomicI8>,
+    flush_pitch:     Arc<AtomicBool>,
+    current_pitch:   i8,
+    channels:        u16,
+    sample_rate:     u32,
+}
+
+impl<S: Source<Item = f32>> PitchSource<S> {
+    pub(crate) fn new(
+        inner:           S,
+        pitch_semitones: Arc<std::sync::atomic::AtomicI8>,
+        flush_pitch:     Arc<AtomicBool>,
+    ) -> Self {
+        let channels    = inner.channels().get() as u16;
+        let sample_rate = inner.sample_rate().get();
+        let mut st = soundtouch::SoundTouch::new();
+        st.set_channels(channels as u32);
+        st.set_sample_rate(sample_rate);
+        PitchSource { inner, st, output: std::collections::VecDeque::new(), pitch_semitones, flush_pitch, current_pitch: 0, channels, sample_rate }
+    }
+}
+
+impl<S: Source<Item = f32>> Iterator for PitchSource<S> {
+    type Item = f32;
+    fn next(&mut self) -> Option<f32> {
+        if self.flush_pitch.swap(false, Ordering::Relaxed) {
+            self.st.clear();
+            self.output.clear();
+        }
+
+        let new_pitch = self.pitch_semitones.load(Ordering::Relaxed);
+
+        if new_pitch == 0 {
+            if self.current_pitch != 0 {
+                self.st.clear();
+                self.output.clear();
+                self.current_pitch = 0;
+            }
+            return self.inner.next();
+        }
+
+        if new_pitch != self.current_pitch {
+            self.st.set_pitch_semitones(new_pitch as i32);
+            self.output.clear();
+            self.current_pitch = new_pitch;
+        }
+
+        if let Some(s) = self.output.pop_front() {
+            return Some(s);
+        }
+
+        // Feed a chunk from the inner source into SoundTouch.
+        const CHUNK_FRAMES: usize = 512;
+        let n_samples = CHUNK_FRAMES * self.channels as usize;
+        let mut chunk = Vec::with_capacity(n_samples);
+        for _ in 0..n_samples {
+            match self.inner.next() {
+                Some(s) => chunk.push(s),
+                None    => break,
+            }
+        }
+        if chunk.is_empty() {
+            return Some(0.0);
+        }
+        let n_frames = chunk.len() / self.channels as usize;
+        self.st.put_samples(&chunk, n_frames);
+
+        let available = self.st.num_samples().max(0) as usize;
+        if available > 0 {
+            let mut buf = vec![0.0f32; available * self.channels as usize];
+            let received = self.st.receive_samples(&mut buf, available);
+            buf.truncate(received * self.channels as usize);
+            self.output.extend(buf);
+        }
+
+        self.output.pop_front().or(Some(0.0))
+    }
+}
+
+impl<S: Source<Item = f32>> Source for PitchSource<S> {
+    fn current_span_len(&self) -> Option<usize> { self.inner.current_span_len() }
+    fn channels(&self)       -> NonZero<u16>    { NonZero::new(self.channels).unwrap_or(NonZero::new(2).unwrap()) }
+    fn sample_rate(&self)    -> NonZero<u32>    { NonZero::new(self.sample_rate).unwrap_or(NonZero::new(44100).unwrap()) }
+    fn total_duration(&self) -> Option<Duration> { None }
 }
 
 // ---------------------------------------------------------------------------

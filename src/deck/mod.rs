@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI8, AtomicU8, AtomicU32};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -37,6 +37,8 @@ pub(crate) struct DeckAudio {
     pub(crate) gain_linear: Arc<AtomicU32>,
     /// Filter slope: 2 = 12 dB/oct, 4 = 24 dB/oct.
     pub(crate) filter_poles: Arc<AtomicU8>,
+    /// Pitch shift in semitones (±6); shared with PitchSource on the audio thread.
+    pub(crate) pitch_semitones: Arc<AtomicI8>,
 }
 
 pub(crate) struct TempoState {
@@ -130,6 +132,7 @@ pub(crate) struct Deck {
     pub(crate) pfl_level: u8,
     pub(crate) filter_offset: i32,
     pub(crate) filter_poles: u8,
+    pub(crate) pitch_semitones: i8,
     pub(crate) nudge: i8,
     pub(crate) nudge_mode: NudgeMode,
     pub(crate) metronome_mode: bool,
@@ -170,6 +173,7 @@ impl Deck {
             pfl_level: 0,
             filter_offset: 0,
             filter_poles: 2,
+            pitch_semitones: 0,
             nudge: 0,
             nudge_mode: NudgeMode::Jump,
             metronome_mode: false,

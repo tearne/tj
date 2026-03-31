@@ -1,6 +1,6 @@
 [package]
 name = "deck"
-version = "0.6.38"
+version = "0.7.6"
 edition = "2024"
 license = "AGPL-3.0-or-later"
 
@@ -18,3 +18,4 @@ color-eyre = "0.6.5"
 lofty = "0.22"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 fuzzy-matcher = "0.3"
+soundtouch = "0.2"

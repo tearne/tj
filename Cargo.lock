@@ -213,6 +213,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aebf35691d1bfb0ac386a69bac2fde4dd276fb618cf8bf4f5318fe285e821bb2"
 dependencies = [
  "find-msvc-tools",
+ "jobserver",
+ "libc",
  "shlex",
 ]
 
@@ -502,7 +504,7 @@ checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
 
 [[package]]
 name = "deck"
-version = "0.6.38"
+version = "0.7.6"
 dependencies = [
  "blake3",
  "color-eyre",
@@ -514,6 +516,7 @@ dependencies = [
  "rodio",
  "serde",
  "serde_json",
+ "soundtouch",
  "stratum-dsp",
  "symphonia",
  "toml",
@@ -927,6 +930,16 @@ name = "jni-sys"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8eaf4bc02d17cbdd7ff4c7438cafcdf7fb9a4613313ad11b4f8fefe7d3fa0130"
+
+[[package]]
+name = "jobserver"
+version = "0.1.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9afb3de4395d6b3e67a780b6de64b51c978ecf11cb9a462c66be7d4ca9039d33"
+dependencies = [
+ "getrandom 0.3.4",
+ "libc",
+]
 
 [[package]]
 name = "js-sys"
@@ -2044,6 +2057,26 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
+
+[[package]]
+name = "soundtouch"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36848b2827257e7fb81f93fbaf7ade203505d188d9cba9c2b69448dcf8cf565d"
+dependencies = [
+ "libc",
+ "soundtouch-ffi",
+]
+
+[[package]]
+name = "soundtouch-ffi"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74e984705df6333756b385c31132bede8f27bb1b52d9d3150e9b0fa2fe767e26"
+dependencies = [
+ "cc",
+ "libc",
+]
 
 [[package]]
 name = "static_assertions"

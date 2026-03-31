@@ -511,8 +511,8 @@ pub(crate) fn info_line_for_deck(
             ),
         ]);
     }
-    // Beat flash is suppressed in vinyl mode.
-    let beat_active = !vinyl_mode && beat_on;
+    // Beat flash requires both vinyl mode off and an established BPM.
+    let beat_active = !vinyl_mode && beat_on && deck.tempo.bpm_established;
     let beat_style = if beat_active {
         Style::default().fg(Color::Yellow).bg(Color::Rgb(60, 50, 0))
     } else {
@@ -525,7 +525,7 @@ pub(crate) fn info_line_for_deck(
     let left_spans: Vec<Span<'static>> = {
         let mut spans = vec![Span::styled(format!("{play_icon}  "), dim)];
         if show_percentage {
-            let pct = if vinyl_mode {
+            let pct = if vinyl_mode || !deck.tempo.bpm_established {
                 (deck.tempo.vinyl_speed - 1.0) * 100.0
             } else {
                 (deck.tempo.bpm / deck.tempo.base_bpm - 1.0) * 100.0
@@ -539,9 +539,18 @@ pub(crate) fn info_line_for_deck(
                 format!("{:.1}%", rounded)
             };
             spans.push(Span::styled(pct_str, beat_style));
-            // In beat mode without BPM, offset and metronome remain visible (dormant).
-            // In vinyl mode they are hidden entirely.
-            if !vinyl_mode {
+            if deck.pitch_semitones != 0 {
+                let pitch_str = if deck.pitch_semitones > 0 {
+                    format!("+{}st", deck.pitch_semitones)
+                } else {
+                    format!("{}st", deck.pitch_semitones)
+                };
+                let pitch_color = spectral_color(deck.display.palette, 0.0, 0.55);
+                spans.push(Span::styled(" (", dim));
+                spans.push(Span::styled(pitch_str, Style::default().fg(pitch_color)));
+                spans.push(Span::styled(")", dim));
+            }
+            if !vinyl_mode && deck.tempo.bpm_established {
                 if deck.metronome_mode {
                     spans.push(Span::styled("\u{266A}", Style::default().fg(Color::Red)));
                 }
@@ -550,10 +559,25 @@ pub(crate) fn info_line_for_deck(
         } else {
             // base_bpm adjusts in 0.01 steps → 2dp; playback bpm adjusts in 0.1 steps → 1dp.
             let adjusted = (deck.tempo.bpm - deck.tempo.base_bpm).abs() >= 0.05;
-            if adjusted {
+            let pitched  = deck.pitch_semitones != 0;
+            if adjusted || pitched {
                 spans.push(Span::styled(format!("{:.2} ", deck.tempo.base_bpm), dim));
                 spans.push(Span::styled("(", dim));
-                spans.push(Span::styled(format!("{:.1}", deck.tempo.bpm), beat_style));
+                if adjusted {
+                    spans.push(Span::styled(format!("{:.1}", deck.tempo.bpm), beat_style));
+                }
+                if adjusted && pitched {
+                    spans.push(Span::styled("  ", dim));
+                }
+                if pitched {
+                    let pitch_str = if deck.pitch_semitones > 0 {
+                        format!("+{}st", deck.pitch_semitones)
+                    } else {
+                        format!("{}st", deck.pitch_semitones)
+                    };
+                    let pitch_color = spectral_color(deck.display.palette, 0.0, 0.55);
+                    spans.push(Span::styled(pitch_str, Style::default().fg(pitch_color)));
+                }
                 spans.push(Span::styled(")", dim));
             } else {
                 spans.push(Span::styled(format!("{:.2}", deck.tempo.base_bpm), beat_style));
@@ -1075,7 +1099,7 @@ pub(crate) fn peaks_for_slot(
         let samp_start = raw_start as usize;
         let samp_end   = (samp_start + col_samp).min(mono.len());
         if samp_start >= mono.len() {
-            return (0.0, 0.0);
+            return (1.0, -1.0);
         }
         let chunk = &mono[samp_start..samp_end];
         let mn = chunk.iter().cloned().fold(f32::INFINITY,     f32::min);

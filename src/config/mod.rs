@@ -29,6 +29,7 @@ pub(crate) enum Action {
     Deck1Cue, Deck1CuePlay,
     Deck1PflToggle,
     Deck1GainIncrease, Deck1GainDecrease,
+    Deck1PitchUp, Deck1PitchDown,
     // Deck 2
     Deck2PlayPause, Deck2OpenBrowser,
     Deck2LevelUp, Deck2LevelDown, Deck2LevelMax, Deck2LevelMin,
@@ -46,6 +47,7 @@ pub(crate) enum Action {
     Deck2Cue, Deck2CuePlay,
     Deck2PflToggle,
     Deck2GainIncrease, Deck2GainDecrease,
+    Deck2PitchUp, Deck2PitchDown,
 }
 
 pub(crate) static ACTION_NAMES: &[(&str, Action)] = &[
@@ -99,6 +101,8 @@ pub(crate) static ACTION_NAMES: &[(&str, Action)] = &[
     ("deck1_pfl_toggle",        Action::Deck1PflToggle),
     ("deck1_gain_increase",     Action::Deck1GainIncrease),
     ("deck1_gain_decrease",     Action::Deck1GainDecrease),
+    ("deck1_pitch_up",          Action::Deck1PitchUp),
+    ("deck1_pitch_down",        Action::Deck1PitchDown),
     // Deck 2
     ("deck2_play_pause",        Action::Deck2PlayPause),
     ("deck2_open_browser",      Action::Deck2OpenBrowser),
@@ -136,6 +140,8 @@ pub(crate) static ACTION_NAMES: &[(&str, Action)] = &[
     ("deck2_pfl_toggle",        Action::Deck2PflToggle),
     ("deck2_gain_increase",     Action::Deck2GainIncrease),
     ("deck2_gain_decrease",     Action::Deck2GainDecrease),
+    ("deck2_pitch_up",          Action::Deck2PitchUp),
+    ("deck2_pitch_down",        Action::Deck2PitchDown),
 ];
 
 #[derive(Hash, Eq, PartialEq)]
