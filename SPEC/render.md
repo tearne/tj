@@ -14,7 +14,8 @@ The UI is structured into the following vertical sections (top to bottom):
 7. Notification bar — Deck 2
 8. Info bar — Deck 2
 9. Overview — Deck 2
-10. Global status bar
+10. Spacer panel (keyboard help / cover art / file browser)
+11. Global status bar
 
 ### Global Status Bar
 
@@ -203,6 +204,28 @@ So `0x47` = bits 0,1,2,6 = dots 1,2,3,7 (left column, full height). `0xB8` = bit
 The cue point is stored in `BrailleBuffer` as `cue_buf_col: Option<usize>` — a single buffer column index. This differs from tick marks in two ways: the cue spans the full character width (not a sub-column), and it does not need a half-column shift transform because it is mapped to the nearest screen column by integer division.
 
 **Rendering**: The draw thread maps `cue_buf_col` to a screen column via `viewport_start`: `screen_col = cue_buf_col − viewport_start`. If the result is within `[0, screen_width)`, the cue is rendered as a green `│` character spanning the full detail height, replacing whatever waveform or tick content would otherwise appear at that column.
+
+---
+
+## Spacer Panel
+
+The spacer panel occupies the leftover rows between the two decks (below Deck 2's overview and above the global status bar). Its content is determined by the following priority:
+
+1. **File browser** — when the browser is open, it fills the spacer (or the full screen if the spacer is too small).
+2. **Keyboard layout** — when `keyboard_help_open` is true (toggled by `Space+/`), a static 12-row keyboard map is rendered.
+3. **Cover art** — when neither browser nor keyboard help is active and `art_bright_idx < 2`, both decks' embedded cover art is rendered using half-block characters. The area is divided into two equal panels (one per deck) separated by a 1-column gap, with a 1-row top margin.
+
+### Keyboard Help Panel
+
+`Space+/` toggles `keyboard_help_open`. When active, the spacer renders a staggered spatial keyboard map showing the physical layout of bound keys — 12 lines total across four keyboard rows (number row, QWERTY, ASDF, ZXCV). Each keyboard row occupies three text lines: a Shift/upper modifier row, a plain key row, and a Space-chord row.
+
+The left block (keys `1`–`5`, `Q`–`T`, `A`–`G`, `Z`–`B`) covers deck controls; the right block (keys `7`–`8`, `U`–`I`, `J`–`K`, `M`–`,`) covers mixer controls. A `┆` column separator divides the blocks. Keys with no binding on a modifier row are left blank between separators.
+
+**Sizing**: when `keyboard_help_open`, 12 is added to the fixed row count used by the compression algorithm, so deck waveform heights compress to make room for the spacer before the keyboard map is rendered. Whatever space is available after compression is given to the panel; lines that do not fit are clipped at the bottom. The layout is rendered top-down so the number row and QWERTY row appear first.
+
+**Interaction**: the keyboard layout is non-modal — it does not intercept input or alter key handling.
+
+---
 
 ### Column Coincidence Rules
 

@@ -1355,3 +1355,52 @@ pub(crate) fn render_shared_tick_row(
     }).collect();
     frame.render_widget(Paragraph::new(Line::from(Span::styled(s, Style::default().fg(Color::Gray)))), area);
 }
+
+pub(crate) fn render_keyboard_help(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+    const TEXT_W: u16 = 77;
+    const TEXT_H: u16 = 12;
+    const H_PAD:  u16 = 2;
+    const V_PAD:  u16 = 1;
+
+    // The box sits one row below the top of the spacer to clear the deck-2 margin.
+    // available_h accounts for that offset so the rect never overflows the buffer.
+    let available_h = area.height.saturating_sub(1);
+    if available_h == 0 { return; }
+
+    let outer_w = (TEXT_W + H_PAD * 2).min(area.width);
+    let outer_h = (TEXT_H + V_PAD * 2).min(available_h);
+    let x = area.x + area.width.saturating_sub(outer_w) / 2;
+    let outer = ratatui::layout::Rect { x, y: area.y + 1, width: outer_w, height: outer_h };
+
+    // Clear replaces halfblock art characters with spaces; Block then fills with dark bg.
+    // Without Clear, set_style leaves the art ▀ characters in place, producing a comb edge.
+    let bg = Style::default().bg(Color::Rgb(15, 15, 15));
+    frame.render_widget(Clear, outer);
+    frame.render_widget(Block::default().style(bg), outer);
+
+    let inner = ratatui::layout::Rect {
+        x:      outer.x + H_PAD.min(outer.width / 2),
+        y:      outer.y + V_PAD.min(outer.height / 2),
+        width:  outer.width.saturating_sub(H_PAD * 2),
+        height: outer.height.saturating_sub(V_PAD * 2),
+    };
+
+    let lines: Vec<Line<'static>> = vec![
+        Line::raw("╭         ╭         ╭         ╭ +32b    ╭ +64b    ┆   ╭ Slp+    ╭ Slp+"),
+        Line::raw("1 +1bt    2 +1b     3 +4b     4 +8b     5 +16b    ┆   7 HPF     8 HPF"),
+        Line::raw("╰ Sel D1  ╰ Sel D2  ╰         ╰         ╰         ┆   ╰ Flt=    ╰ Flt="),
+        Line::raw("  ╭         ╭         ╭         ╭ -32b    ╭ -64b    ┆   ╭ Slp-    ╭ Slp-"),
+        Line::raw("  Q -1bt    W -1b     E -4b     R -8b     T -16b    ┆   U LPF     I LPF"),
+        Line::raw("  ╰         ╰         ╰ CueSt   ╰ CueJp   ╰         ┆   ╰ Flt=    ╰ Flt="),
+        Line::raw("    ╭         ╭         ╭         ╭ +Tick   ╭ -BsBPM  ┆   ╭ Gain+   ╭ Gain+"),
+        Line::raw("    A Ptch-   S PFL+    D         F Fwd     G -BPM    ┆   J Lvl+    K Lvl+"),
+        Line::raw("    ╰ Ptch=   ╰ Rst     ╰ Brows   ╰ Play    ╰ PFLTog  ┆   ╰ 100%    ╰ 100%"),
+        Line::raw("      ╭         ╭         ╭         ╭ -Tick   ╭ +BsBPM  ┆   ╭ Gain-   ╭ Gain-"),
+        Line::raw("      Z Ptch+   X PFL-    C Tap     V Back    B +BPM    ┆   M Lvl-    , Lvl-"),
+        Line::raw("      ╰ Ptch=   ╰ Rst     ╰ BDtct   ╰         ╰ Metro   ┆   ╰ 0%      ╰ 0%"),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().fg(Color::DarkGray).bg(Color::Rgb(15, 15, 15))),
+        inner,
+    );
+}

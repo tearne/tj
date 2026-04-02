@@ -76,7 +76,7 @@ Space │           │           │
       │     #     │     /     │
 Shift │  Palette  │   Help    │
    -- │           │ Album Art │
-Space │           │           │
+Space │           │  Kbd Map  │
 
 
 
@@ -97,7 +97,7 @@ Space │           │           │
   Zoom In/Out    zoom                   Latency +/-    latency ±10ms
   Height +/-     waveform height        Refresh        refresh terminal
   Help           key help               Album Art      album art toggle
-  Palette        palette cycle (¬=Nudge Mode, Shift+#=Palette on UK keyboard)
+  Kbd Map        keyboard layout        Palette        palette cycle (¬=Nudge Mode, Shift+#=Palette on UK keyboard)
 ```
 
 Keys `6`, `Y`, `H`, and `N` are intentionally unbound.

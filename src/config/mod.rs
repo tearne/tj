@@ -12,6 +12,7 @@ pub(crate) enum Action {
     PaletteCycle,
     NudgeModeToggle,
     ArtCycle,
+    KeyboardHelp,
     // Selected-deck controls
     SelectDeck1, SelectDeck2,
     PlayPause, OpenBrowser,
@@ -54,8 +55,9 @@ pub(crate) static ACTION_NAMES: &[(&str, Action)] = &[
     ("latency_increase",  Action::LatencyIncrease),
     ("latency_decrease",  Action::LatencyDecrease),
     ("palette_cycle",     Action::PaletteCycle),
-    ("nudge_mode_toggle", Action::NudgeModeToggle),
-    ("art_cycle",         Action::ArtCycle),
+    ("nudge_mode_toggle",  Action::NudgeModeToggle),
+    ("art_cycle",          Action::ArtCycle),
+    ("keyboard_help",      Action::KeyboardHelp),
     // Selected-deck controls
     ("select_deck1",        Action::SelectDeck1),
     ("select_deck2",        Action::SelectDeck2),

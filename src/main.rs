@@ -46,7 +46,7 @@ use render::{
     extract_tick_viewport, halfblock_art, info_line_empty, DEFAULT_ZOOM_IDX,
     info_line_for_deck, notification_line_empty, notification_line_for_deck,
     overview_empty, overview_for_deck, render_detail_empty, render_detail_waveform,
-    render_shared_tick_row,
+    render_keyboard_help, render_shared_tick_row,
     render_tag_editor, SharedDetailRenderer, ZOOM_LEVELS,
 };
 use tags::{propose_rename_stem, read_cover_art, read_tags_for_editor, read_track_name};
@@ -347,6 +347,7 @@ fn tui_loop(
     let mut frame_count: usize = 0;
     let mut last_render = Instant::now();
     let mut help_open = false;
+    let mut keyboard_help_open = false;
     let mut browser_state: Option<(BrowserState, usize)> = None; // (state, target deck slot)
     let mut preview_output: Option<PreviewOutput> = None;
     let mut max_det_h: usize = usize::MAX;
@@ -779,6 +780,11 @@ fn tui_loop(
                 }
             }
 
+            // Keyboard help overlay — drawn on top of art; skipped when browser is open
+            if keyboard_help_open && browser_state.is_none() {
+                render_keyboard_help(frame, c[11]);
+            }
+
             // Tag editor overlay
             for deck_opt in [&d0, &d1] {
                 if let Some(deck) = deck_opt {
@@ -791,31 +797,13 @@ fn tui_loop(
             // Help popup
             if help_open {
                 const HELP: &str = "\
-── Selected deck (Space+1 / Space+2 to select) ─────────────────────────
-Space+F              play / pause
-Space+D              load file
-Space+E / Space+R    cue set / cue jump
-f / v                nudge forward / backward     ¬  toggle nudge mode
-z / a                pitch +1 / −1 semitone       Space+Z or Space+A  reset
-b / g                BPM ±0.1  (vinyl: speed ±0.1%)
-B / G                base BPM ±0.01
-c                    tap BPM                      Space+C  BPM redetect
-Space+B              metronome toggle
-F / V                tick offset ±10ms
-s / x                PFL level +/−               Space+S or Space+X  reset
-Space+G              PFL on/off
-1/2/3/4/5  q/w/e/r/t  jump ±1bt/1b/4b/8b/16b
-$/% R/T              jump ±32b / ±64b
-── Mixer (addressed directly) ──────────────────────────────────────────
-j/m  k/,             Deck 1/2 level up/down       Space+j/m  Space+k/,  snap 100%/0%
-J/M  K/<             Deck 1/2 gain ±1 dB
-7/u  8/i             Deck 1/2 filter HPF/LPF      Space+7/u  Space+8/i  reset
-&/U  */I             Deck 1/2 filter slope +/−
 ── Global ───────────────────────────────────────────────────────────────
-`  /  ¬              vinyl mode / nudge mode toggle
+`                    vinyl mode
+¬                    nudge mode toggle
 - / =                zoom in / out                { / }  waveform height
 [ / ]                latency ±10ms
 /                    album art                    ~  palette cycle
+Space+/              keyboard layout
 ?                    toggle this help
 Esc                  close this / quit";
                 let popup_w = 86u16;
@@ -1654,6 +1642,9 @@ Esc                  close this / quit";
                         art_bright_idx = [2u8, 0, 1][art_bright_idx as usize]; // dim→bright→off→dim
                         cache.set_art_bright_idx(art_bright_idx);
                         cache.save();
+                    }
+                    Some(Action::KeyboardHelp) => {
+                        keyboard_help_open = !keyboard_help_open;
                     }
                     Some(Action::OffsetIncrease) => {
                         if !vinyl_mode { if let Some(ref mut d) = decks[selected_deck] { apply_offset_step(d, 10); } }

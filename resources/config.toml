@@ -11,6 +11,7 @@ latency_increase  = "]"
 palette_cycle     = "~"
 vinyl_mode_toggle = "`"
 art_cycle         = "/"
+keyboard_help     = "space+/"
 help              = "?"
 nudge_mode_toggle = "¬"
 
