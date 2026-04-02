@@ -471,7 +471,7 @@ pub(crate) fn notification_line_for_deck(deck: &Deck, content_width: usize, viny
 
 pub(crate) fn notification_line_empty() -> Line<'static> {
     Line::from(Span::styled(
-        "no track — press z to open the file browser",
+        "no track — Space+D to open the file browser",
         Style::default().fg(Color::Rgb(60, 60, 60)),
     ))
 }
@@ -605,14 +605,14 @@ pub(crate) fn info_line_for_deck(
         right_spans.push(Span::styled(nudge_str.to_string(), dim));
     }
     const LEVEL_BARS: [char; 8] = ['▁','▂','▃','▄','▅','▆','▇','█'];
-    let level_idx = ((deck.volume * 7.0).round() as usize).min(7);
+    let level_idx = ((deck.mixer.volume * 7.0).round() as usize).min(7);
     let level_char = LEVEL_BARS[level_idx];
     let t = level_idx as f32 / 7.0;
     let level_style = Style::default()
         .fg(Color::Rgb((60.0 + 195.0 * t).round() as u8, (50.0 + 165.0 * t).round() as u8, 0))
         .bg(Color::Rgb((40.0 * t).round() as u8, (33.0 * t).round() as u8, 0));
     let bracket_style = Style::default().fg(Color::Rgb(140, 140, 140));
-    if deck.pfl_level > 0 {
+    if deck.mixer.pfl_level > 0 {
         right_spans.push(Span::styled("  PFL", Style::default().fg(Color::Cyan)));
     }
     right_spans.push(Span::styled("  level:", dim));
@@ -621,8 +621,8 @@ pub(crate) fn info_line_for_deck(
     right_spans.push(Span::styled("\u{258F}", bracket_style));
     {
         const GAIN_CHARS: [char; 7] = ['▁','▂','▃','▄','▅','▆','▇'];
-        let idx = ((deck.gain_db as i32 + 12) * 6 / 24).clamp(0, 6) as usize;
-        let gain_style = if deck.gain_db == 0 {
+        let idx = ((deck.mixer.gain_db as i32 + 12) * 6 / 24).clamp(0, 6) as usize;
+        let gain_style = if deck.mixer.gain_db == 0 {
             Style::default().fg(Color::Rgb(45, 45, 45))
         } else {
             Style::default().fg(Color::Rgb(180, 140, 0))
@@ -630,9 +630,9 @@ pub(crate) fn info_line_for_deck(
         right_spans.push(Span::styled(GAIN_CHARS[idx].to_string(), gain_style));
     }
     {
-        let stopband: Option<(bool, usize)> = if deck.filter_offset != 0 {
-            let n = deck.filter_offset.unsigned_abs() as usize;
-            let is_lpf = deck.filter_offset < 0;
+        let stopband: Option<(bool, usize)> = if deck.mixer.filter_offset != 0 {
+            let n = deck.mixer.filter_offset.unsigned_abs() as usize;
+            let is_lpf = deck.mixer.filter_offset < 0;
             let cutoff_char = if is_lpf { 16 - n } else { n };
             Some((is_lpf, cutoff_char))
         } else {
@@ -661,7 +661,7 @@ pub(crate) fn info_line_for_deck(
         }
         right_spans.push(Span::styled("\u{258F}".to_string(), dim));
         // dB/oct indicator: fixed 2-char field — visible when filter active, blank otherwise.
-        let slope_str = if deck.filter_offset != 0 { match deck.filter_poles { 4 => "24", _ => "12" } } else { "  " };
+        let slope_str = if deck.mixer.filter_offset != 0 { match deck.mixer.filter_poles { 4 => "24", _ => "12" } } else { "  " };
         right_spans.push(Span::styled(slope_str, dim));
     }
 
@@ -711,7 +711,7 @@ pub(crate) fn overview_for_deck(
             .min(overview_width.saturating_sub(1))
     });
 
-    let gain_linear = 10f32.powf(deck.gain_db as f32 / 20.0);
+    let gain_linear = 10f32.powf(deck.mixer.gain_db as f32 / 20.0);
     let hires: Vec<((f32, f32), f32)> = (0..overview_width * 2)
         .map(|col| {
             let idx = (col * total_peaks / (overview_width * 2).max(1)).min(total_peaks.saturating_sub(1));

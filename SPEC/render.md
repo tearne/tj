@@ -35,6 +35,7 @@ Notification colour schemes:
 ### Notification Bar
 
 - A single line displayed above the info bar. By default it shows the track name derived from embedded metadata: `Artist – Title` if both are present, `Title` if only a title is available, or the filename as a fallback. Shown only when a track is loaded.
+- The deck number label at the left edge of the notification bar is highlighted yellow when that deck is the currently selected deck. When the deck is not selected, the label uses the standard dim style.
 - When a notification is active it temporarily replaces the track name. Notifications carry a message, a style (`Info` / `Warning` / `Error` / `Success`), and an expiry; the most recent notification takes precedence. Notifications expire automatically after their timeout; no explicit dismissal is required.
 - The track name is rendered in a muted form of the active palette's treble colour, distinguishing it visually from notification text.
 - The BPM confirmation prompt (see `deck/SPEC.md`) is displayed as a `Warning`-style notification.

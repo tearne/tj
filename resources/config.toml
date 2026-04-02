@@ -2,98 +2,99 @@
 quit             = "esc"
 
 # Global
-zoom_in          = "-"
-zoom_out         = "="
-height_increase  = "}"
-height_decrease  = "{"
-latency_decrease = "["
-latency_increase = "]"
-palette_cycle    = "P"
-terminal_refresh = "¬"
+zoom_in           = "-"
+zoom_out          = "="
+height_decrease   = "{"
+height_increase   = "}"
+latency_decrease  = "["
+latency_increase  = "]"
+palette_cycle     = "~"
 vinyl_mode_toggle = "`"
-art_cycle         = "\\"
-help             = "?"
-nudge_mode_toggle = "|"
+art_cycle         = "/"
+help              = "?"
+nudge_mode_toggle = "¬"
 
-# Deck 1
-deck1_play_pause        = "space+z"
-deck1_open_browser      = "Z"
-deck1_bpm_tap           = "b"
-deck1_metronome         = "B"
-deck1_redetect_bpm      = "'"
-deck1_tempo_reset       = "@"
-deck1_bpm_increase      = "x"
-deck1_bpm_decrease      = "s"
-deck1_base_bpm_increase = "X"
-deck1_base_bpm_decrease = "S"
-deck1_nudge_forward     = "a"
-deck1_nudge_backward    = "z"
-deck1_offset_increase   = "!"
-deck1_offset_decrease   = "Q"
+# Deck select
+select_deck1 = "space+1"
+select_deck2 = "space+2"
+
+# Transport / browse (selected deck)
+play_pause   = "space+f"
+open_browser = "space+d"
+
+# Pitch (selected deck)
+pitch_up    = "z"
+pitch_down  = "a"
+pitch_reset = ["space+a", "space+z"]
+
+# BPM (selected deck)
+bpm_tap          = "c"
+redetect_bpm     = "space+c"
+metronome_toggle = "space+b"
+bpm_increase     = "b"
+bpm_decrease     = "g"
+base_bpm_increase = "B"
+base_bpm_decrease = "G"
+
+# Nudge (selected deck)
+nudge_forward  = "f"
+nudge_backward = "v"
+
+# Tick offset (selected deck)
+offset_increase = "F"
+offset_decrease = "V"
+
+# Cue (selected deck)
+cue      = "space+e"
+cue_play = "space+r"
+
+# PFL (selected deck)
+pfl_up     = "s"
+pfl_down   = "x"
+pfl_reset  = ["space+s", "space+x"]
+pfl_on_off = "space+g"
+
+# Beat jumps (selected deck)
+jump_forward_1bt  = "1"
+jump_backward_1bt = "q"
+jump_forward_4bt  = "2"
+jump_backward_4bt = "w"
+jump_forward_4b   = "3"
+jump_backward_4b  = "e"
+jump_forward_8b   = "4"
+jump_backward_8b  = "r"
+jump_forward_16b  = "5"
+jump_backward_16b = "t"
+jump_forward_32b  = "$"
+jump_backward_32b = "R"
+jump_forward_64b  = "%"
+jump_backward_64b = "T"
+
+# Mixer — Deck 1
 deck1_level_up          = "j"
 deck1_level_down        = "m"
 deck1_level_max         = "space+j"
 deck1_level_min         = "space+m"
 deck1_gain_increase     = "J"
 deck1_gain_decrease     = "M"
-deck1_pitch_up          = "5"
-deck1_pitch_down        = "t"
 deck1_filter_increase        = "7"
 deck1_filter_decrease        = "u"
 deck1_filter_reset           = ["space+7", "space+u"]
 deck1_filter_slope_increase  = "&"
 deck1_filter_slope_decrease  = "U"
-deck1_jump_forward_4b   = "1"
-deck1_jump_backward_4b  = "q"
-deck1_jump_forward_8b   = "2"
-deck1_jump_backward_8b  = "w"
-deck1_jump_forward_1bt  = "space+1"
-deck1_jump_backward_1bt = "space+q"
-deck1_jump_forward_4bt  = "space+2"
-deck1_jump_backward_4bt = "space+w"
-deck1_cue               = "A"
-deck1_cue_play          = "space+a"
-deck1_pfl_toggle        = "space+x"
 
-# Deck 2
-deck2_play_pause        = "space+c"
-deck2_open_browser      = "C"
-deck2_bpm_tap           = "n"
-deck2_metronome         = "N"
-deck2_redetect_bpm      = "#"
-deck2_tempo_reset       = "~"
-deck2_bpm_increase      = "v"
-deck2_bpm_decrease      = "f"
-deck2_base_bpm_increase = "V"
-deck2_base_bpm_decrease = "F"
-deck2_nudge_forward     = "d"
-deck2_nudge_backward    = "c"
-deck2_offset_increase   = "£"
-deck2_offset_decrease   = "E"
+# Mixer — Deck 2
 deck2_level_up          = "k"
 deck2_level_down        = ","
 deck2_level_max         = "space+k"
 deck2_level_min         = "space+,"
 deck2_gain_increase     = "K"
 deck2_gain_decrease     = "<"
-deck2_pitch_up          = "9"
-deck2_pitch_down        = "o"
 deck2_filter_increase        = "8"
 deck2_filter_decrease        = "i"
-deck2_filter_reset           = ["space+i", "space+8"]
+deck2_filter_reset           = ["space+8", "space+i"]
 deck2_filter_slope_increase  = "*"
 deck2_filter_slope_decrease  = "I"
-deck2_jump_forward_4b   = "3"
-deck2_jump_backward_4b  = "e"
-deck2_jump_forward_8b   = "4"
-deck2_jump_backward_8b  = "r"
-deck2_jump_forward_1bt  = "space+3"
-deck2_jump_backward_1bt = "space+e"
-deck2_jump_forward_4bt  = "space+4"
-deck2_jump_backward_4bt = "space+r"
-deck2_cue               = "D"
-deck2_cue_play          = "space+d"
-deck2_pfl_toggle        = "space+v"
 
 [display]
 playhead_position = 20        # 0–100, percentage from left edge of detail panel

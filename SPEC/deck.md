@@ -3,11 +3,10 @@
 ## Deck Selection
 
 - Two decks — Deck 1 and Deck 2 — operate independently. Each deck maintains its own track, transport, BPM, offset, volume, filter, metronome, zoom, waveform, tap accumulator, BPM analysis state, and notification state.
-- One deck is active at a time. `g` selects Deck 1; `h` selects Deck 2. The active deck's control section is visually highlighted; the inactive deck's section is dim.
-- All active-deck controls (transport, BPM, offset, metronome, nudge, tap, re-detect) apply to the active deck only. Zoom and detail height are global and apply to both decks simultaneously.
-- Level and filter have dedicated per-deck bindings and may be adjusted on either deck regardless of which is active (see [keymap.md](keymap.md)).
-- Global controls (quit, help, vinyl mode toggle, terminal refresh, file browser, deck select) are not deck-specific.
-- At startup only Deck 1 is used. Deck 2 can be loaded by selecting it with `h` and opening the file browser.
+- One deck is always selected. `Space+1` selects Deck 1; `Space+2` selects Deck 2. The selected deck defaults to Deck 1 on startup.
+- All deck controls (transport, BPM, offset, pitch, metronome, nudge, tap, re-detect, cue, PFL level) operate on the selected deck only. Mixer controls (level, gain, filter) have dedicated per-deck bindings and may be adjusted on either deck regardless of which is selected.
+- Global controls (quit, help, vinyl mode toggle, deck select) are not deck-specific.
+- At startup only Deck 1 is used. Deck 2 can be loaded by selecting it with `Space+2` and opening the file browser.
 - Audio latency is a single global setting shared across both decks.
 
 ## Playback
@@ -45,14 +44,6 @@
 - The cue position acts as the zero datum for the beat grid: whenever `base_bpm` changes (manual adjustment or re-detection), `offset_ms` is recalculated to keep a tick on the cue position.
 - BPM tap does not disturb the cue point; the tapped grid lands where it lands.
 - The cue column is shown as a green marker in both the overview and detail waveforms.
-
-## Gain Trim
-
-- Each deck has an independent gain trim applied to the audio signal after the filter and before the fader. The trim range is ±12 dB in 1 dB steps.
-- `J` / `M` (Deck 1) and `K` / `<` (Deck 2) increase / decrease gain by 1 dB. Clamps silently at ±12 dB.
-- Gain is applied as a linear multiplier (`10^(dB/20)`) in the audio signal chain, after the filter and before PFL routing.
-- Gain is persisted to the cache alongside BPM and offset, and restored when the track is loaded.
-- The detail info bar shows a single character gain indicator immediately after the level closing bracket. It uses `▁▂▃▄▅▆▇` to represent the range −12 dB to +12 dB, with `▄` at 0 dB. The indicator is grey at 0 dB and dim amber at any non-zero value.
 
 ## Needle Drop
 
@@ -94,14 +85,7 @@ Vinyl mode is a global toggle (`` ` ``) that applies to both decks simultaneousl
 
 **Waveform** — Beat tick marks and the cue column are hidden. The waveform itself is unchanged.
 
-**Beat jumps** — Remapped to fixed time intervals equal to N beats × 0.5 s (the beat period at 120 BPM):
-
-| Keys | Beat mode | Vinyl mode |
-|------|-----------|------------|
-| `1` / `q` (Deck 1), `3` / `e` (Deck 2) | ±4 bars (16 beats) | ±8 s |
-| `2` / `w` (Deck 1), `4` / `r` (Deck 2) | ±8 bars (32 beats) | ±16 s |
-| `Space+1` / `Space+q` (Deck 1), `Space+3` / `Space+e` (Deck 2) | ±1 beat | ±0.5 s |
-| `Space+2` / `Space+w` (Deck 1), `Space+4` / `Space+r` (Deck 2) | ±4 beats | ±2 s |
+**Beat jumps** — Each beat jump action is remapped to a fixed time interval: N beats × 0.5 s (the beat period at 120 BPM). For example, a 16-beat jump becomes ±8 s. See `SPEC/config.md` for the key bindings.
 
 **BPM analysis** — Does not run while vinyl mode is active. The redetect key has no effect in vinyl mode.
 

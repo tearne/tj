@@ -122,16 +122,19 @@ impl TagEditorState {
     }
 }
 
-pub(crate) struct Deck {
-    pub(crate) filename: String,
-    pub(crate) path:     std::path::PathBuf,
-    pub(crate) track_name: String,
-    pub(crate) total_duration: f64,
+pub(crate) struct Mixer {
     pub(crate) volume: f32,
     pub(crate) gain_db: i8,
     pub(crate) pfl_level: u8,
     pub(crate) filter_offset: i32,
     pub(crate) filter_poles: u8,
+}
+
+pub(crate) struct Deck {
+    pub(crate) filename: String,
+    pub(crate) path:     std::path::PathBuf,
+    pub(crate) track_name: String,
+    pub(crate) total_duration: f64,
     pub(crate) pitch_semitones: i8,
     pub(crate) nudge: i8,
     pub(crate) nudge_mode: NudgeMode,
@@ -147,6 +150,7 @@ pub(crate) struct Deck {
     pub(crate) cover_art_cache: Option<(u16, u16, u8, Vec<ratatui::text::Line<'static>>)>, // (cols, rows, bright_idx, lines)
 
     pub(crate) audio: DeckAudio,
+    pub(crate) mixer: Mixer,
     pub(crate) tempo: TempoState,
     pub(crate) tap: TapState,
     pub(crate) display: DisplayState,
@@ -168,11 +172,7 @@ impl Deck {
             path,
             track_name,
             total_duration,
-            volume: 1.0,
-            gain_db: 0,
-            pfl_level: 0,
-            filter_offset: 0,
-            filter_poles: 2,
+            mixer: Mixer { volume: 1.0, gain_db: 0, pfl_level: 0, filter_offset: 0, filter_poles: 2 },
             pitch_semitones: 0,
             nudge: 0,
             nudge_mode: NudgeMode::Jump,
@@ -440,7 +440,7 @@ pub(crate) fn cache_entry_for_deck(d: &Deck) -> CacheEntry {
         name: d.filename.clone(),
         cue_sample: d.cue_sample,
         offset_established: d.tempo.offset_established,
-        gain_db: d.gain_db,
+        gain_db: d.mixer.gain_db,
     }
 }
 

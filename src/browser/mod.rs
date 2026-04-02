@@ -375,7 +375,7 @@ pub(crate) fn handle_browser_key(
             Ok(Some(BrowserResult::WorkspaceCleared))
         }
         KeyCode::Char('q') if state.search_term.is_empty() => Ok(Some(BrowserResult::Quit)),
-        KeyCode::Char('z') | KeyCode::Esc => {
+        KeyCode::Esc => {
             if !state.search_term.is_empty() {
                 state.search_term.clear();
                 state.search_results = None;
