@@ -1385,22 +1385,62 @@ pub(crate) fn render_keyboard_help(frame: &mut ratatui::Frame, area: ratatui::la
         height: outer.height.saturating_sub(V_PAD * 2),
     };
 
+    let g     = Style::default().fg(Color::DarkGray);
+    let gr    = Style::default().fg(Color::Green);
+    let wh    = Style::default().fg(Color::White);
+    let bl    = Style::default().fg(Color::Blue);
+
+    // Row 6: F's ╭ bracket in white
+    let row6 = Line::from(vec![
+        Span::styled("    ╭         ╭         ╭ +Tick   ", g),
+        Span::styled("╭", wh),
+        Span::styled(" -BsBPM  ╭         ┆   ╭ +Gain   ╭ +Gain", g),
+    ]);
+    // Row 7: F in bold green, +Ndge and -BPM in green
+    let row7 = Line::from(vec![
+        Span::styled("    A -Ptch   S +PFL    D ", g),
+        Span::styled("+Ndge", gr),
+        Span::styled("   ", g),
+        Span::styled("F", wh),
+        Span::styled(" ", g),
+        Span::styled("-BPM", gr),
+        Span::styled("    G         ┆   J +Lvl    K +Lvl", g),
+    ]);
+    // Row 8: F's ╰ bracket in white, Brows and Play in blue (Space-modifier actions)
+    let row8 = Line::from(vec![
+        Span::styled("    ╰ -Ptch   ╰ Rst     ╰ ", g),
+        Span::styled("Brows", bl),
+        Span::styled("   ", g),
+        Span::styled("╰", wh),
+        Span::styled(" ", g),
+        Span::styled("Play", bl),
+        Span::styled("    ╰ PFLTog  ┆   ╰ 100%    ╰ 100%", g),
+    ]);
+    // Row 10: -Ndge and +BPM in green
+    let row10 = Line::from(vec![
+        Span::styled("      Z +Ptch   X -PFL    C ", g),
+        Span::styled("-Ndge", gr),
+        Span::styled("   V ", g),
+        Span::styled("+BPM", gr),
+        Span::styled("    B Tap     ┆   M -Lvl    , -Lvl", g),
+    ]);
+
     let lines: Vec<Line<'static>> = vec![
-        Line::raw("╭         ╭         ╭         ╭ +32b    ╭ +64b    ┆   ╭ Slp+    ╭ Slp+"),
-        Line::raw("1 +1bt    2 +1b     3 +4b     4 +8b     5 +16b    ┆   7 HPF     8 HPF"),
-        Line::raw("╰ Sel D1  ╰ Sel D2  ╰         ╰         ╰         ┆   ╰ Flt=    ╰ Flt="),
-        Line::raw("  ╭         ╭         ╭         ╭ -32b    ╭ -64b    ┆   ╭ Slp-    ╭ Slp-"),
-        Line::raw("  Q -1bt    W -1b     E -4b     R -8b     T -16b    ┆   U LPF     I LPF"),
-        Line::raw("  ╰         ╰         ╰ CueSt   ╰ CueJp   ╰         ┆   ╰ Flt=    ╰ Flt="),
-        Line::raw("    ╭         ╭         ╭         ╭ +Tick   ╭ -BsBPM  ┆   ╭ Gain+   ╭ Gain+"),
-        Line::raw("    A Ptch-   S PFL+    D         F Fwd     G -BPM    ┆   J Lvl+    K Lvl+"),
-        Line::raw("    ╰ Ptch=   ╰ Rst     ╰ Brows   ╰ Play    ╰ PFLTog  ┆   ╰ 100%    ╰ 100%"),
-        Line::raw("      ╭         ╭         ╭         ╭ -Tick   ╭ +BsBPM  ┆   ╭ Gain-   ╭ Gain-"),
-        Line::raw("      Z Ptch+   X PFL-    C Tap     V Back    B +BPM    ┆   M Lvl-    , Lvl-"),
-        Line::raw("      ╰ Ptch=   ╰ Rst     ╰ BDtct   ╰         ╰ Metro   ┆   ╰ 0%      ╰ 0%"),
+        Line::styled("╭         ╭         ╭         ╭ +32b    ╭ +64b    ┆   ╭ +Slp    ╭ +Slp", g),
+        Line::styled("1 +1bt    2 +1b     3 +4b     4 +8b     5 +16b    ┆   7 HPF     8 HPF", g),
+        Line::styled("╰ SelD1   ╰ SelD2   ╰         ╰         ╰         ┆   ╰ Flt=    ╰ Flt=", g),
+        Line::styled("  ╭         ╭         ╭         ╭ -32b    ╭ -64b    ┆   ╭ -Slp    ╭ -Slp", g),
+        Line::styled("  Q -1bt    W -1b     E -4b     R -8b     T -16b    ┆   U LPF     I LPF", g),
+        Line::styled("  ╰         ╰         ╰ CueSt   ╰ CueJp   ╰         ┆   ╰ Flt=    ╰ Flt=", g),
+        row6,
+        row7,
+        row8,
+        Line::styled("      ╭         ╭         ╭ -Tick   ╭ +BsBPM  ╭         ┆   ╭ -Gain   ╭ -Gain", g),
+        row10,
+        Line::styled("      ╰ +Ptch   ╰ Rst     ╰         ╰ Metro   ╰ BDtct   ┆   ╰ 0%      ╰ 0%", g),
     ];
     frame.render_widget(
-        Paragraph::new(lines).style(Style::default().fg(Color::DarkGray).bg(Color::Rgb(15, 15, 15))),
+        Paragraph::new(lines).style(Style::default().bg(Color::Rgb(15, 15, 15))),
         inner,
     );
 }

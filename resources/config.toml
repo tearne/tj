@@ -29,21 +29,21 @@ pitch_down  = "a"
 pitch_reset = ["space+a", "space+z"]
 
 # BPM (selected deck)
-bpm_tap          = "c"
-redetect_bpm     = "space+c"
-metronome_toggle = "space+b"
-bpm_increase     = "b"
-bpm_decrease     = "g"
-base_bpm_increase = "B"
-base_bpm_decrease = "G"
+bpm_tap          = "b"
+redetect_bpm     = "space+b"
+metronome_toggle = "space+v"
+bpm_increase     = "v"
+bpm_decrease     = "f"
+base_bpm_increase = "V"
+base_bpm_decrease = "F"
 
 # Nudge (selected deck)
-nudge_forward  = "f"
-nudge_backward = "v"
+nudge_forward  = "d"
+nudge_backward = "c"
 
 # Tick offset (selected deck)
-offset_increase = "F"
-offset_decrease = "V"
+offset_increase = "D"
+offset_decrease = "C"
 
 # Cue (selected deck)
 cue      = "space+e"
