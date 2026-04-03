@@ -16,11 +16,11 @@ The layout below matches the in-app keyboard help overlay (`Space+/`). Left bloc
   Q -1bt    W -1b     E -4b     R -8b     T -16b    ┆   U LPF     I LPF     O LPF
   ╰         ╰         ╰ CueSt   ╰ CueJp   ╰         ┆   ╰ Flt=    ╰ Flt=    ╰ Flt=
     ╭         ╭         ╭ +Tick   ╭ -BsBPM  ╭         ┆   ╭ +Gain   ╭ +Gain   ╭ +Gain
-    A -Ptch   S +PFL    D +Ndge   F -BPM    G         ┆   J +Lvl    K +Lvl    L +Lvl
-    ╰ -Ptch   ╰ Rst     ╰ Brows   ╰ Play    ╰ PFLTog  ┆   ╰ 100%    ╰ 100%    ╰ 100%
+    A +Ptch   S +PFL    D +Ndge   F -BPM    G         ┆   J +Lvl    K +Lvl    L +Lvl
+    ╰ =Ptch   ╰ Rst     ╰ Brows   ╰ Play    ╰ PFLTog  ┆   ╰ 100%    ╰ 100%    ╰ 100%
       ╭         ╭         ╭ -Tick   ╭ +BsBPM  ╭         ┆   ╭ -Gain   ╭ -Gain   ╭ -Gain
-      Z +Ptch   X -PFL    C -Ndge   V +BPM    B Tap     ┆   M -Lvl    , -Lvl    . -Lvl
-      ╰ +Ptch   ╰ Rst     ╰         ╰ Metro   ╰ BDtct   ┆   ╰ 0%      ╰ 0%      ╰ 0%
+      Z -Ptch   X -PFL    C -Ndge   V +BPM    B Tap     ┆   M -Lvl    , -Lvl    . -Lvl
+      ╰ =Ptch   ╰ Rst     ╰         ╰ Metro   ╰ BDtct   ┆   ╰ 0%      ╰ 0%      ╰ 0%
 ```
 
 Per-cell format: `╭ Shift-action` / `Key plain-action` / `╰ Space-action`. Empty modifier cells are left blank.

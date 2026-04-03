@@ -34,10 +34,19 @@ Review cadence: per task.
 
 ## Plan
 
-- [ ] FIX `src/main.rs`: add `continue` in the CuePlay early intercept after the seek so the normal action dispatch is skipped
-- [ ] FIX `resources/config.toml`: swap `pitch_up` and `pitch_down` bindings (`a` ↔ `z`)
-- [ ] UPDATE `SPEC/config.md`: swap the pitch +/− labels for A and Z
-- [ ] UPDATE `changes/active/planning/key-rebinding.md`: correct Space-layer labels for Z and A from `+Ptch`/`-Ptch` to `Ptch=`
-- [ ] FIX `src/audio/mod.rs`: add an output-position counter to `PitchSource` and update `SeekHandle` (and any display-position reads) to use it instead of `TrackingSource`'s position
+- [x] FIX `src/main.rs`: add `continue` in the CuePlay early intercept after the seek so the normal action dispatch is skipped
+- [x] FIX `resources/config.toml`: swap `pitch_up` and `pitch_down` bindings (`a` ↔ `z`)
+- [x] UPDATE `SPEC/config.md`: swap the pitch +/− labels for A and Z
+- [x] UPDATE `changes/active/planning/key-rebinding.md`: correct Space-layer labels for Z and A from `+Ptch`/`-Ptch` to `Ptch=`
+- [x] FIX `src/audio/mod.rs`: add an output-position counter to `PitchSource` and update `SeekHandle` (and any display-position reads) to use it instead of `TrackingSource`'s position
+
+## Log
+
+- `key-rebinding.md` no longer exists in `changes/active/planning/` — task was a no-op.
+- SPEC correction used `=Ptch` per user preference (not `Ptch=` as written in the plan).
+- CuePlay while playing: after initial build, display did not snap to new position because `seek_to` did not update `output_position`. Fixed by also storing `target_sample` into `output_position` in `seek_to`, so the drift correction fires immediately.
+- End-of-track detection and remaining-time read kept on `TrackingSource.position` (not `output_position`) — `output_position` accumulates across seeks and would falsely trigger end-of-track.
 
 ## Conclusion
+
+All four bugs fixed. `output_position` is used only for display drift correction; `TrackingSource.position` is retained for end-of-track detection and remaining time. The pitch fix requires a release build and removal of any existing `~/.config/deck/config.toml` if auto-created by an older binary.

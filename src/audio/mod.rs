@@ -415,6 +415,9 @@ impl<S: Source<Item = f32>> Source for FilterSource<S> {
 pub(crate) struct SeekHandle {
     pub(crate) samples: Arc<Vec<f32>>,
     pub(crate) position: Arc<AtomicUsize>,
+    /// Tracks samples actually emitted by PitchSource; used for display to avoid the 512-sample
+    /// batch-read jumps that occur in TrackingSource when pitch is active.
+    pub(crate) output_position: Arc<AtomicUsize>,
     pub(crate) fade_remaining: Arc<AtomicI64>,
     pub(crate) fade_len: Arc<AtomicI64>,
     pub(crate) pending_target: Arc<AtomicUsize>,
@@ -425,9 +428,9 @@ pub(crate) struct SeekHandle {
 }
 
 impl SeekHandle {
-    /// Current playback position derived from the atomic sample counter.
+    /// Current playback position derived from the output-position counter.
     pub(crate) fn current_pos(&self) -> Duration {
-        let pos = self.position.load(Ordering::Relaxed);
+        let pos = self.output_position.load(Ordering::Relaxed);
         Duration::from_secs_f64(pos as f64 / (self.sample_rate as f64 * self.channels as f64))
     }
 
@@ -463,6 +466,9 @@ impl SeekHandle {
         self.fade_len.store(FADE_SAMPLES, Ordering::SeqCst);
         self.pending_target.store(target_sample, Ordering::SeqCst);
         self.fade_remaining.store(-FADE_SAMPLES, Ordering::SeqCst);
+        // Update output_position immediately so the display snaps to the new position
+        // without waiting for the fade to complete.
+        self.output_position.store(target_sample, Ordering::SeqCst);
     }
 
     /// Seek to `target_secs` directly, without a fade. Used when paused — the audio
@@ -478,6 +484,7 @@ impl SeekHandle {
         self.pending_target.store(usize::MAX, Ordering::SeqCst);
         self.fade_remaining.store(0, Ordering::SeqCst);
         self.position.store(target_sample, Ordering::SeqCst);
+        self.output_position.store(target_sample, Ordering::SeqCst);
     }
 
     /// Move to `target_secs` exactly, without a quiet-frame search or fade.
@@ -490,6 +497,7 @@ impl SeekHandle {
         self.pending_target.store(usize::MAX, Ordering::SeqCst);
         self.fade_remaining.store(0, Ordering::SeqCst);
         self.position.store(target_sample, Ordering::SeqCst);
+        self.output_position.store(target_sample, Ordering::SeqCst);
     }
 }
 
@@ -506,6 +514,7 @@ pub(crate) struct PitchSource<S: Source<Item = f32>> {
     current_pitch:   i8,
     channels:        u16,
     sample_rate:     u32,
+    output_position: Arc<AtomicUsize>,
 }
 
 impl<S: Source<Item = f32>> PitchSource<S> {
@@ -513,13 +522,14 @@ impl<S: Source<Item = f32>> PitchSource<S> {
         inner:           S,
         pitch_semitones: Arc<std::sync::atomic::AtomicI8>,
         flush_pitch:     Arc<AtomicBool>,
+        output_position: Arc<AtomicUsize>,
     ) -> Self {
         let channels    = inner.channels().get() as u16;
         let sample_rate = inner.sample_rate().get();
         let mut st = soundtouch::SoundTouch::new();
         st.set_channels(channels as u32);
         st.set_sample_rate(sample_rate);
-        PitchSource { inner, st, output: std::collections::VecDeque::new(), pitch_semitones, flush_pitch, current_pitch: 0, channels, sample_rate }
+        PitchSource { inner, st, output: std::collections::VecDeque::new(), pitch_semitones, flush_pitch, current_pitch: 0, channels, sample_rate, output_position }
     }
 }
 
@@ -539,7 +549,9 @@ impl<S: Source<Item = f32>> Iterator for PitchSource<S> {
                 self.output.clear();
                 self.current_pitch = 0;
             }
-            return self.inner.next();
+            let sample = self.inner.next();
+            self.output_position.fetch_add(1, Ordering::Relaxed);
+            return sample;
         }
 
         if new_pitch != self.current_pitch {
@@ -549,6 +561,7 @@ impl<S: Source<Item = f32>> Iterator for PitchSource<S> {
         }
 
         if let Some(s) = self.output.pop_front() {
+            self.output_position.fetch_add(1, Ordering::Relaxed);
             return Some(s);
         }
 
@@ -576,7 +589,9 @@ impl<S: Source<Item = f32>> Iterator for PitchSource<S> {
             self.output.extend(buf);
         }
 
-        self.output.pop_front().or(Some(0.0))
+        let sample = self.output.pop_front().or(Some(0.0));
+        self.output_position.fetch_add(1, Ordering::Relaxed);
+        sample
     }
 }
 

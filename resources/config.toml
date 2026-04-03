@@ -25,8 +25,8 @@ play_pause   = "space+f"
 open_browser = "space+d"
 
 # Pitch (selected deck)
-pitch_up    = "z"
-pitch_down  = "a"
+pitch_up    = "a"
+pitch_down  = "z"
 pitch_reset = ["space+a", "space+z"]
 
 # BPM (selected deck)

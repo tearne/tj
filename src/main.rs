@@ -209,15 +209,17 @@ fn build_deck(
     let mono           = Arc::new(mono);
     let waveform       = Arc::new(WaveformData::compute(Arc::clone(&mono), sample_rate));
 
-    let samples        = Arc::new(stereo);
-    let position       = Arc::new(AtomicUsize::new(0));
-    let fade_remaining = Arc::new(AtomicI64::new(0));
-    let fade_len       = Arc::new(AtomicI64::new(FADE_SAMPLES));
+    let samples         = Arc::new(stereo);
+    let position        = Arc::new(AtomicUsize::new(0));
+    let output_position = Arc::new(AtomicUsize::new(0));
+    let fade_remaining  = Arc::new(AtomicI64::new(0));
+    let fade_len        = Arc::new(AtomicI64::new(FADE_SAMPLES));
     let pending_target  = Arc::new(AtomicUsize::new(usize::MAX));
     let flush_pitch     = Arc::new(AtomicBool::new(false));
     let seek_handle = SeekHandle {
         samples: Arc::clone(&samples),
         position: Arc::clone(&position),
+        output_position: Arc::clone(&output_position),
         fade_remaining: Arc::clone(&fade_remaining),
         fade_len: Arc::clone(&fade_len),
         pending_target: Arc::clone(&pending_target),
@@ -250,6 +252,7 @@ fn build_deck(
         ),
         Arc::clone(&pitch_semitones),
         Arc::clone(&flush_pitch),
+        Arc::clone(&output_position),
     ));
     player.pause();
 
@@ -1203,6 +1206,7 @@ Space+= / Space+-    swap decks 1↔2 / 2↔3";
                             space_held = false;
                             space_repeat_suppressed = true;
                         }
+                        continue 'tui;
                     }
                     // Nudge (selected deck) — guards exclude space_held so Space+nudge-key
                     // resolves cleanly to its SpaceChord action without also nudging.
@@ -1929,7 +1933,7 @@ fn service_deck_frame(
         }
     }
 
-    // Real audio position.
+    // Actual playback position from TrackingSource — used for end-of-track detection.
     let pos_raw  = d.audio.seek_handle.position.load(Ordering::Relaxed);
     let pos_samp = pos_raw / d.audio.seek_handle.channels as usize;
     let total_mono_samps = d.audio.seek_handle.samples.len() / d.audio.seek_handle.channels as usize;
@@ -1976,8 +1980,11 @@ fn service_deck_frame(
         }
     }
 
-    // Drift correction.
-    let drift = d.display.smooth_display_samp - pos_samp as f64;
+    // Drift correction — use output_position to avoid the 512-sample batch-read jumps in
+    // TrackingSource when pitch is active, which would otherwise cause the display to snap.
+    let display_pos_samp = d.audio.seek_handle.output_position.load(Ordering::Relaxed)
+        / d.audio.seek_handle.channels as usize;
+    let drift = d.display.smooth_display_samp - display_pos_samp as f64;
     let large_drift = drift.abs() > d.audio.sample_rate as f64 * 0.5;
     let paused_snap  = d.audio.player.is_paused() && d.nudge == 0 && drift.abs() > 1.0;
     if large_drift || paused_snap {
@@ -1986,9 +1993,9 @@ fn service_deck_frame(
         let col_samp_f64 = col_secs * d.audio.sample_rate as f64 * speed;
         let half_col = col_samp_f64 / 2.0;
         d.display.smooth_display_samp = if half_col > 0.0 {
-            (pos_samp as f64 / half_col).round() * half_col
+            (display_pos_samp as f64 / half_col).round() * half_col
         } else {
-            pos_samp as f64
+            display_pos_samp as f64
         };
     } else if !d.audio.player.is_paused() {
         d.display.smooth_display_samp -= drift * 0.05;
