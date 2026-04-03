@@ -14,7 +14,7 @@ pub(crate) enum Action {
     ArtCycle,
     KeyboardHelp,
     // Selected-deck controls
-    SelectDeck1, SelectDeck2,
+    SelectDeck1, SelectDeck2, SelectDeck3,
     PlayPause, OpenBrowser,
     PitchUp, PitchDown, PitchReset,
     BpmTap, MetronomeToggle, RedetectBpm,
@@ -41,6 +41,12 @@ pub(crate) enum Action {
     Deck2FilterIncrease, Deck2FilterDecrease, Deck2FilterReset,
     Deck2FilterSlopeIncrease, Deck2FilterSlopeDecrease,
     Deck2GainIncrease, Deck2GainDecrease,
+    Deck3LevelUp, Deck3LevelDown, Deck3LevelMax, Deck3LevelMin,
+    Deck3FilterIncrease, Deck3FilterDecrease, Deck3FilterReset,
+    Deck3FilterSlopeIncrease, Deck3FilterSlopeDecrease,
+    Deck3GainIncrease, Deck3GainDecrease,
+    // Deck swap
+    SwapDeck1Deck2, SwapDeck2Deck3,
 }
 
 pub(crate) static ACTION_NAMES: &[(&str, Action)] = &[
@@ -61,6 +67,7 @@ pub(crate) static ACTION_NAMES: &[(&str, Action)] = &[
     // Selected-deck controls
     ("select_deck1",        Action::SelectDeck1),
     ("select_deck2",        Action::SelectDeck2),
+    ("select_deck3",        Action::SelectDeck3),
     ("play_pause",          Action::PlayPause),
     ("open_browser",        Action::OpenBrowser),
     ("pitch_up",            Action::PitchUp),
@@ -121,6 +128,19 @@ pub(crate) static ACTION_NAMES: &[(&str, Action)] = &[
     ("deck2_filter_slope_decrease",  Action::Deck2FilterSlopeDecrease),
     ("deck2_gain_increase",     Action::Deck2GainIncrease),
     ("deck2_gain_decrease",     Action::Deck2GainDecrease),
+    ("deck3_level_up",          Action::Deck3LevelUp),
+    ("deck3_level_down",        Action::Deck3LevelDown),
+    ("deck3_level_max",         Action::Deck3LevelMax),
+    ("deck3_level_min",         Action::Deck3LevelMin),
+    ("deck3_filter_increase",        Action::Deck3FilterIncrease),
+    ("deck3_filter_decrease",        Action::Deck3FilterDecrease),
+    ("deck3_filter_reset",           Action::Deck3FilterReset),
+    ("deck3_filter_slope_increase",  Action::Deck3FilterSlopeIncrease),
+    ("deck3_filter_slope_decrease",  Action::Deck3FilterSlopeDecrease),
+    ("deck3_gain_increase",     Action::Deck3GainIncrease),
+    ("deck3_gain_decrease",     Action::Deck3GainDecrease),
+    ("swap_deck1_deck2",        Action::SwapDeck1Deck2),
+    ("swap_deck2_deck3",        Action::SwapDeck2Deck3),
 ];
 
 #[derive(Hash, Eq, PartialEq)]

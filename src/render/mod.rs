@@ -58,7 +58,7 @@ impl BrailleBuffer {
     }
 }
 
-/// A single background thread that produces two `BrailleBuffer`s — one per
+/// A single background thread that produces three `BrailleBuffer`s — one per
 /// deck — each at a `col_samp` scaled by that deck's `bpm / base_bpm` ratio.
 /// Scaling by the playback speed means ticks placed at `base_bpm` sample
 /// spacing appear at `bpm`-spaced columns, so the tick grids of two decks at
@@ -69,33 +69,44 @@ pub(crate) struct SharedDetailRenderer {
     pub(crate) zoom_at:        Arc<AtomicUsize>,
     pub(crate) sample_rate_a:  Arc<AtomicUsize>,
     pub(crate) sample_rate_b:  Arc<AtomicUsize>,
+    pub(crate) sample_rate_c:  Arc<AtomicUsize>,
     /// `(bpm / base_bpm) × 65536`, updated on every BPM-changing action.
     pub(crate) speed_ratio_a:  Arc<AtomicUsize>,
     pub(crate) speed_ratio_b:  Arc<AtomicUsize>,
+    pub(crate) speed_ratio_c:  Arc<AtomicUsize>,
     pub(crate) waveform_a:     Arc<Mutex<Option<Arc<WaveformData>>>>,
     pub(crate) waveform_b:     Arc<Mutex<Option<Arc<WaveformData>>>>,
+    pub(crate) waveform_c:     Arc<Mutex<Option<Arc<WaveformData>>>>,
     pub(crate) display_pos_a:  Arc<AtomicUsize>,
     pub(crate) display_pos_b:  Arc<AtomicUsize>,
+    pub(crate) display_pos_c:  Arc<AtomicUsize>,
     pub(crate) channels_a:     Arc<AtomicUsize>,
     pub(crate) channels_b:     Arc<AtomicUsize>,
+    pub(crate) channels_c:     Arc<AtomicUsize>,
     /// Incremented each time a new track is loaded into the slot; signals the
     /// background thread to recompute immediately rather than waiting for drift.
     pub(crate) load_gen_a:     Arc<AtomicUsize>,
     pub(crate) load_gen_b:     Arc<AtomicUsize>,
+    pub(crate) load_gen_c:     Arc<AtomicUsize>,
     /// `base_bpm` as f32 bits; 0 when analysing or unloaded.
     pub(crate) bpm_a:          Arc<AtomicU32>,
     pub(crate) bpm_b:          Arc<AtomicU32>,
+    pub(crate) bpm_c:          Arc<AtomicU32>,
     pub(crate) offset_ms_a:    Arc<AtomicI64>,
     pub(crate) offset_ms_b:    Arc<AtomicI64>,
+    pub(crate) offset_ms_c:    Arc<AtomicI64>,
     /// Cue point in mono samples; -1 when unset.
     pub(crate) cue_sample_a:   Arc<AtomicI64>,
     pub(crate) cue_sample_b:   Arc<AtomicI64>,
+    pub(crate) cue_sample_c:   Arc<AtomicI64>,
     /// Gain trim as f32 bits; 1.0 when unset. Peaks in the buffer are pre-scaled
     /// by this value so the detail waveform height tracks gain visually.
     pub(crate) gain_a:         Arc<AtomicU32>,
     pub(crate) gain_b:         Arc<AtomicU32>,
+    pub(crate) gain_c:         Arc<AtomicU32>,
     pub(crate) shared_a:       Arc<Mutex<Arc<BrailleBuffer>>>,
     pub(crate) shared_b:       Arc<Mutex<Arc<BrailleBuffer>>>,
+    pub(crate) shared_c:       Arc<Mutex<Arc<BrailleBuffer>>>,
     _stop_guard:    StopOnDrop,
 }
 
@@ -111,27 +122,39 @@ impl SharedDetailRenderer {
         let zoom_at        = Arc::new(AtomicUsize::new(zoom_idx));
         let sample_rate_a  = Arc::new(AtomicUsize::new(44100));
         let sample_rate_b  = Arc::new(AtomicUsize::new(44100));
+        let sample_rate_c  = Arc::new(AtomicUsize::new(44100));
         let speed_ratio_a  = Arc::new(AtomicUsize::new(65536)); // 1.0 × 65536
         let speed_ratio_b  = Arc::new(AtomicUsize::new(65536));
+        let speed_ratio_c  = Arc::new(AtomicUsize::new(65536));
         let waveform_a     = Arc::new(Mutex::new(None::<Arc<WaveformData>>));
         let waveform_b     = Arc::new(Mutex::new(None::<Arc<WaveformData>>));
+        let waveform_c     = Arc::new(Mutex::new(None::<Arc<WaveformData>>));
         let display_pos_a  = Arc::new(AtomicUsize::new(0));
         let display_pos_b  = Arc::new(AtomicUsize::new(0));
+        let display_pos_c  = Arc::new(AtomicUsize::new(0));
         let channels_a     = Arc::new(AtomicUsize::new(1));
         let channels_b     = Arc::new(AtomicUsize::new(1));
+        let channels_c     = Arc::new(AtomicUsize::new(1));
         let load_gen_a     = Arc::new(AtomicUsize::new(0));
         let load_gen_b     = Arc::new(AtomicUsize::new(0));
+        let load_gen_c     = Arc::new(AtomicUsize::new(0));
         let bpm_a          = Arc::new(AtomicU32::new(0));
         let bpm_b          = Arc::new(AtomicU32::new(0));
+        let bpm_c          = Arc::new(AtomicU32::new(0));
         let offset_ms_a    = Arc::new(AtomicI64::new(0));
         let offset_ms_b    = Arc::new(AtomicI64::new(0));
+        let offset_ms_c    = Arc::new(AtomicI64::new(0));
         let cue_sample_a   = Arc::new(AtomicI64::new(-1));
         let cue_sample_b   = Arc::new(AtomicI64::new(-1));
+        let cue_sample_c   = Arc::new(AtomicI64::new(-1));
         let gain_a         = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let gain_b         = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let gain_c         = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let shared_a: Arc<Mutex<Arc<BrailleBuffer>>> =
             Arc::new(Mutex::new(Arc::new(BrailleBuffer::empty())));
         let shared_b: Arc<Mutex<Arc<BrailleBuffer>>> =
+            Arc::new(Mutex::new(Arc::new(BrailleBuffer::empty())));
+        let shared_c: Arc<Mutex<Arc<BrailleBuffer>>> =
             Arc::new(Mutex::new(Arc::new(BrailleBuffer::empty())));
         let stop       = Arc::new(AtomicBool::new(false));
         let stop_guard = StopOnDrop(Arc::clone(&stop));
@@ -142,46 +165,64 @@ impl SharedDetailRenderer {
             let zoom_bg      = Arc::clone(&zoom_at);
             let sr_a_bg      = Arc::clone(&sample_rate_a);
             let sr_b_bg      = Arc::clone(&sample_rate_b);
+            let sr_c_bg      = Arc::clone(&sample_rate_c);
             let ratio_a_bg   = Arc::clone(&speed_ratio_a);
             let ratio_b_bg   = Arc::clone(&speed_ratio_b);
+            let ratio_c_bg   = Arc::clone(&speed_ratio_c);
             let wf_a_bg      = Arc::clone(&waveform_a);
             let wf_b_bg      = Arc::clone(&waveform_b);
+            let wf_c_bg      = Arc::clone(&waveform_c);
             let pos_a_bg     = Arc::clone(&display_pos_a);
             let pos_b_bg     = Arc::clone(&display_pos_b);
+            let pos_c_bg     = Arc::clone(&display_pos_c);
             let ch_a_bg      = Arc::clone(&channels_a);
             let ch_b_bg      = Arc::clone(&channels_b);
+            let ch_c_bg      = Arc::clone(&channels_c);
             let gen_a_bg     = Arc::clone(&load_gen_a);
             let gen_b_bg     = Arc::clone(&load_gen_b);
+            let gen_c_bg     = Arc::clone(&load_gen_c);
             let bpm_a_bg     = Arc::clone(&bpm_a);
             let bpm_b_bg     = Arc::clone(&bpm_b);
+            let bpm_c_bg     = Arc::clone(&bpm_c);
             let off_ms_a_bg  = Arc::clone(&offset_ms_a);
             let off_ms_b_bg  = Arc::clone(&offset_ms_b);
+            let off_ms_c_bg  = Arc::clone(&offset_ms_c);
             let cue_a_bg     = Arc::clone(&cue_sample_a);
             let cue_b_bg     = Arc::clone(&cue_sample_b);
+            let cue_c_bg     = Arc::clone(&cue_sample_c);
             let gain_a_bg    = Arc::clone(&gain_a);
             let gain_b_bg    = Arc::clone(&gain_b);
+            let gain_c_bg    = Arc::clone(&gain_c);
             let shared_a_bg  = Arc::clone(&shared_a);
             let shared_b_bg  = Arc::clone(&shared_b);
+            let shared_c_bg  = Arc::clone(&shared_c);
             let stop_bg      = Arc::clone(&stop);
 
             thread::spawn(move || {
-                let mut last_cols      = 0usize;
-                let mut last_rows      = 0usize;
-                let mut last_zoom      = usize::MAX;
+                let mut last_cols       = 0usize;
+                let mut last_rows       = 0usize;
+                let mut last_zoom       = usize::MAX;
                 let mut last_col_samp_a = 0usize;
                 let mut last_col_samp_b = 0usize;
-                let mut last_anchor_a  = 0usize;
-                let mut last_anchor_b  = 0usize;
-                let mut last_gen_a     = usize::MAX;
-                let mut last_gen_b     = usize::MAX;
+                let mut last_col_samp_c = 0usize;
+                let mut last_anchor_a   = 0usize;
+                let mut last_anchor_b   = 0usize;
+                let mut last_anchor_c   = 0usize;
+                let mut last_gen_a      = usize::MAX;
+                let mut last_gen_b      = usize::MAX;
+                let mut last_gen_c      = usize::MAX;
                 let mut last_bpm_a: u32  = 0;
                 let mut last_bpm_b: u32  = 0;
+                let mut last_bpm_c: u32  = 0;
                 let mut last_off_a: i64  = 0;
                 let mut last_off_b: i64  = 0;
+                let mut last_off_c: i64  = 0;
                 let mut last_cue_a: i64  = -1;
                 let mut last_cue_b: i64  = -1;
+                let mut last_cue_c: i64  = -1;
                 let mut last_gain_a: u32 = 1.0f32.to_bits();
                 let mut last_gain_b: u32 = 1.0f32.to_bits();
+                let mut last_gain_c: u32 = 1.0f32.to_bits();
 
                 loop {
                     if stop_bg.load(Ordering::Relaxed) { break; }
@@ -197,16 +238,21 @@ impl SharedDetailRenderer {
                     let zoom_secs = ZOOM_LEVELS[zoom] as f64;
                     let sr_a      = sr_a_bg.load(Ordering::Relaxed);
                     let sr_b      = sr_b_bg.load(Ordering::Relaxed);
+                    let sr_c      = sr_c_bg.load(Ordering::Relaxed);
                     let ratio_a   = ratio_a_bg.load(Ordering::Relaxed) as f64 / 65536.0;
                     let ratio_b   = ratio_b_bg.load(Ordering::Relaxed) as f64 / 65536.0;
+                    let ratio_c   = ratio_c_bg.load(Ordering::Relaxed) as f64 / 65536.0;
                     // col_samp scaled by speed ratio so column grid is in playback-time space.
                     let col_samp_a = ((zoom_secs * sr_a as f64 * ratio_a) as usize / cols).max(1);
                     let col_samp_b = ((zoom_secs * sr_b as f64 * ratio_b) as usize / cols).max(1);
+                    let col_samp_c = ((zoom_secs * sr_c as f64 * ratio_c) as usize / cols).max(1);
 
                     let ch_a   = ch_a_bg.load(Ordering::Relaxed).max(1);
                     let ch_b   = ch_b_bg.load(Ordering::Relaxed).max(1);
+                    let ch_c   = ch_c_bg.load(Ordering::Relaxed).max(1);
                     let pos_a  = pos_a_bg.load(Ordering::Relaxed) / ch_a;
                     let pos_b  = pos_b_bg.load(Ordering::Relaxed) / ch_b;
+                    let pos_c  = pos_c_bg.load(Ordering::Relaxed) / ch_c;
 
                     let drift_a = if last_col_samp_a > 0 {
                         pos_a.abs_diff(last_anchor_a) / last_col_samp_a
@@ -214,46 +260,64 @@ impl SharedDetailRenderer {
                     let drift_b = if last_col_samp_b > 0 {
                         pos_b.abs_diff(last_anchor_b) / last_col_samp_b
                     } else { usize::MAX };
+                    let drift_c = if last_col_samp_c > 0 {
+                        pos_c.abs_diff(last_anchor_c) / last_col_samp_c
+                    } else { usize::MAX };
 
-                    let gen_a    = gen_a_bg.load(Ordering::Relaxed);
-                    let gen_b    = gen_b_bg.load(Ordering::Relaxed);
+                    let gen_a     = gen_a_bg.load(Ordering::Relaxed);
+                    let gen_b     = gen_b_bg.load(Ordering::Relaxed);
+                    let gen_c     = gen_c_bg.load(Ordering::Relaxed);
                     let bpm_a_raw = bpm_a_bg.load(Ordering::Relaxed);
                     let bpm_b_raw = bpm_b_bg.load(Ordering::Relaxed);
+                    let bpm_c_raw = bpm_c_bg.load(Ordering::Relaxed);
                     let off_ms_a  = off_ms_a_bg.load(Ordering::Relaxed);
                     let off_ms_b  = off_ms_b_bg.load(Ordering::Relaxed);
+                    let off_ms_c  = off_ms_c_bg.load(Ordering::Relaxed);
                     let cue_raw_a  = cue_a_bg.load(Ordering::Relaxed);
                     let cue_raw_b  = cue_b_bg.load(Ordering::Relaxed);
+                    let cue_raw_c  = cue_c_bg.load(Ordering::Relaxed);
                     let gain_raw_a = gain_a_bg.load(Ordering::Relaxed);
                     let gain_raw_b = gain_b_bg.load(Ordering::Relaxed);
+                    let gain_raw_c = gain_c_bg.load(Ordering::Relaxed);
                     let must_recompute = cols != last_cols
                         || rows != last_rows
                         || zoom != last_zoom
                         || col_samp_a != last_col_samp_a
                         || col_samp_b != last_col_samp_b
+                        || col_samp_c != last_col_samp_c
                         || drift_a >= cols * 3 / 4
                         || drift_b >= cols * 3 / 4
+                        || drift_c >= cols * 3 / 4
                         || gen_a != last_gen_a
                         || gen_b != last_gen_b
+                        || gen_c != last_gen_c
                         || bpm_a_raw != last_bpm_a
                         || bpm_b_raw != last_bpm_b
+                        || bpm_c_raw != last_bpm_c
                         || off_ms_a != last_off_a
                         || off_ms_b != last_off_b
+                        || off_ms_c != last_off_c
                         || cue_raw_a != last_cue_a
                         || cue_raw_b != last_cue_b
+                        || cue_raw_c != last_cue_c
                         || gain_raw_a != last_gain_a
-                        || gain_raw_b != last_gain_b;
+                        || gain_raw_b != last_gain_b
+                        || gain_raw_c != last_gain_c;
 
                     if must_recompute {
                         let buf_cols = cols * 5;
 
                         let wf_a: Option<Arc<WaveformData>> = wf_a_bg.lock().unwrap().clone();
                         let wf_b: Option<Arc<WaveformData>> = wf_b_bg.lock().unwrap().clone();
+                        let wf_c: Option<Arc<WaveformData>> = wf_c_bg.lock().unwrap().clone();
 
                         let anchor_a = (pos_a / col_samp_a) * col_samp_a;
                         let anchor_b = (pos_b / col_samp_b) * col_samp_b;
+                        let anchor_c = (pos_c / col_samp_c) * col_samp_c;
 
                         let tick_view_start_a = anchor_a as f64 - (buf_cols / 2) as f64 * col_samp_a as f64;
                         let tick_view_start_b = anchor_b as f64 - (buf_cols / 2) as f64 * col_samp_b as f64;
+                        let tick_view_start_c = anchor_c as f64 - (buf_cols / 2) as f64 * col_samp_c as f64;
                         let compute_cue_buf_col = |cue_raw: i64, anchor: usize, col_samp: usize| -> Option<usize> {
                             if cue_raw < 0 || col_samp == 0 { return None; }
                             let delta = cue_raw - anchor as i64;
@@ -262,6 +326,7 @@ impl SharedDetailRenderer {
                         };
                         let gain_a = f32::from_bits(gain_raw_a);
                         let gain_b = f32::from_bits(gain_raw_b);
+                        let gain_c = f32::from_bits(gain_raw_c);
                         let scale_peaks = |peaks: Vec<(f32, f32)>, g: f32| -> Vec<(f32, f32)> {
                             peaks.into_iter().map(|(mn, mx)| (mn * g, mx * g)).collect()
                         };
@@ -291,27 +356,48 @@ impl SharedDetailRenderer {
                             anchor_sample:   anchor_b,
                             samples_per_col: col_samp_b,
                         });
+                        let buf_c = Arc::new(BrailleBuffer {
+                            grid: render_braille(
+                                &scale_peaks(peaks_for_slot(&wf_c, anchor_c, col_samp_c, buf_cols), gain_c),
+                                rows, buf_cols,
+                            ),
+                            bass_ratio:      spectral_for_slot(&wf_c, anchor_c, col_samp_c, buf_cols, sr_c as u32),
+                            tick:            compute_tick_display(buf_cols, col_samp_c, tick_view_start_c,
+                                                 bpm_c_raw == 0, f32::from_bits(bpm_c_raw), sr_c as u32, off_ms_c),
+                            cue_buf_col:     compute_cue_buf_col(cue_raw_c, anchor_c, col_samp_c),
+                            buf_cols,
+                            anchor_sample:   anchor_c,
+                            samples_per_col: col_samp_c,
+                        });
 
                         *shared_a_bg.lock().unwrap() = buf_a;
                         *shared_b_bg.lock().unwrap() = buf_b;
+                        *shared_c_bg.lock().unwrap() = buf_c;
 
                         last_cols       = cols;
                         last_rows       = rows;
                         last_zoom       = zoom;
                         last_col_samp_a = col_samp_a;
                         last_col_samp_b = col_samp_b;
+                        last_col_samp_c = col_samp_c;
                         last_anchor_a   = anchor_a;
                         last_anchor_b   = anchor_b;
+                        last_anchor_c   = anchor_c;
                         last_gen_a      = gen_a;
                         last_gen_b      = gen_b;
+                        last_gen_c      = gen_c;
                         last_bpm_a      = bpm_a_raw;
                         last_bpm_b      = bpm_b_raw;
+                        last_bpm_c      = bpm_c_raw;
                         last_off_a      = off_ms_a;
                         last_off_b      = off_ms_b;
+                        last_off_c      = off_ms_c;
                         last_cue_a      = cue_raw_a;
                         last_cue_b      = cue_raw_b;
+                        last_cue_c      = cue_raw_c;
                         last_gain_a     = gain_raw_a;
                         last_gain_b     = gain_raw_b;
+                        last_gain_c     = gain_raw_c;
                     }
 
                     thread::sleep(Duration::from_millis(8));
@@ -321,17 +407,17 @@ impl SharedDetailRenderer {
 
         SharedDetailRenderer {
             cols, rows, zoom_at,
-            sample_rate_a, sample_rate_b,
-            speed_ratio_a, speed_ratio_b,
-            waveform_a, waveform_b,
-            display_pos_a, display_pos_b,
-            channels_a, channels_b,
-            load_gen_a, load_gen_b,
-            bpm_a, bpm_b,
-            offset_ms_a, offset_ms_b,
-            cue_sample_a, cue_sample_b,
-            gain_a, gain_b,
-            shared_a, shared_b,
+            sample_rate_a, sample_rate_b, sample_rate_c,
+            speed_ratio_a, speed_ratio_b, speed_ratio_c,
+            waveform_a, waveform_b, waveform_c,
+            display_pos_a, display_pos_b, display_pos_c,
+            channels_a, channels_b, channels_c,
+            load_gen_a, load_gen_b, load_gen_c,
+            bpm_a, bpm_b, bpm_c,
+            offset_ms_a, offset_ms_b, offset_ms_c,
+            cue_sample_a, cue_sample_b, cue_sample_c,
+            gain_a, gain_b, gain_c,
+            shared_a, shared_b, shared_c,
             _stop_guard: stop_guard,
         }
     }
@@ -345,12 +431,19 @@ impl SharedDetailRenderer {
                 self.speed_ratio_a.store(65536, Ordering::Relaxed); // reset to 1.0 on load
                 self.load_gen_a.fetch_add(1, Ordering::Relaxed);
             }
-            _ => {
+            1 => {
                 *self.waveform_b.lock().unwrap() = Some(wf);
                 self.channels_b.store(channels as usize, Ordering::Relaxed);
                 self.sample_rate_b.store(sample_rate as usize, Ordering::Relaxed);
                 self.speed_ratio_b.store(65536, Ordering::Relaxed);
                 self.load_gen_b.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {
+                *self.waveform_c.lock().unwrap() = Some(wf);
+                self.channels_c.store(channels as usize, Ordering::Relaxed);
+                self.sample_rate_c.store(sample_rate as usize, Ordering::Relaxed);
+                self.speed_ratio_c.store(65536, Ordering::Relaxed);
+                self.load_gen_c.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -359,7 +452,8 @@ impl SharedDetailRenderer {
         let ratio = ((bpm / base_bpm) as f64 * 65536.0) as usize;
         match slot {
             0 => self.speed_ratio_a.store(ratio, Ordering::Relaxed),
-            _ => self.speed_ratio_b.store(ratio, Ordering::Relaxed),
+            1 => self.speed_ratio_b.store(ratio, Ordering::Relaxed),
+            _ => self.speed_ratio_c.store(ratio, Ordering::Relaxed),
         }
     }
 
@@ -367,7 +461,8 @@ impl SharedDetailRenderer {
         let raw = cue_sample.map_or(-1, |s| s as i64);
         match slot {
             0 => self.cue_sample_a.store(raw, Ordering::Relaxed),
-            _ => self.cue_sample_b.store(raw, Ordering::Relaxed),
+            1 => self.cue_sample_b.store(raw, Ordering::Relaxed),
+            _ => self.cue_sample_c.store(raw, Ordering::Relaxed),
         }
     }
 
@@ -378,9 +473,13 @@ impl SharedDetailRenderer {
                 self.bpm_a.store(bpm_raw, Ordering::Relaxed);
                 self.offset_ms_a.store(offset_ms, Ordering::Relaxed);
             }
-            _ => {
+            1 => {
                 self.bpm_b.store(bpm_raw, Ordering::Relaxed);
                 self.offset_ms_b.store(offset_ms, Ordering::Relaxed);
+            }
+            _ => {
+                self.bpm_c.store(bpm_raw, Ordering::Relaxed);
+                self.offset_ms_c.store(offset_ms, Ordering::Relaxed);
             }
         }
     }
@@ -388,8 +487,110 @@ impl SharedDetailRenderer {
     pub(crate) fn store_gain(&self, slot: usize, gain_linear: f32) {
         match slot {
             0 => self.gain_a.store(gain_linear.to_bits(), Ordering::Relaxed),
-            _ => self.gain_b.store(gain_linear.to_bits(), Ordering::Relaxed),
+            1 => self.gain_b.store(gain_linear.to_bits(), Ordering::Relaxed),
+            _ => self.gain_c.store(gain_linear.to_bits(), Ordering::Relaxed),
         }
+    }
+
+    /// Swap all rendering state between two deck slots. Called when the user swaps decks.
+    pub(crate) fn swap_slots(&self, slot_x: usize, slot_y: usize) {
+        let swap_atomic_usize = |a: &AtomicUsize, b: &AtomicUsize| {
+            let va = a.load(Ordering::Relaxed);
+            let vb = b.load(Ordering::Relaxed);
+            a.store(vb, Ordering::Relaxed);
+            b.store(va, Ordering::Relaxed);
+        };
+        let swap_atomic_u32 = |a: &AtomicU32, b: &AtomicU32| {
+            let va = a.load(Ordering::Relaxed);
+            let vb = b.load(Ordering::Relaxed);
+            a.store(vb, Ordering::Relaxed);
+            b.store(va, Ordering::Relaxed);
+        };
+        let swap_atomic_i64 = |a: &AtomicI64, b: &AtomicI64| {
+            let va = a.load(Ordering::Relaxed);
+            let vb = b.load(Ordering::Relaxed);
+            a.store(vb, Ordering::Relaxed);
+            b.store(va, Ordering::Relaxed);
+        };
+        let swap_waveform = |wa: &Mutex<Option<Arc<WaveformData>>>, wb: &Mutex<Option<Arc<WaveformData>>>| {
+            let mut ga = wa.lock().unwrap();
+            let mut gb = wb.lock().unwrap();
+            std::mem::swap(&mut *ga, &mut *gb);
+        };
+        let swap_buffer = |ba: &Mutex<Arc<BrailleBuffer>>, bb: &Mutex<Arc<BrailleBuffer>>| {
+            let mut ga = ba.lock().unwrap();
+            let mut gb = bb.lock().unwrap();
+            std::mem::swap(&mut *ga, &mut *gb);
+        };
+
+        let (sr_x, sr_y) = match (slot_x, slot_y) {
+            (0, 1) | (1, 0) => (&self.sample_rate_a, &self.sample_rate_b),
+            (1, 2) | (2, 1) => (&self.sample_rate_b, &self.sample_rate_c),
+            (0, 2) | (2, 0) => (&self.sample_rate_a, &self.sample_rate_c),
+            _ => return,
+        };
+        let (ratio_x, ratio_y) = match (slot_x, slot_y) {
+            (0, 1) | (1, 0) => (&self.speed_ratio_a, &self.speed_ratio_b),
+            (1, 2) | (2, 1) => (&self.speed_ratio_b, &self.speed_ratio_c),
+            _ => (&self.speed_ratio_a, &self.speed_ratio_c),
+        };
+        let (wf_x, wf_y) = match (slot_x, slot_y) {
+            (0, 1) | (1, 0) => (&self.waveform_a, &self.waveform_b),
+            (1, 2) | (2, 1) => (&self.waveform_b, &self.waveform_c),
+            _ => (&self.waveform_a, &self.waveform_c),
+        };
+        let (pos_x, pos_y) = match (slot_x, slot_y) {
+            (0, 1) | (1, 0) => (&self.display_pos_a, &self.display_pos_b),
+            (1, 2) | (2, 1) => (&self.display_pos_b, &self.display_pos_c),
+            _ => (&self.display_pos_a, &self.display_pos_c),
+        };
+        let (ch_x, ch_y) = match (slot_x, slot_y) {
+            (0, 1) | (1, 0) => (&self.channels_a, &self.channels_b),
+            (1, 2) | (2, 1) => (&self.channels_b, &self.channels_c),
+            _ => (&self.channels_a, &self.channels_c),
+        };
+        let (gen_x, gen_y) = match (slot_x, slot_y) {
+            (0, 1) | (1, 0) => (&self.load_gen_a, &self.load_gen_b),
+            (1, 2) | (2, 1) => (&self.load_gen_b, &self.load_gen_c),
+            _ => (&self.load_gen_a, &self.load_gen_c),
+        };
+        let (bpm_x, bpm_y) = match (slot_x, slot_y) {
+            (0, 1) | (1, 0) => (&self.bpm_a, &self.bpm_b),
+            (1, 2) | (2, 1) => (&self.bpm_b, &self.bpm_c),
+            _ => (&self.bpm_a, &self.bpm_c),
+        };
+        let (off_x, off_y) = match (slot_x, slot_y) {
+            (0, 1) | (1, 0) => (&self.offset_ms_a, &self.offset_ms_b),
+            (1, 2) | (2, 1) => (&self.offset_ms_b, &self.offset_ms_c),
+            _ => (&self.offset_ms_a, &self.offset_ms_c),
+        };
+        let (cue_x, cue_y) = match (slot_x, slot_y) {
+            (0, 1) | (1, 0) => (&self.cue_sample_a, &self.cue_sample_b),
+            (1, 2) | (2, 1) => (&self.cue_sample_b, &self.cue_sample_c),
+            _ => (&self.cue_sample_a, &self.cue_sample_c),
+        };
+        let (gain_x, gain_y) = match (slot_x, slot_y) {
+            (0, 1) | (1, 0) => (&self.gain_a, &self.gain_b),
+            (1, 2) | (2, 1) => (&self.gain_b, &self.gain_c),
+            _ => (&self.gain_a, &self.gain_c),
+        };
+        let (buf_x, buf_y) = match (slot_x, slot_y) {
+            (0, 1) | (1, 0) => (&self.shared_a, &self.shared_b),
+            (1, 2) | (2, 1) => (&self.shared_b, &self.shared_c),
+            _ => (&self.shared_a, &self.shared_c),
+        };
+
+        swap_atomic_usize(sr_x, sr_y);
+        swap_atomic_usize(ratio_x, ratio_y);
+        swap_waveform(wf_x, wf_y);
+        swap_atomic_usize(pos_x, pos_y);
+        swap_atomic_usize(ch_x, ch_y);
+        swap_atomic_usize(gen_x, gen_y);
+        swap_atomic_u32(bpm_x, bpm_y);
+        swap_atomic_i64(off_x, off_y);
+        swap_atomic_i64(cue_x, cue_y);
+        swap_atomic_u32(gain_x, gain_y);
+        swap_buffer(buf_x, buf_y);
     }
 }
 
@@ -1357,7 +1558,7 @@ pub(crate) fn render_shared_tick_row(
 }
 
 pub(crate) fn render_keyboard_help(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
-    const TEXT_W: u16 = 77;
+    const TEXT_W: u16 = 87;
     const TEXT_H: u16 = 12;
     const H_PAD:  u16 = 2;
     const V_PAD:  u16 = 1;
@@ -1394,7 +1595,7 @@ pub(crate) fn render_keyboard_help(frame: &mut ratatui::Frame, area: ratatui::la
     let row6 = Line::from(vec![
         Span::styled("    ╭         ╭         ╭ +Tick   ", g),
         Span::styled("╭", wh),
-        Span::styled(" -BsBPM  ╭         ┆   ╭ +Gain   ╭ +Gain", g),
+        Span::styled(" -BsBPM  ╭         ┆   ╭ +Gain   ╭ +Gain   ╭ +Gain", g),
     ]);
     // Row 7: F in bold green, +Ndge and -BPM in green
     let row7 = Line::from(vec![
@@ -1404,7 +1605,7 @@ pub(crate) fn render_keyboard_help(frame: &mut ratatui::Frame, area: ratatui::la
         Span::styled("F", wh),
         Span::styled(" ", g),
         Span::styled("-BPM", gr),
-        Span::styled("    G         ┆   J +Lvl    K +Lvl", g),
+        Span::styled("    G         ┆   J +Lvl    K +Lvl    L +Lvl", g),
     ]);
     // Row 8: F's ╰ bracket in white, Brows and Play in blue (Space-modifier actions)
     let row8 = Line::from(vec![
@@ -1414,7 +1615,7 @@ pub(crate) fn render_keyboard_help(frame: &mut ratatui::Frame, area: ratatui::la
         Span::styled("╰", wh),
         Span::styled(" ", g),
         Span::styled("Play", bl),
-        Span::styled("    ╰ PFLTog  ┆   ╰ 100%    ╰ 100%", g),
+        Span::styled("    ╰ PFLTog  ┆   ╰ 100%    ╰ 100%    ╰ 100%", g),
     ]);
     // Row 10: -Ndge and +BPM in green
     let row10 = Line::from(vec![
@@ -1422,22 +1623,22 @@ pub(crate) fn render_keyboard_help(frame: &mut ratatui::Frame, area: ratatui::la
         Span::styled("-Ndge", gr),
         Span::styled("   V ", g),
         Span::styled("+BPM", gr),
-        Span::styled("    B Tap     ┆   M -Lvl    , -Lvl", g),
+        Span::styled("    B Tap     ┆   M -Lvl    , -Lvl    . -Lvl", g),
     ]);
 
     let lines: Vec<Line<'static>> = vec![
-        Line::styled("╭         ╭         ╭         ╭ +32b    ╭ +64b    ┆   ╭ +Slp    ╭ +Slp", g),
-        Line::styled("1 +1bt    2 +1b     3 +4b     4 +8b     5 +16b    ┆   7 HPF     8 HPF", g),
-        Line::styled("╰ SelD1   ╰ SelD2   ╰         ╰         ╰         ┆   ╰ Flt=    ╰ Flt=", g),
-        Line::styled("  ╭         ╭         ╭         ╭ -32b    ╭ -64b    ┆   ╭ -Slp    ╭ -Slp", g),
-        Line::styled("  Q -1bt    W -1b     E -4b     R -8b     T -16b    ┆   U LPF     I LPF", g),
-        Line::styled("  ╰         ╰         ╰ CueSt   ╰ CueJp   ╰         ┆   ╰ Flt=    ╰ Flt=", g),
+        Line::styled("╭         ╭         ╭         ╭ +32b    ╭ +64b    ┆   ╭ +Slp    ╭ +Slp    ╭ +Slp", g),
+        Line::styled("1 +1bt    2 +1b     3 +4b     4 +8b     5 +16b    ┆   7 HPF     8 HPF     9 HPF", g),
+        Line::styled("╰ SelD1   ╰ SelD2   ╰ SelD3   ╰         ╰         ┆   ╰ Flt=    ╰ Flt=    ╰ Flt=", g),
+        Line::styled("  ╭         ╭         ╭         ╭ -32b    ╭ -64b    ┆   ╭ -Slp    ╭ -Slp    ╭ -Slp", g),
+        Line::styled("  Q -1bt    W -1b     E -4b     R -8b     T -16b    ┆   U LPF     I LPF     O LPF", g),
+        Line::styled("  ╰         ╰         ╰ CueSt   ╰ CueJp   ╰         ┆   ╰ Flt=    ╰ Flt=    ╰ Flt=", g),
         row6,
         row7,
         row8,
-        Line::styled("      ╭         ╭         ╭ -Tick   ╭ +BsBPM  ╭         ┆   ╭ -Gain   ╭ -Gain", g),
+        Line::styled("      ╭         ╭         ╭ -Tick   ╭ +BsBPM  ╭         ┆   ╭ -Gain   ╭ -Gain   ╭ -Gain", g),
         row10,
-        Line::styled("      ╰ +Ptch   ╰ Rst     ╰         ╰ Metro   ╰ BDtct   ┆   ╰ 0%      ╰ 0%", g),
+        Line::styled("      ╰ +Ptch   ╰ Rst     ╰         ╰ Metro   ╰ BDtct   ┆   ╰ 0%      ╰ 0%      ╰ 0%", g),
     ];
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(Color::Rgb(15, 15, 15))),

@@ -327,8 +327,8 @@ fn tui_loop(
             expires: Instant::now() + NOTIFICATION_TIMEOUT,
         });
     }
-    let mut decks: [Option<Deck>; 2] = [None, None];
-    let mut pending_loads: [Option<PendingLoad>; 2] = [initial_load, None];
+    let mut decks: [Option<Deck>; 3] = [None, None, None];
+    let mut pending_loads: [Option<PendingLoad>; 3] = [initial_load, None, None];
     if pending_loads[0].is_none() && global_notification.is_none() {
         global_notification = Some(Notification {
             message: "No track loaded — press z to open the file browser".to_string(),
@@ -410,7 +410,7 @@ fn tui_loop(
             global_notification = None;
         }
         // Complete any pending loads.
-        for slot in 0..2 {
+        for slot in 0..3 {
             if pending_loads[slot].is_none() { continue; }
             let recv = pending_loads[slot].as_ref().unwrap().rx.try_recv();
             match recv {
@@ -436,13 +436,13 @@ fn tui_loop(
             }
         }
 
-        // Service both decks: BPM results, position, metronome, tap timeout, spectrum.
-        for slot in 0..2 {
+        // Service all three decks: BPM results, position, metronome, tap timeout, spectrum.
+        for slot in 0..3 {
             service_deck_frame(slot, &mut decks, col_secs, frame_dur, elapsed, mixer, &shared_renderer, cache, audio_latency_ms, vinyl_mode);
         }
 
-        // Compute render state for both decks.
-        let render: [Option<DeckRenderState>; 2] = std::array::from_fn(|slot| {
+        // Compute render state for all three decks.
+        let render: [Option<DeckRenderState>; 3] = std::array::from_fn(|slot| {
             let d = decks[slot].as_ref()?;
             // Latency correction only applies during playback — when paused there is
             // no buffer fill ahead, so the raw position is the heard position.
@@ -450,10 +450,10 @@ fn tui_loop(
             let display_samp = (d.display.smooth_display_samp - latency_correction).max(0.0);
             let display_pos_samp = display_samp as usize;
             let pos_interleaved  = display_pos_samp * d.audio.seek_handle.channels as usize;
-            if slot == 0 {
-                shared_renderer.display_pos_a.store(pos_interleaved, Ordering::Relaxed);
-            } else {
-                shared_renderer.display_pos_b.store(pos_interleaved, Ordering::Relaxed);
+            match slot {
+                0 => shared_renderer.display_pos_a.store(pos_interleaved, Ordering::Relaxed),
+                1 => shared_renderer.display_pos_b.store(pos_interleaved, Ordering::Relaxed),
+                _ => shared_renderer.display_pos_c.store(pos_interleaved, Ordering::Relaxed),
             }
             let spinner_active = d.tempo.analysis_hash.is_none();
             let analysing      = vinyl_mode || spinner_active || !d.tempo.bpm_established;
@@ -477,15 +477,18 @@ fn tui_loop(
         shared_renderer.zoom_at.store(zoom_idx, Ordering::Relaxed);
         let buf_a = Arc::clone(&*shared_renderer.shared_a.lock().unwrap());
         let buf_b = Arc::clone(&*shared_renderer.shared_b.lock().unwrap());
+        let buf_c = Arc::clone(&*shared_renderer.shared_c.lock().unwrap());
         let scrub_spc_a = buf_a.samples_per_col;
         let scrub_spc_b = buf_b.samples_per_col;
+        let scrub_spc_c = buf_c.samples_per_col;
 
-        // Take both decks out so the draw closure can mutate them.
+        // Take all three decks out so the draw closure can mutate them.
         let mut d0 = decks[0].take();
         let mut d1 = decks[1].take();
+        let mut d2 = decks[2].take();
 
         // Compute loading labels for slots that have a pending load but no deck.
-        let loading_label: [Option<String>; 2] = std::array::from_fn(|slot| {
+        let loading_label: [Option<String>; 3] = std::array::from_fn(|slot| {
             let p = pending_loads[slot].as_ref()?;
             let done  = p.decoded.load(Ordering::Relaxed);
             let total = p.total.load(Ordering::Relaxed);
@@ -509,36 +512,36 @@ fn tui_loop(
             const OV_MIN:  u16 = 2;
             let det_max = detail_height as u16;
             let ih = inner.height;
-            let fixed = 7_u16; // global + detail-info + shared-tick + notif×2 + info×2
+            let fixed = 10_u16; // global + detail-info + shared-tick×2 + notif×3 + info×3
 
             // Cap detail_height to what the current terminal can actually display,
             // so HeightIncrease never outruns the screen.
-            max_det_h = (ih.saturating_sub(fixed + OV_MIN * 2) / 2) as usize;
+            max_det_h = (ih.saturating_sub(fixed + OV_MIN * 3) / 3) as usize;
 
-            // Compute a unified pool for each waveform type so both decks always
+            // Compute a unified pool for each waveform type so all three decks always
             // get the same height (no sequential-allocation asymmetry).
             // Phase 1: detail compresses; overviews stay at OV_MAX.
             // Phase 2: overviews compress; detail stays at DET_MIN.
             // Phase 3: items fall off bottom (heights stay at minimums).
             let total_variable = ih.saturating_sub(fixed);
-            let det_full = det_max * 2;
-            let ov_full  = OV_MAX * 2;
+            let det_full = det_max * 3;
+            let ov_full  = OV_MAX * 3;
 
-            let (both_det, both_ov) = if total_variable >= det_full + ov_full {
+            let (all_det, all_ov) = if total_variable >= det_full + ov_full {
                 (det_full, ov_full)
-            } else if total_variable >= DET_MIN * 2 + ov_full {
+            } else if total_variable >= DET_MIN * 3 + ov_full {
                 (total_variable - ov_full, ov_full)
-            } else if total_variable >= DET_MIN * 2 + OV_MIN * 2 {
-                (DET_MIN * 2, total_variable - DET_MIN * 2)
+            } else if total_variable >= DET_MIN * 3 + OV_MIN * 3 {
+                (DET_MIN * 3, total_variable - DET_MIN * 3)
             } else {
-                let d = total_variable.min(DET_MIN * 2);
+                let d = total_variable.min(DET_MIN * 3);
                 (d, total_variable.saturating_sub(d))
             };
 
             // Clamp to minimums: the pool calculation drives compression through
             // the normal phase range; below minimum, take_h handles falloff.
-            let effective_det_h = (both_det / 2).max(DET_MIN).min(det_max);
-            let effective_ov_h  = (both_ov  / 2).clamp(OV_MIN, OV_MAX);
+            let effective_det_h = (all_det / 3).max(DET_MIN).min(det_max);
+            let effective_ov_h  = (all_ov  / 3).clamp(OV_MIN, OV_MAX);
 
             // Allocate rows top-to-bottom using take_exact for all waveform rows:
             // each waveform shows at its computed height or disappears entirely.
@@ -555,28 +558,37 @@ fn tui_loop(
                 actual
             };
             let hh = [
-                take(&mut rem, 1),                      // 0: global bar
-                take(&mut rem, 1),                      // 1: detail info bar
-                take_consume(&mut rem, effective_det_h), // 2: detail A
-                take(&mut rem, 1),                      // 3: shared tick row
-                take_consume(&mut rem, effective_det_h), // 4: detail B
-                take(&mut rem, 1),                      // 5: notif A
-                take(&mut rem, 1),                      // 6: info A
-                take_consume(&mut rem, effective_ov_h),  // 7: overview A
-                take(&mut rem, 1),                      // 8: notif B
-                take(&mut rem, 1),                      // 9: info B
-                take_consume(&mut rem, effective_ov_h),  // 10: overview B
-                rem,                                    // 11: spacer (leftover)
+                take(&mut rem, 1),                       // 0:  global bar
+                take(&mut rem, 1),                       // 1:  detail info bar
+                take_consume(&mut rem, effective_det_h),  // 2:  detail A
+                take(&mut rem, 1),                       // 3:  shared tick row A/B
+                take_consume(&mut rem, effective_det_h),  // 4:  detail B
+                take(&mut rem, 1),                       // 5:  shared tick row B/C
+                take_consume(&mut rem, effective_det_h),  // 6:  detail C
+                take(&mut rem, 1),                       // 7:  notif A
+                take(&mut rem, 1),                       // 8:  info A
+                take_consume(&mut rem, effective_ov_h),   // 9:  overview A
+                take(&mut rem, 1),                       // 10: notif B
+                take(&mut rem, 1),                       // 11: info B
+                take_consume(&mut rem, effective_ov_h),   // 12: overview B
+                take(&mut rem, 1),                       // 13: notif C
+                take(&mut rem, 1),                       // 14: info C
+                take_consume(&mut rem, effective_ov_h),   // 15: overview C
+                rem,                                     // 16: spacer (leftover)
             ];
 
             let c = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints(hh.map(Constraint::Length))
                 .split(inner);
-            let (area_detail_info, area_detail_a, area_tick,
-                 area_detail_b, area_notif_a, area_info_a, area_overview_a,
+            let (area_detail_info, area_detail_a, area_tick_ab,
+                 area_detail_b, area_tick_bc, area_detail_c,
+                 area_notif_a, area_info_a, area_overview_a,
                  area_notif_b, area_info_b, area_overview_b,
-                 area_global) = (c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[0]);
+                 area_notif_c, area_info_c, area_overview_c,
+                 area_global) = (c[1], c[2], c[3], c[4], c[5], c[6],
+                                 c[7], c[8], c[9], c[10], c[11], c[12],
+                                 c[13], c[14], c[15], c[0]);
 
             // Update renderer dimensions from layout.
             {
@@ -590,7 +602,7 @@ fn tui_loop(
 
             // Update tempo and cue state for background buffer rendering.
             // In vinyl mode: suppress ticks (analysing=true) and cue column.
-            for (slot, deck) in [(0usize, d0.as_ref()), (1, d1.as_ref())] {
+            for (slot, deck) in [(0usize, d0.as_ref()), (1, d1.as_ref()), (2, d2.as_ref())] {
                 let (base_bpm, offset_ms, analysing, cue_sample) = deck.map(|d| {
                     let analysing = vinyl_mode || d.tempo.analysis_hash.is_none() || !d.tempo.bpm_established;
                     let cue = if vinyl_mode { None } else { d.cue_sample };
@@ -602,7 +614,7 @@ fn tui_loop(
 
             // Detail info bar
             {
-                let nudge_label = match d0.as_ref().or(d1.as_ref()).map(|d| d.nudge_mode) {
+                let nudge_label = match d0.as_ref().or(d1.as_ref()).or(d2.as_ref()).map(|d| d.nudge_mode) {
                     Some(NudgeMode::Warp) => "  [WARP]",
                     _ => "  [JUMP]",
                 };
@@ -620,15 +632,18 @@ fn tui_loop(
             let label_style = Style::default().fg(Color::Rgb(40, 60, 100));
             let notif_bg    = Style::default().bg(Color::Rgb(20, 20, 38));
 
-            // Extract tick viewport slices for the shared tick row.
-            let tick_w = area_tick.width as usize;
+            // Extract tick viewport slices for both shared tick rows.
+            let tick_w = area_tick_ab.width as usize;
             let tick_centre = ((tick_w as f64 * display_cfg.playhead_position as f64 / 100.0) as usize)
                 .clamp(0, tick_w.saturating_sub(1));
             let pos_a = render[0].as_ref().map(|rs| rs.display_pos_samp).unwrap_or(0);
             let pos_b = render[1].as_ref().map(|rs| rs.display_pos_samp).unwrap_or(0);
+            let pos_c = render[2].as_ref().map(|rs| rs.display_pos_samp).unwrap_or(0);
             let tick_a = extract_tick_viewport(&buf_a, pos_a, tick_centre, tick_w);
             let tick_b = extract_tick_viewport(&buf_b, pos_b, tick_centre, tick_w);
-            render_shared_tick_row(frame, area_tick, &tick_a, &tick_b);
+            let tick_c = extract_tick_viewport(&buf_c, pos_c, tick_centre, tick_w);
+            render_shared_tick_row(frame, area_tick_ab, &tick_a, &tick_b);
+            render_shared_tick_row(frame, area_tick_bc, &tick_b, &tick_c);
 
             // ---- Deck 1 ----
             if let (Some(deck), Some(rs)) = (&mut d0, &render[0]) {
@@ -688,6 +703,35 @@ fn tui_loop(
                 render_detail_empty(frame, area_detail_b, 1);
             }
 
+            // ---- Deck 3 ----
+            if let (Some(deck), Some(rs)) = (&mut d2, &render[2]) {
+                let content = notification_line_for_deck(deck, area_notif_c.width.saturating_sub(2) as usize, vinyl_mode);
+                let num3_style = if selected_deck == 2 { Style::default().fg(Color::Yellow) } else { label_style };
+                let mut spans = vec![Span::styled("3", num3_style), Span::styled(" ", label_style)];
+                spans.extend(content.spans);
+                frame.render_widget(Paragraph::new(Line::from(spans)).style(notif_bg), area_notif_c);
+                let info = info_line_for_deck(deck, frame_count, rs.beat_on, rs.spinner_active, label_style, area_info_c.width, vinyl_mode);
+                frame.render_widget(Paragraph::new(info), area_info_c);
+                let (ov, bar_cols, bar_times) = overview_for_deck(deck, area_overview_c, rs.display_samp, rs.analysing, rs.warning_active, rs.warn_beat_on);
+                deck.display.overview_rect  = area_overview_c;
+                deck.display.last_bar_cols  = bar_cols;
+                deck.display.last_bar_times = bar_times;
+                frame.render_widget(Paragraph::new(ov), area_overview_c);
+                render_detail_waveform(frame, &buf_c, deck, area_detail_c, &display_cfg, rs.display_pos_samp, deck.display.palette);
+            } else {
+                let num3_style = if selected_deck == 2 { Style::default().fg(Color::Yellow) } else { label_style };
+                let mut spans = vec![Span::styled("3", num3_style), Span::styled(" ", label_style)];
+                if let Some(ref s) = loading_label[2] {
+                    spans.push(Span::styled(s.clone(), Style::default().fg(Color::DarkGray)));
+                } else {
+                    spans.extend(notification_line_empty().spans);
+                }
+                frame.render_widget(Paragraph::new(Line::from(spans)).style(notif_bg), area_notif_c);
+                frame.render_widget(Paragraph::new(info_line_empty(area_info_c.width)), area_info_c);
+                frame.render_widget(Paragraph::new(overview_empty(area_overview_c, 2)), area_overview_c);
+                render_detail_empty(frame, area_detail_c, 2);
+            }
+
             // ---- Global status bar ----
             {
                 if pending_quit.map_or(false, |e| Instant::now() > e) { pending_quit = None; }
@@ -741,27 +785,27 @@ fn tui_loop(
 
             // ---- Browser / cover art (spacer row) ----
             if let Some((ref bs, slot)) = browser_state {
-                if c[11].height >= 8 {
-                    render_browser(frame, c[11], bs, slot);
+                if c[16].height >= 8 {
+                    render_browser(frame, c[16], bs, slot);
                 } else {
                     // Art area too small — render browser fullscreen.
                     frame.render_widget(ratatui::widgets::Clear, inner);
                     render_browser(frame, inner, bs, slot);
                 }
-            } else if c[11].height >= 3 && art_bright_idx < 2 {
+            } else if c[16].height >= 3 && art_bright_idx < 2 {
                 let brightness = [1.0f32, 0.35, 0.0][art_bright_idx as usize];
                 // 1-row top margin separates art from deck 2 above.
                 let vert = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Length(1), Constraint::Min(0)])
-                    .split(c[11]);
+                    .split(c[16]);
                 let art_row = vert[1];
-                // 1-column centre gap between the two panels.
+                // 1-column gaps between the three panels.
                 let art_areas = Layout::default()
                     .direction(Direction::Horizontal)
-                    .constraints([Constraint::Fill(1), Constraint::Length(1), Constraint::Fill(1)])
+                    .constraints([Constraint::Fill(1), Constraint::Length(1), Constraint::Fill(1), Constraint::Length(1), Constraint::Fill(1)])
                     .split(art_row);
-                for (idx, deck_opt) in [&mut d0, &mut d1].iter_mut().enumerate() {
+                for (idx, deck_opt) in [&mut d0, &mut d1, &mut d2].iter_mut().enumerate() {
                     let panel_idx = idx * 2; // indices 0 and 2; index 1 is the gap
                     if let Some(deck) = deck_opt {
                         if let Some(ref bytes) = deck.cover_art {
@@ -782,11 +826,11 @@ fn tui_loop(
 
             // Keyboard help overlay — drawn on top of art; skipped when browser is open
             if keyboard_help_open && browser_state.is_none() {
-                render_keyboard_help(frame, c[11]);
+                render_keyboard_help(frame, c[16]);
             }
 
             // Tag editor overlay
-            for deck_opt in [&d0, &d1] {
+            for deck_opt in [&d0, &d1, &d2] {
                 if let Some(deck) = deck_opt {
                     if let Some(ref editor) = deck.tag_editor {
                         render_tag_editor(frame, editor, area);
@@ -805,7 +849,10 @@ fn tui_loop(
 /                    album art                    ~  palette cycle
 Space+/              keyboard layout
 ?                    toggle this help
-Esc                  close this / quit";
+Esc                  close this / quit
+── Decks ────────────────────────────────────────────────────────────────
+Space+1/2/3          select deck
+Space+= / Space+-    swap decks 1↔2 / 2↔3";
                 let popup_w = 86u16;
                 let popup_h = HELP.lines().count() as u16 + 2;
                 let px = area.x + area.width.saturating_sub(popup_w) / 2;
@@ -825,9 +872,10 @@ Esc                  close this / quit";
             }
         })?;
 
-        // Put both decks back after render.
+        // Put all three decks back after render.
         decks[0] = d0;
         decks[1] = d1;
+        decks[2] = d2;
 
         // Single event handler — all actions work regardless of which deck is loaded.
         while event::poll(Duration::ZERO)? {
@@ -838,7 +886,7 @@ Esc                  close this / quit";
                 if mouse_event.kind == MouseEventKind::Down(MouseButton::Left) {
                     let col = mouse_event.column as usize;
                     let row = mouse_event.row as usize;
-                    for slot in 0..2 {
+                    for slot in 0..3 {
                         if let Some(ref d) = decks[slot] {
                             let rect = d.display.overview_rect;
                             if col >= rect.x as usize && col < (rect.x + rect.width) as usize
@@ -869,7 +917,7 @@ Esc                  close this / quit";
             Event::Key(key) => {
                 // Ctrl-C: unconditional quit.
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    for slot in 0..2 {
+                    for slot in 0..3 {
                         if let Some(ref d) = decks[slot] {
                             d.audio.player.stop();
                             if let Some(ref hash) = d.tempo.analysis_hash {
@@ -885,7 +933,7 @@ Esc                  close this / quit";
                     let editor_open = decks.iter().flatten().any(|d| d.tag_editor.is_some());
                     if editor_open {
                         if let KeyEventKind::Press = key.kind {
-                            for slot in 0..2 {
+                            for slot in 0..3 {
                                 if let Some(ref mut d) = decks[slot] {
                                     if let Some(ref mut editor) = d.tag_editor {
                                         match key.code {
@@ -1093,7 +1141,7 @@ Esc                  close this / quit";
                         Some(BrowserResult::Quit) => {
                             *browser_dir = bs.cwd.clone();
                             cache.set_last_browser_path(browser_dir);
-                            for slot in 0..2 { if let Some(ref d) = decks[slot] { d.audio.player.stop(); } }
+                            for slot in 0..3 { if let Some(ref d) = decks[slot] { d.audio.player.stop(); } }
                             cache.save();
                             return Ok(());
                         }
@@ -1125,7 +1173,7 @@ Esc                  close this / quit";
                                 NudgeMode::Warp => NudgeMode::Jump,
                             })
                             .unwrap_or(NudgeMode::Jump);
-                        for slot in 0..2 {
+                        for slot in 0..3 {
                             if let Some(ref mut d) = decks[slot] {
                                 if d.nudge != 0 {
                                     d.nudge = 0;
@@ -1161,7 +1209,7 @@ Esc                  close this / quit";
                     KeyEventKind::Press | KeyEventKind::Repeat
                         if !space_held && keymap.get(&KeyBinding::Key(key.code)) == Some(&Action::NudgeBackward) =>
                     {
-                        let scrub_spc = [scrub_spc_a, scrub_spc_b][selected_deck];
+                        let scrub_spc = [scrub_spc_a, scrub_spc_b, scrub_spc_c][selected_deck];
                         if let Some(ref mut d) = decks[selected_deck] {
                             match d.nudge_mode {
                                 NudgeMode::Jump => {
@@ -1184,7 +1232,7 @@ Esc                  close this / quit";
                     KeyEventKind::Press | KeyEventKind::Repeat
                         if !space_held && keymap.get(&KeyBinding::Key(key.code)) == Some(&Action::NudgeForward) =>
                     {
-                        let scrub_spc = [scrub_spc_a, scrub_spc_b][selected_deck];
+                        let scrub_spc = [scrub_spc_a, scrub_spc_b, scrub_spc_c][selected_deck];
                         if let Some(ref mut d) = decks[selected_deck] {
                             match d.nudge_mode {
                                 NudgeMode::Jump => {
@@ -1274,7 +1322,7 @@ Esc                  close this / quit";
                     if pending_quit.is_some() {
                         pending_quit = None;
                         if matches!(key.code, KeyCode::Char('y') | KeyCode::Enter) {
-                            for slot in 0..2 {
+                            for slot in 0..3 {
                                 if let Some(ref d) = decks[slot] {
                                     d.audio.player.stop();
                                     if let Some(ref hash) = d.tempo.analysis_hash {
@@ -1296,7 +1344,7 @@ Esc                  close this / quit";
                     }
                     // BPM confirmation intercept — check both decks.
                     let mut bpm_intercepted = false;
-                    for slot in 0..2 {
+                    for slot in 0..3 {
                         if let Some(ref mut d) = decks[slot] {
                             if let Some((hash, p_bpm, p_offset, _)) = d.tempo.pending_bpm.take() {
                                 if matches!(key.code, KeyCode::Char('y') | KeyCode::Enter) {
@@ -1322,7 +1370,7 @@ Esc                  close this / quit";
                     // Rename offer — 'y' and 'h' are intercepted when offer is visible;
                     // any other key dismisses the offer and falls through to normal handling.
                     let mut rename_offer_consumed = false;
-                    for slot in 0..2 {
+                    for slot in 0..3 {
                         if let Some(ref mut d) = decks[slot] {
                             if d.rename_offer_active() {
                                 match key.code {
@@ -1379,7 +1427,7 @@ Esc                  close this / quit";
                             pending_quit = Some(Instant::now() + Duration::from_secs(5));
                             continue 'tui;
                         }
-                        for slot in 0..2 {
+                        for slot in 0..3 {
                             if let Some(ref d) = decks[slot] {
                                 d.audio.player.stop();
                                 if let Some(ref hash) = d.tempo.analysis_hash {
@@ -1393,6 +1441,7 @@ Esc                  close this / quit";
                     }
                     Some(Action::SelectDeck1) => { selected_deck = 0; }
                     Some(Action::SelectDeck2) => { selected_deck = 1; }
+                    Some(Action::SelectDeck3) => { selected_deck = 2; }
                     Some(Action::OpenBrowser) => {
                         let target = selected_deck;
                         let playing = decks[target].as_ref().map_or(false, |d| !d.audio.player.is_paused());
@@ -1430,19 +1479,21 @@ Esc                  close this / quit";
                     Some(Action::Deck2LevelDown)  => { if let Some(ref mut d) = decks[1] { d.mixer.volume = (d.mixer.volume - 0.05).max(0.0); d.audio.deck_volume_atomic.store(d.mixer.volume.to_bits(), Ordering::Relaxed); if pfl_active_deck.load(Ordering::Relaxed) != 1 { d.audio.player.set_volume(d.mixer.volume); } } }
                     Some(Action::Deck2LevelMax)   => { if let Some(ref mut d) = decks[1] { d.mixer.volume = 1.0; d.audio.deck_volume_atomic.store(d.mixer.volume.to_bits(), Ordering::Relaxed); if pfl_active_deck.load(Ordering::Relaxed) != 1 { d.audio.player.set_volume(d.mixer.volume); } } }
                     Some(Action::Deck2LevelMin)   => { if let Some(ref mut d) = decks[1] { d.mixer.volume = 0.0; d.audio.deck_volume_atomic.store(d.mixer.volume.to_bits(), Ordering::Relaxed); if pfl_active_deck.load(Ordering::Relaxed) != 1 { d.audio.player.set_volume(d.mixer.volume); } } }
+                    Some(Action::Deck3LevelUp)    => { if let Some(ref mut d) = decks[2] { d.mixer.volume = (d.mixer.volume + 0.05).min(1.0); d.audio.deck_volume_atomic.store(d.mixer.volume.to_bits(), Ordering::Relaxed); if pfl_active_deck.load(Ordering::Relaxed) != 2 { d.audio.player.set_volume(d.mixer.volume); } } }
+                    Some(Action::Deck3LevelDown)  => { if let Some(ref mut d) = decks[2] { d.mixer.volume = (d.mixer.volume - 0.05).max(0.0); d.audio.deck_volume_atomic.store(d.mixer.volume.to_bits(), Ordering::Relaxed); if pfl_active_deck.load(Ordering::Relaxed) != 2 { d.audio.player.set_volume(d.mixer.volume); } } }
+                    Some(Action::Deck3LevelMax)   => { if let Some(ref mut d) = decks[2] { d.mixer.volume = 1.0; d.audio.deck_volume_atomic.store(d.mixer.volume.to_bits(), Ordering::Relaxed); if pfl_active_deck.load(Ordering::Relaxed) != 2 { d.audio.player.set_volume(d.mixer.volume); } } }
+                    Some(Action::Deck3LevelMin)   => { if let Some(ref mut d) = decks[2] { d.mixer.volume = 0.0; d.audio.deck_volume_atomic.store(d.mixer.volume.to_bits(), Ordering::Relaxed); if pfl_active_deck.load(Ordering::Relaxed) != 2 { d.audio.player.set_volume(d.mixer.volume); } } }
                     Some(Action::PflOnOff) => {
-                        let other = 1 - selected_deck;
                         if pfl_active_deck.load(Ordering::Relaxed) == selected_deck {
                             if let Some(ref mut d) = decks[selected_deck] { d.mixer.pfl_level = 0; d.audio.pfl_level.store(0, Ordering::Relaxed); d.audio.player.set_volume(d.mixer.volume); }
                             pfl_active_deck.store(usize::MAX, Ordering::Relaxed);
                         } else {
-                            if let Some(ref mut d) = decks[other] { d.mixer.pfl_level = 0; d.audio.pfl_level.store(0, Ordering::Relaxed); d.audio.player.set_volume(d.mixer.volume); }
+                            for other in 0..3 { if other != selected_deck { if let Some(ref mut d) = decks[other] { d.mixer.pfl_level = 0; d.audio.pfl_level.store(0, Ordering::Relaxed); d.audio.player.set_volume(d.mixer.volume); } } }
                             if let Some(ref mut d) = decks[selected_deck] { d.mixer.pfl_level = 100; d.audio.pfl_level.store(100, Ordering::Relaxed); d.audio.player.set_volume(1.0); }
                             pfl_active_deck.store(selected_deck, Ordering::Relaxed);
                         }
                     }
                     Some(Action::PflLevelUp) => {
-                        let other = 1 - selected_deck;
                         let activate = if let Some(ref mut d) = decks[selected_deck] {
                             if d.mixer.pfl_level < 100 {
                                 let was_zero = d.mixer.pfl_level == 0;
@@ -1452,7 +1503,7 @@ Esc                  close this / quit";
                             } else { false }
                         } else { false };
                         if activate {
-                            if let Some(ref mut od) = decks[other] { od.mixer.pfl_level = 0; od.audio.pfl_level.store(0, Ordering::Relaxed); od.audio.player.set_volume(od.mixer.volume); }
+                            for other in 0..3 { if other != selected_deck { if let Some(ref mut od) = decks[other] { od.mixer.pfl_level = 0; od.audio.pfl_level.store(0, Ordering::Relaxed); od.audio.player.set_volume(od.mixer.volume); } } }
                             if let Some(ref mut d) = decks[selected_deck] { d.audio.player.set_volume(1.0); }
                             pfl_active_deck.store(selected_deck, Ordering::Relaxed);
                         }
@@ -1518,6 +1569,36 @@ Esc                  close this / quit";
                                 cache.save();
                             }
                         }
+                    }
+                    Some(Action::Deck3GainIncrease) => {
+                        if let Some(ref mut d) = decks[2] {
+                            d.mixer.gain_db = (d.mixer.gain_db + 1).min(12);
+                            d.audio.gain_linear.store(10f32.powf(d.mixer.gain_db as f32 / 20.0).to_bits(), Ordering::Relaxed);
+                            if let Some(ref hash) = d.tempo.analysis_hash.clone() {
+                                cache.set(hash.clone(), cache_entry_for_deck(d));
+                                cache.save();
+                            }
+                        }
+                    }
+                    Some(Action::Deck3GainDecrease) => {
+                        if let Some(ref mut d) = decks[2] {
+                            d.mixer.gain_db = (d.mixer.gain_db - 1).max(-12);
+                            d.audio.gain_linear.store(10f32.powf(d.mixer.gain_db as f32 / 20.0).to_bits(), Ordering::Relaxed);
+                            if let Some(ref hash) = d.tempo.analysis_hash.clone() {
+                                cache.set(hash.clone(), cache_entry_for_deck(d));
+                                cache.save();
+                            }
+                        }
+                    }
+                    Some(Action::SwapDeck1Deck2) => {
+                        decks.swap(0, 1);
+                        shared_renderer.swap_slots(0, 1);
+                        if selected_deck == 0 { selected_deck = 1; } else if selected_deck == 1 { selected_deck = 0; }
+                    }
+                    Some(Action::SwapDeck2Deck3) => {
+                        decks.swap(1, 2);
+                        shared_renderer.swap_slots(1, 2);
+                        if selected_deck == 1 { selected_deck = 2; } else if selected_deck == 2 { selected_deck = 1; }
                     }
                     Some(Action::PitchUp) => {
                         if let Some(ref mut d) = decks[selected_deck] {
@@ -1586,7 +1667,7 @@ Esc                  close this / quit";
                     Some(Action::Help)            => { help_open = true; }
                     Some(Action::VinylModeToggle) => {
                         vinyl_mode = !vinyl_mode;
-                        for slot in 0..2 {
+                        for slot in 0..3 {
                             if let Some(ref mut d) = decks[slot] {
                                 if vinyl_mode {
                                     // Entering vinyl mode: capture current speed as vinyl_speed;
@@ -1630,9 +1711,14 @@ Esc                  close this / quit";
                     Some(Action::Deck1FilterSlopeDecrease) => { if let Some(ref mut d) = decks[0] { if d.mixer.filter_poles > 2 { d.mixer.filter_poles -= 2; d.audio.filter_poles.store(d.mixer.filter_poles, Ordering::Relaxed); } } }
                     Some(Action::Deck2FilterSlopeIncrease) => { if let Some(ref mut d) = decks[1] { if d.mixer.filter_poles < 4 { d.mixer.filter_poles += 2; d.audio.filter_poles.store(d.mixer.filter_poles, Ordering::Relaxed); } } }
                     Some(Action::Deck2FilterSlopeDecrease) => { if let Some(ref mut d) = decks[1] { if d.mixer.filter_poles > 2 { d.mixer.filter_poles -= 2; d.audio.filter_poles.store(d.mixer.filter_poles, Ordering::Relaxed); } } }
+                    Some(Action::Deck3FilterIncrease) => { if let Some(ref mut d) = decks[2] { d.mixer.filter_offset = (d.mixer.filter_offset + 1).min(16);  d.audio.filter_offset_shared.store(d.mixer.filter_offset, Ordering::Relaxed); } }
+                    Some(Action::Deck3FilterDecrease) => { if let Some(ref mut d) = decks[2] { d.mixer.filter_offset = (d.mixer.filter_offset - 1).max(-16); d.audio.filter_offset_shared.store(d.mixer.filter_offset, Ordering::Relaxed); } }
+                    Some(Action::Deck3FilterReset)    => { if let Some(ref mut d) = decks[2] { d.mixer.filter_offset = 0; d.audio.filter_offset_shared.store(0, Ordering::Relaxed); } }
+                    Some(Action::Deck3FilterSlopeIncrease) => { if let Some(ref mut d) = decks[2] { if d.mixer.filter_poles < 4 { d.mixer.filter_poles += 2; d.audio.filter_poles.store(d.mixer.filter_poles, Ordering::Relaxed); } } }
+                    Some(Action::Deck3FilterSlopeDecrease) => { if let Some(ref mut d) = decks[2] { if d.mixer.filter_poles > 2 { d.mixer.filter_poles -= 2; d.audio.filter_poles.store(d.mixer.filter_poles, Ordering::Relaxed); } } }
                     Some(Action::PaletteCycle) => {
                         scheme_idx = (scheme_idx + 1) % PALETTE_SCHEMES.len();
-                        for slot in 0..2 {
+                        for slot in 0..3 {
                             if let Some(ref mut d) = decks[slot] {
                                 d.display.palette = if slot == 0 { PALETTE_SCHEMES[scheme_idx].1 } else { PALETTE_SCHEMES[scheme_idx].2 };
                             }
@@ -1783,7 +1869,7 @@ Esc                  close this / quit";
 
 fn service_deck_frame(
     slot: usize,
-    decks: &mut [Option<Deck>; 2],
+    decks: &mut [Option<Deck>; 3],
     col_secs: f64,
     frame_dur: Duration,
     elapsed: f64,

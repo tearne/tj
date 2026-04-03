@@ -18,6 +18,7 @@ nudge_mode_toggle = "¬"
 # Deck select
 select_deck1 = "space+1"
 select_deck2 = "space+2"
+select_deck3 = "space+3"
 
 # Transport / browse (selected deck)
 play_pause   = "space+f"
@@ -96,6 +97,23 @@ deck2_filter_decrease        = "i"
 deck2_filter_reset           = ["space+8", "space+i"]
 deck2_filter_slope_increase  = "*"
 deck2_filter_slope_decrease  = "I"
+
+# Mixer — Deck 3
+deck3_level_up          = "l"
+deck3_level_down        = "."
+deck3_level_max         = "space+l"
+deck3_level_min         = "space+."
+deck3_gain_increase     = "L"
+deck3_gain_decrease     = ">"
+deck3_filter_increase        = "9"
+deck3_filter_decrease        = "o"
+deck3_filter_reset           = ["space+9", "space+o"]
+deck3_filter_slope_increase  = "("
+deck3_filter_slope_decrease  = "O"
+
+# Deck swap
+swap_deck1_deck2 = "space+="
+swap_deck2_deck3 = "space+-"
 
 [display]
 playhead_position = 20        # 0–100, percentage from left edge of detail panel

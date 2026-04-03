@@ -7,15 +7,21 @@
 The UI is structured into the following vertical sections (top to bottom):
 1. Detail info bar (shared)
 2. Detail waveform — Deck 1
-3. Detail waveform — Deck 2
-4. Notification bar — Deck 1
-5. Info bar — Deck 1
-6. Overview — Deck 1
-7. Notification bar — Deck 2
-8. Info bar — Deck 2
-9. Overview — Deck 2
-10. Spacer panel (keyboard help / cover art / file browser)
-11. Global status bar
+3. Shared beat-marker row — Deck 1 / Deck 2
+4. Detail waveform — Deck 2
+5. Shared beat-marker row — Deck 2 / Deck 3
+6. Detail waveform — Deck 3
+7. Notification bar — Deck 1
+8. Info bar — Deck 1
+9. Overview — Deck 1
+10. Notification bar — Deck 2
+11. Info bar — Deck 2
+12. Overview — Deck 2
+13. Notification bar — Deck 3
+14. Info bar — Deck 3
+15. Overview — Deck 3
+16. Spacer panel (keyboard help / cover art / file browser)
+17. Global status bar
 
 ### Global Status Bar
 
@@ -67,7 +73,7 @@ Notification colour schemes:
 ### Empty Deck Panels
 
 When no track is loaded in a deck slot, all deck sections render at full height with placeholder content:
-- **Notification bar**: dim deck label ("A" or "B") and prompt "no track — press z to open the file browser".
+- **Notification bar**: dim deck label ("A", "B", or "C") and prompt "no track — press z to open the file browser".
 - **Info bar**: `⏸  ---  +0ms` in dim style; level and filter widgets omitted.
 - **Overview**: a faint flat horizontal line at the vertical midpoint, rendered via the braille pipeline with zero-amplitude peaks and 120 BPM tick marks.
 - **Detail waveform**: a faint vertical line at the playhead column spanning the full height; all other columns blank.
@@ -97,10 +103,10 @@ Layout constraints are based on the loaded deck's `detail_height` (defaulting to
 
 ### Shared Behaviour
 
-- Zoom level and detail height are shared across both decks. `-`/`=` and `{`/`}` adjust them globally.
-- Both sets of markers shift immediately when the phase offset is adjusted.
-- The detail info bar is a single shared row above both detail waveforms, showing the common zoom level (e.g. `zoom:4s`), latency, and nudge mode in dim style. A mode indicator is always present: `[VINYL]` in vinyl mode, `[BEAT]` in beat mode. When Space is held, `[SPC]` appears to the right of the mode indicator.
-- The detail waveform height is user-adjustable at runtime with `{` (decrease) and `}` (increase), and applies to both decks simultaneously. Any unused space below the panel is left blank. The initial height is set by `detail_height` in the `[display]` section of `config.toml` (default `6`, minimum `3`; value is total rows including the 2-row tick area, giving 4 waveform rows at the default).
+- Zoom level and detail height are shared across all three decks. `-`/`=` and `{`/`}` adjust them globally.
+- All sets of markers shift immediately when the phase offset is adjusted.
+- The detail info bar is a single shared row above all detail waveforms, showing the common zoom level (e.g. `zoom:4s`), latency, and nudge mode in dim style. A mode indicator is always present: `[VINYL]` in vinyl mode, `[BEAT]` in beat mode. When Space is held, `[SPC]` appears to the right of the mode indicator.
+- The detail waveform height is user-adjustable at runtime with `{` (decrease) and `}` (increase), and applies to all three decks simultaneously. Any unused space below the panel is left blank. The initial height is set by `detail_height` in the `[display]` section of `config.toml` (default `6`, minimum `3`; value is total rows including the 2-row tick area, giving 4 waveform rows at the default).
 - The playhead column in the detail panel is set by `playhead_position` (0–100, default `20`) in the `[display]` section of `config.toml`. The value is a percentage of the panel width from the left edge; out-of-range values are clamped silently.
 - The detail waveform scrolls at half-column resolution: the viewport can be positioned at half-character offsets without modifying the pre-rendered buffer (see *Glossary — Half-column scrolling*).
 
@@ -153,7 +159,7 @@ The following invariants must be maintained to achieve smooth, stable rendering:
 - **Early recompute trigger**: The background thread begins computing a new buffer when drift reaches 3/4 of the screen width (not at the edge), ensuring the new buffer is ready before the old one runs out. A last-valid-viewport fallback prevents black frames in the rare case the OS delays the background thread.
 - **Overlay markers in the buffer pipeline**: Beat tick marks and the cue point line are computed by the background thread at the same time as the waveform, stored in the buffer using the same anchor and `samples_per_col`. The draw thread maps them to screen coordinates via the same `viewport_start` transform as the waveform, guaranteeing they cannot drift relative to it.
 
-Both detail waveforms are rendered by a single shared background thread in the same pass at identical `samples_per_col`, ensuring their column grids are byte-for-byte compatible and both viewports advance at the same rate each frame.
+All three detail waveforms are rendered by a single shared background thread in the same pass at identical `samples_per_col`, ensuring their column grids are byte-for-byte compatible and all viewports advance at the same rate each frame.
 
 The render frame period adapts to the current zoom level and detail panel width, targeting one dot-column advance per frame. At very tight zoom it is capped at ~120 fps; at very wide zoom it is capped at ~5 fps to keep input responsive.
 
@@ -209,7 +215,7 @@ The cue point is stored in `BrailleBuffer` as `cue_buf_col: Option<usize>` — a
 
 ## Spacer Panel
 
-The spacer panel occupies the leftover rows between the two decks (below Deck 2's overview and above the global status bar). Its content is determined by the following priority:
+The spacer panel occupies the leftover rows between the three decks (below Deck 3's overview and above the global status bar). Its content is determined by the following priority:
 
 1. **File browser** — when the browser is open, it fills the spacer (or the full screen if the spacer is too small).
 2. **Keyboard layout** — when `keyboard_help_open` is true (toggled by `Space+/`), a static 12-row keyboard map is rendered.

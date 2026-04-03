@@ -2,12 +2,13 @@
 
 ## Deck Selection
 
-- Two decks — Deck 1 and Deck 2 — operate independently. Each deck maintains its own track, transport, BPM, offset, volume, filter, metronome, zoom, waveform, tap accumulator, BPM analysis state, and notification state.
-- One deck is always selected. `Space+1` selects Deck 1; `Space+2` selects Deck 2. The selected deck defaults to Deck 1 on startup.
-- All deck controls (transport, BPM, offset, pitch, metronome, nudge, tap, re-detect, cue, PFL level) operate on the selected deck only. Mixer controls (level, gain, filter) have dedicated per-deck bindings and may be adjusted on either deck regardless of which is selected.
-- Global controls (quit, help, vinyl mode toggle, deck select) are not deck-specific.
-- At startup only Deck 1 is used. Deck 2 can be loaded by selecting it with `Space+2` and opening the file browser.
-- Audio latency is a single global setting shared across both decks.
+- Three decks — Deck 1, Deck 2, and Deck 3 — operate independently. Each deck maintains its own track, transport, BPM, offset, volume, filter, metronome, zoom, waveform, tap accumulator, BPM analysis state, and notification state.
+- One deck is always selected. `Space+1` selects Deck 1; `Space+2` selects Deck 2; `Space+3` selects Deck 3. The selected deck defaults to Deck 1 on startup.
+- All deck controls (transport, BPM, offset, pitch, metronome, nudge, tap, re-detect, cue, PFL level) operate on the selected deck only. Mixer controls (level, gain, filter) have dedicated per-deck bindings and may be adjusted on any deck regardless of which is selected.
+- Global controls (quit, help, vinyl mode toggle, deck select, deck swap) are not deck-specific.
+- `Space+=` swaps the entire state of Deck 1 and Deck 2 (track, transport, BPM, pitch, mixer, cue, waveform rendering). `Space+-` swaps Deck 2 and Deck 3 in the same way. If the selected deck is one of the two swapped slots, selection follows the content so the operator continues controlling the same physical content after the swap.
+- At startup only Deck 1 is used. Deck 2 and Deck 3 can be loaded by selecting them and opening the file browser.
+- Audio latency is a single global setting shared across all three decks.
 
 ## Playback
 
