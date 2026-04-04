@@ -1917,9 +1917,12 @@ fn service_deck_frame(
         // Include warp-nudge speed factor so the display tracks the audio speed exactly.
         let base_speed = if vinyl_mode { d.tempo.vinyl_speed as f64 } else { (d.tempo.bpm / d.tempo.base_bpm) as f64 };
         let speed = base_speed * (1.0 + d.nudge as f64 * 0.1);
-        // Use nominal frame duration rather than measured elapsed to avoid systematic drift:
-        // thread::sleep overshoots, so elapsed is consistently larger than frame_dur.
-        d.display.smooth_display_samp += frame_dur.as_secs_f64() * d.audio.sample_rate as f64 * speed;
+        // Use measured elapsed rather than nominal frame_dur: frame_dur creates a systematic lag
+        // because thread::sleep consistently overshoots, causing output_position to run ahead and
+        // the drift correction to fight it continuously. Elapsed tracks the real frame rate so the
+        // correction term is near-zero in steady state. Cap at 2× frame_dur to absorb load spikes.
+        let advance_secs = elapsed.min(frame_dur.as_secs_f64() * 2.0);
+        d.display.smooth_display_samp += advance_secs * d.audio.sample_rate as f64 * speed;
     } else if d.nudge != 0 {
         // Paused with warp nudge: drift display and sync actual audio position for scrubbing.
         d.display.smooth_display_samp = (d.display.smooth_display_samp
@@ -1947,7 +1950,9 @@ fn service_deck_frame(
     let display_pos_samp = d.audio.seek_handle.output_position.load(Ordering::Relaxed)
         / d.audio.seek_handle.channels as usize;
     let drift = d.display.smooth_display_samp - display_pos_samp as f64;
-    let large_drift = drift.abs() > d.audio.sample_rate as f64 * 0.1;
+    // 0.3s: above typical accumulated drift on a loaded system but below a single beat at any
+    // practical BPM (a beat at 120 BPM is 0.5s). Lower thresholds trigger snap during normal drift.
+    let large_drift = drift.abs() > d.audio.sample_rate as f64 * 0.3;
     let paused_snap  = d.audio.player.is_paused() && d.nudge == 0 && drift.abs() > 1.0;
     if large_drift || paused_snap {
         // Snap to nearest half-column so sub_col is stable after seeks.
@@ -1960,7 +1965,10 @@ fn service_deck_frame(
             display_pos_samp as f64
         };
     } else if !d.audio.player.is_paused() {
-        d.display.smooth_display_samp -= drift * 0.05;
+        // With elapsed-advance removing steady-state lag, residual drift is sub-ppm system-clock
+        // vs. audio-clock skew — far below the 0.3s snap threshold. A large correction factor
+        // amplifies audio-device step noise into visible rounding flicker; 0.002 damps it away.
+        d.display.smooth_display_samp -= drift * 0.002;
     }
 
     // Metronome: fire from buffer write position so the click arrives at the speaker on the beat.
