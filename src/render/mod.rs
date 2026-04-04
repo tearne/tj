@@ -1559,7 +1559,7 @@ pub(crate) fn render_shared_tick_row(
 
 pub(crate) fn render_keyboard_help(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
     const TEXT_W: u16 = 87;
-    const TEXT_H: u16 = 12;
+    const TEXT_H: u16 = 15;
     const H_PAD:  u16 = 2;
     const V_PAD:  u16 = 1;
 
@@ -1586,59 +1586,69 @@ pub(crate) fn render_keyboard_help(frame: &mut ratatui::Frame, area: ratatui::la
         height: outer.height.saturating_sub(V_PAD * 2),
     };
 
-    let g     = Style::default().fg(Color::DarkGray);
-    let gr    = Style::default().fg(Color::Green);
-    let wh    = Style::default().fg(Color::White);
-    let bl    = Style::default().fg(Color::Blue);
+    let sh = Style::default().fg(Color::Rgb(130, 100,  50));  // Shift layer: dim warm amber
+    let ba = Style::default().fg(Color::Rgb(170, 170, 170));  // Bare layer:  medium gray
+    let sp = Style::default().fg(Color::Rgb( 60, 100, 160));  // Space layer: dim cool blue
+    let gr = Style::default().fg(Color::Rgb( 80, 140,  70));  // nudge / BPM: muted sage
+    let wh = Style::default().fg(Color::White);               // F-key bracket exception
 
-    // Row 6: F's ╭ bracket in white
-    let row6 = Line::from(vec![
-        Span::styled("    ╭         ╭         ╭ +Tick   ", g),
-        Span::styled("╭", wh),
-        Span::styled(" -BsBPM  ╭         ┆   ╭ +Gain   ╭ +Gain   ╭ +Gain", g),
-    ]);
-    // Row 7: F in bold green, +Ndge and -BPM in green
+    // Row 7: Shift — F's ╭ bracket stays white
     let row7 = Line::from(vec![
-        Span::styled("    A -Ptch   S +PFL    D ", g),
-        Span::styled("+Ndge", gr),
-        Span::styled("   ", g),
-        Span::styled("F", wh),
-        Span::styled(" ", g),
-        Span::styled("-BPM", gr),
-        Span::styled("    G         ┆   J +Lvl    K +Lvl    L +Lvl", g),
+        Span::styled("    ╭         ╭         ╭ +Tick   ", sh),
+        Span::styled("╭", wh),
+        Span::styled(" -BsBPM  ╭         ┆   ╭ +Gain   ╭ +Gain   ╭ +Gain", sh),
     ]);
-    // Row 8: F's ╰ bracket in white, Brows and Play in blue (Space-modifier actions)
+    // Row 8: Bare — F key name stays white; +Ndge / -BPM use muted sage
     let row8 = Line::from(vec![
-        Span::styled("    ╰ -Ptch   ╰ Rst     ╰ ", g),
-        Span::styled("Brows", bl),
-        Span::styled("   ", g),
-        Span::styled("╰", wh),
-        Span::styled(" ", g),
-        Span::styled("Play", bl),
-        Span::styled("    ╰ PFLTog  ┆   ╰ 100%    ╰ 100%    ╰ 100%", g),
+        Span::styled("    A -Ptch   S +PFL    D ", ba),
+        Span::styled("+Ndge", gr),
+        Span::styled("   ", ba),
+        Span::styled("F", wh),
+        Span::styled(" ", ba),
+        Span::styled("-BPM", gr),
+        Span::styled("    G         ┆   J +Lvl    K +Lvl    L +Lvl", ba),
     ]);
-    // Row 10: -Ndge and +BPM in green
-    let row10 = Line::from(vec![
-        Span::styled("      Z +Ptch   X -PFL    C ", g),
+    // Row 9: Space — F's ╰ bracket stays white
+    let row9 = Line::from(vec![
+        Span::styled("    ╰ -Ptch   ╰ Rst     ╰ Brows   ", sp),
+        Span::styled("╰", wh),
+        Span::styled(" Play    ╰ PFLTog  ┆   ╰ 100%    ╰ 100%    ╰ 100%", sp),
+    ]);
+    // Row 11: Bare — -Ndge / +BPM use muted sage
+    let row11 = Line::from(vec![
+        Span::styled("      Z +Ptch   X -PFL    C ", ba),
         Span::styled("-Ndge", gr),
-        Span::styled("   V ", g),
+        Span::styled("   V ", ba),
         Span::styled("+BPM", gr),
-        Span::styled("    B Tap     ┆   M -Lvl    , -Lvl    . -Lvl", g),
+        Span::styled("    B Tap     ┆   M -Lvl    , -Lvl    . -Lvl", ba),
+    ]);
+    // Row 13: separator with modifier legend flush-right
+    let row13 = Line::from(vec![
+        Span::styled("──────────────────────────────────────────────────────────────  [", ba),
+        Span::styled("Shift", sh),
+        Span::styled("]  [", ba),
+        Span::styled("Bare", ba),
+        Span::styled("]  [", ba),
+        Span::styled("Space", sp),
+        Span::styled("]", ba),
     ]);
 
     let lines: Vec<Line<'static>> = vec![
-        Line::styled("╭         ╭         ╭         ╭ +32b    ╭ +64b    ┆   ╭ +Slp    ╭ +Slp    ╭ +Slp", g),
-        Line::styled("1 +1bt    2 +1b     3 +4b     4 +8b     5 +16b    ┆   7 HPF     8 HPF     9 HPF", g),
-        Line::styled("╰ SelD1   ╰ SelD2   ╰ SelD3   ╰         ╰         ┆   ╰ Flt=    ╰ Flt=    ╰ Flt=", g),
-        Line::styled("  ╭         ╭         ╭         ╭ -32b    ╭ -64b    ┆   ╭ -Slp    ╭ -Slp    ╭ -Slp", g),
-        Line::styled("  Q -1bt    W -1b     E -4b     R -8b     T -16b    ┆   U LPF     I LPF     O LPF", g),
-        Line::styled("  ╰         ╰         ╰ CueSt   ╰ CueJp   ╰         ┆   ╰ Flt=    ╰ Flt=    ╰ Flt=", g),
-        row6,
+        Line::styled("╭         ╭         ╭         ╭ +32b    ╭ +64b    ┆   ╭ +Slp    ╭ +Slp    ╭ +Slp", sh),
+        Line::styled("1 +1bt    2 +1b     3 +4b     4 +8b     5 +16b    ┆   7 HPF     8 HPF     9 HPF", ba),
+        Line::styled("╰ SelD1   ╰ SelD2   ╰ SelD3   ╰         ╰         ┆   ╰ Flt=    ╰ Flt=    ╰ Flt=", sp),
+        Line::styled("  ╭         ╭         ╭         ╭ -32b    ╭ -64b    ┆   ╭ -Slp    ╭ -Slp    ╭ -Slp", sh),
+        Line::styled("  Q -1bt    W -1b     E -4b     R -8b     T -16b    ┆   U LPF     I LPF     O LPF", ba),
+        Line::styled("  ╰         ╰         ╰ CueSt   ╰ CueJp   ╰         ┆   ╰ Flt=    ╰ Flt=    ╰ Flt=", sp),
         row7,
         row8,
-        Line::styled("      ╭         ╭         ╭ -Tick   ╭ +BsBPM  ╭         ┆   ╭ -Gain   ╭ -Gain   ╭ -Gain", g),
-        row10,
-        Line::styled("      ╰ +Ptch   ╰ Rst     ╰         ╰ Metro   ╰ BDtct   ┆   ╰ 0%      ╰ 0%      ╰ 0%", g),
+        row9,
+        Line::styled("      ╭         ╭         ╭ -Tick   ╭ +BsBPM  ╭         ┆   ╭ -Gain   ╭ -Gain   ╭ -Gain", sh),
+        row11,
+        Line::styled("      ╰ +Ptch   ╰ Rst     ╰         ╰ Metro   ╰ BDtct   ┆   ╰ 0%      ╰ 0%      ╰ 0%", sp),
+        row13,
+        Line::styled("` vinyl   ¬ nudge   -/= zoom   {/} height   [/] latency   Esc quit", ba),
+        Line::styled("/ art   ~ palette   Spc+= swap1↔2   Spc+- swap2↔3", ba),
     ];
     frame.render_widget(
         Paragraph::new(lines).style(Style::default().bg(Color::Rgb(15, 15, 15))),

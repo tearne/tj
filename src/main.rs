@@ -18,7 +18,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 use ratatui::Terminal;
 
 use rodio::stream::DeviceSinkBuilder;
@@ -350,7 +350,6 @@ fn tui_loop(
     let mut frame_count: usize = 0;
     let mut last_render = Instant::now();
     let mut help_open = false;
-    let mut keyboard_help_open = false;
     let mut browser_state: Option<(BrowserState, usize)> = None; // (state, target deck slot)
     let mut preview_output: Option<PreviewOutput> = None;
     let mut max_det_h: usize = usize::MAX;
@@ -827,8 +826,8 @@ fn tui_loop(
                 }
             }
 
-            // Keyboard help overlay — drawn on top of art; skipped when browser is open
-            if keyboard_help_open && browser_state.is_none() {
+            // Unified help overlay — drawn on top of art; skipped when browser is open
+            if help_open && browser_state.is_none() {
                 render_keyboard_help(frame, c[16]);
             }
 
@@ -841,38 +840,6 @@ fn tui_loop(
                 }
             }
 
-            // Help popup
-            if help_open {
-                const HELP: &str = "\
-── Global ───────────────────────────────────────────────────────────────
-`                    vinyl mode
-¬                    nudge mode toggle
-- / =                zoom in / out                { / }  waveform height
-[ / ]                latency ±10ms
-/                    album art                    ~  palette cycle
-Space+/              keyboard layout
-?                    toggle this help
-Esc                  close this / quit
-── Decks ────────────────────────────────────────────────────────────────
-Space+1/2/3          select deck
-Space+= / Space+-    swap decks 1↔2 / 2↔3";
-                let popup_w = 86u16;
-                let popup_h = HELP.lines().count() as u16 + 2;
-                let px = area.x + area.width.saturating_sub(popup_w) / 2;
-                let py = area.y + area.height.saturating_sub(popup_h) / 2;
-                let popup_rect = ratatui::layout::Rect {
-                    x: px, y: py,
-                    width: popup_w.min(area.width),
-                    height: popup_h.min(area.height),
-                };
-                frame.render_widget(ratatui::widgets::Clear, popup_rect);
-                frame.render_widget(
-                    Paragraph::new(HELP)
-                        .block(Block::default().borders(Borders::ALL).title(" Key Bindings "))
-                        .style(Style::default().fg(Color::White)),
-                    popup_rect,
-                );
-            }
         })?;
 
         // Put all three decks back after render.
@@ -1300,12 +1267,10 @@ Space+= / Space+-    swap decks 1↔2 / 2↔3";
                 }
                 // All other actions fire on Press only.
                 if key.kind == KeyEventKind::Press {
-                    // Dismiss any open overlay before processing any other action.
-                    if help_open {
+                    // Esc closes the help overlay (suppresses quit so Esc doesn't quit immediately after).
+                    if help_open && key.code == KeyCode::Esc {
                         help_open = false;
-                        if keymap.get(&KeyBinding::Key(key.code)) == Some(&Action::Quit) {
-                            suppress_quit_until = Some(Instant::now() + Duration::from_millis(300));
-                        }
+                        suppress_quit_until = Some(Instant::now() + Duration::from_millis(300));
                         continue 'tui;
                     }
                     // Browser-blocked intercept — y overrides, Esc/n cancels.
@@ -1668,7 +1633,7 @@ Space+= / Space+-    swap decks 1↔2 / 2↔3";
                         }
                         }
                     }
-                    Some(Action::Help)            => { help_open = true; }
+                    Some(Action::Help)            => { help_open = !help_open; }
                     Some(Action::VinylModeToggle) => {
                         vinyl_mode = !vinyl_mode;
                         for slot in 0..3 {
@@ -1732,9 +1697,6 @@ Space+= / Space+-    swap decks 1↔2 / 2↔3";
                         art_bright_idx = [2u8, 0, 1][art_bright_idx as usize]; // dim→bright→off→dim
                         cache.set_art_bright_idx(art_bright_idx);
                         cache.save();
-                    }
-                    Some(Action::KeyboardHelp) => {
-                        keyboard_help_open = !keyboard_help_open;
                     }
                     Some(Action::OffsetIncrease) => {
                         if !vinyl_mode { if let Some(ref mut d) = decks[selected_deck] { apply_offset_step(d, 10); } }
@@ -1985,7 +1947,7 @@ fn service_deck_frame(
     let display_pos_samp = d.audio.seek_handle.output_position.load(Ordering::Relaxed)
         / d.audio.seek_handle.channels as usize;
     let drift = d.display.smooth_display_samp - display_pos_samp as f64;
-    let large_drift = drift.abs() > d.audio.sample_rate as f64 * 0.5;
+    let large_drift = drift.abs() > d.audio.sample_rate as f64 * 0.1;
     let paused_snap  = d.audio.player.is_paused() && d.nudge == 0 && drift.abs() > 1.0;
     if large_drift || paused_snap {
         // Snap to nearest half-column so sub_col is stable after seeks.

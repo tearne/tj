@@ -12,7 +12,6 @@ pub(crate) enum Action {
     PaletteCycle,
     NudgeModeToggle,
     ArtCycle,
-    KeyboardHelp,
     // Selected-deck controls
     SelectDeck1, SelectDeck2, SelectDeck3,
     PlayPause, OpenBrowser,
@@ -63,7 +62,6 @@ pub(crate) static ACTION_NAMES: &[(&str, Action)] = &[
     ("palette_cycle",     Action::PaletteCycle),
     ("nudge_mode_toggle",  Action::NudgeModeToggle),
     ("art_cycle",          Action::ArtCycle),
-    ("keyboard_help",      Action::KeyboardHelp),
     // Selected-deck controls
     ("select_deck1",        Action::SelectDeck1),
     ("select_deck2",        Action::SelectDeck2),
@@ -183,7 +181,7 @@ pub(crate) struct DisplayConfig {
 }
 
 impl Default for DisplayConfig {
-    fn default() -> Self { Self { playhead_position: 20, warning_threshold_secs: 30.0, detail_height: 6 } }
+    fn default() -> Self { Self { playhead_position: 20, warning_threshold_secs: 30.0, detail_height: 5 } }
 }
 
 /// Finds or creates the config file and returns its text plus an optional notice.
@@ -244,7 +242,7 @@ pub(crate) fn parse_display_config(text: &str) -> DisplayConfig {
     let detail_height = display
         .and_then(|v| v.get("detail_height"))
         .and_then(|v| v.as_integer())
-        .unwrap_or(6)
+        .unwrap_or(5)
         .max(3) as usize;
     DisplayConfig { playhead_position: pos, warning_threshold_secs, detail_height }
 }

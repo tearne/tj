@@ -6,7 +6,7 @@ Controls are split into two groups. The **mixer** — level, gain, and filter �
 
 ### Keyboard Layout
 
-The layout below matches the in-app keyboard help overlay (`Space+/`). Left block = deck controls (selected deck); right block = mixer (addressed directly). Keys `6`, `Y`, `H`, and `N` are intentionally unbound.
+The layout below matches the in-app unified help overlay (`?`). Left block = deck controls (selected deck); right block = mixer (addressed directly). Keys `6`, `Y`, `H`, and `N` are intentionally unbound.
 
 ```
 ╭         ╭         ╭         ╭ +32b    ╭ +64b    ┆   ╭ +Slp    ╭ +Slp    ╭ +Slp
@@ -25,13 +25,13 @@ The layout below matches the in-app keyboard help overlay (`Space+/`). Left bloc
 
 Per-cell format: `╭ Shift-action` / `Key plain-action` / `╰ Space-action`. Empty modifier cells are left blank.
 
-Global keys (not shown in overlay — see `?` modal):
+Global keys (shown in the `?` overlay footer):
 - `` ` `` vinyl mode, `¬` nudge mode toggle
 - `-` / `=` zoom in/out, `{` / `}` waveform height
 - `[` / `]` latency ±10ms
-- `/` album art, `~` palette cycle, `Space+/` keyboard layout
+- `/` album art, `~` palette cycle
 - `Space+=` swap decks 1↔2, `Space+-` swap decks 2↔3
-- `?` help modal, `Esc` quit
+- `?` unified help overlay, `Esc` quit
 
 ```
 ── LEGEND ─────────────────────────────────────────────────────────────────────

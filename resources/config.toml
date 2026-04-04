@@ -11,7 +11,6 @@ latency_increase  = "]"
 palette_cycle     = "~"
 vinyl_mode_toggle = "`"
 art_cycle         = "/"
-keyboard_help     = "space+/"
 help              = "?"
 nudge_mode_toggle = "¬"
 
@@ -118,4 +117,4 @@ swap_deck2_deck3 = "space+-"
 [display]
 playhead_position = 20        # 0–100, percentage from left edge of detail panel
 warning_threshold_secs = 30   # seconds before end to activate bar-marker flash warning
-detail_height = 6             # total rows per detail waveform (including 2-row tick area; min 4)
+detail_height = 5             # total rows per detail waveform (including 2-row tick area; min 4)
